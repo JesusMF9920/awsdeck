@@ -80,5 +80,11 @@ aws-config + aws-sdk-cloudwatchlogs. **Sin `async-trait`.**
 
 ## Estado
 
-v0 en progreso: shell + vista `logs` (mock → SDK real). v1 `sqs`, v2 `sfn`, v3 `events`:
-no iniciadas.
+**v0 completo.** Shell + vista `logs` contra `aws-sdk-cloudwatchlogs` real (con `Backend::Mock`
+para tests offline). Header con `profile · region`, command bar (`:logs`), filtro (`/`),
+drill/back groups↔streams, picker de profiles (`ctrl-e`) con epoch guard, ayuda (`?`), status
+bar de errores. 18 tests (routing, epoch guard, filtro, drill, parser de `~/.aws/config`,
+render con `TestBackend`). `cargo run` lo abre.
+
+Pendiente: v1 `sqs`, v2 `sfn`, v3 `events` (no iniciadas), `y` (copiar ARN), abrir en consola
+(`o`), config en disco.

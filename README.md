@@ -5,7 +5,8 @@ para saltar entre los servicios de AWS que uso a diario —CloudWatch Logs hoy; 
 Functions y EventBridge en camino— con la misma navegación, los mismos keybindings y el
 ambiente (cuenta + región) siempre visible y cambiable al instante.
 
-> Estado: **v0 + v1** — el shell extensible + las vistas `logs` (CloudWatch) y `sqs` (colas, peek, purge gated).
+> Estado: **v0 + v1 + v2** — el shell extensible + las vistas `logs` (CloudWatch), `sqs` (colas, peek,
+> purge gated) y `sfn` (Step Functions: ejecuciones, timeline, redrive gated).
 > Diseño completo en [`ROADMAP.md`](ROADMAP.md); notas de arquitectura en [`CLAUDE.md`](CLAUDE.md).
 
 ## Requisitos
@@ -44,6 +45,7 @@ se muestra en la **status bar** (no crashea).
 | `j` / `k` · `↑` / `↓` · `g` / `G` | navegar |
 | `r` | refrescar |
 | `p` | purgar cola SQS (gated: modo escritura + confirm) |
+| `R` | redrive ejecución `sfn` fallida (gated: modo escritura + confirm) |
 | `:write` | alternar modo escritura (habilita acciones mutantes) |
 | `ctrl-e` | cambiar de ambiente (picker de profiles) |
 | `?` | ayuda |
@@ -66,8 +68,13 @@ Recorrido rápido (con `AWSDECK_MOCK=1 cargo run`):
    filtro `↑`/`↓` navegan los resultados sin tener que salir; `enter` hace **drill** al detalle.
    `esc` es de **dos etapas** (estilo k9s): con un filtro aplicado lo limpia primero; el siguiente
    `esc` regresa un nivel (y desde la raíz de la vista, al menú).
-3. `ctrl-e` abre el picker; elige otro profile → el ambiente y la lista cambian.
-4. `?` muestra la ayuda; `q` sale y la terminal queda limpia.
+3. En `sfn`, `enter` entra a una state machine → sus **ejecuciones con status coloreado** y duración;
+   `enter` en una FAILED → detalle con input/output, error/cause y el **timeline de estados** (el que
+   reventó va resaltado y preseleccionado). En una máquina `[express]` se muestra una nota (sus
+   ejecuciones viven en CloudWatch Logs). Con `:write`, `R` hace **redrive** de una ejecución fallida
+   (confirm modal).
+4. `ctrl-e` abre el picker; elige otro profile → el ambiente y la lista cambian.
+5. `?` muestra la ayuda; `q` sale y la terminal queda limpia.
 
 **Epoch guard:** al cambiar de ambiente con un request en vuelo, nunca se pintan datos de la
 cuenta anterior (probado en `app::tests::epoch_guard_discards_stale_and_accepts_fresh`).
@@ -98,11 +105,13 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
 
 - **v0** ✅ shell + `logs` (CloudWatch).
 - **v1** ✅ `sqs` — colas, attributes, *peek*, `PurgeQueue` (gated por modo escritura + confirm).
-- **v2** `sfn` — ejecuciones, timeline, `Redrive` (gated).
+- **v2** ✅ `sfn` — state machines, ejecuciones (status coloreado), timeline de estados con duración,
+  `Redrive` (gated).
 - **v3** `events` — buses, rules, `SendEvent` (gated).
 
 Backlog: copiar ARN (`y`), abrir en consola (`o`), config en disco, más vistas (Lambda, DynamoDB, ECS…).
 
 ## Stack
 
-`tokio` · `ratatui` + `crossterm` · `color-eyre` · `tui-input` · `aws-config` + `aws-sdk-cloudwatchlogs`.
+`tokio` · `ratatui` + `crossterm` · `color-eyre` · `tui-input` · `aws-config` +
+`aws-sdk-cloudwatchlogs` / `aws-sdk-sqs` / `aws-sdk-sfn` · `serde_json`.

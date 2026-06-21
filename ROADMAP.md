@@ -151,8 +151,10 @@ Listar colas del ambiente; ver attributes (mensajes visibles, in-flight, DLQ); *
 
 Entregado: lista de colas (badge `[fifo]`); drill a attributes (visible/in-flight/delayed/DLQ con maxReceiveCount) + peek (10 msgs, `visibility_timeout(0)`, best-effort); `PurgeQueue` gated por modo escritura (`:write`, badge `[ESCRITURA]`) + confirm modal. Gate genérico en `App::dispatch`, reusable para v2/v3. Mock (`AWSDECK_MOCK=1`) y SDK real (`aws-sdk-sqs`).
 
-### v2 — Vista `sfn` (Step Functions)
+### v2 — Vista `sfn` (Step Functions) — ✅ hecho
 Listar ejecuciones por state machine con status coloreado; drill al timeline de estados con duración; en fallos, saltar al estado que reventó y mostrar input/output. `Redrive` como acción gated.
+
+Entregado: 3 niveles (state machines → ejecuciones → detalle). L1 `list_state_machines` (badge tipo + fecha). L2 `list_executions` con status coloreado (verde/rojo/amarillo/cyan) + inicio + duración; guard EXPRESS (no soporta list_executions → muestra nota, no llama al SDK). L3 `describe_execution` + `get_execution_history`: input/output (pretty, truncado), error/cause y timeline de estados con duración, resaltando/saltando al estado que reventó (`parse_history` empareja StateEntered/StateExited). `RedriveExecution` (`R`) gated por el mismo gate prod-safe de v1 (modo escritura + confirm), solo en ejecuciones redrivables. Mock (`AWSDECK_MOCK=1`) y SDK real (`aws-sdk-sfn`).
 
 ### v3 — Vista `events` (EventBridge)
 Listar event buses, rules y targets; inspeccionar el patrón de cada rule; `SendEvent` de prueba (gated) para disparar un evento contra un bus.

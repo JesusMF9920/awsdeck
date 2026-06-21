@@ -53,12 +53,14 @@ src/
   tui.rs           guard de terminal: raw mode + alt screen, restore en Drop + panic hook
   app.rs           Env+epoch, modos de input, vista activa, routing, status bar (agnóstico de servicio)
   action.rs        enum Action (intents)
-  message.rs       enum Message (results) + DTOs (LogGroup, LogStream)
+  message.rs       enum Message (results) + DTOs (LogGroup, Queue, StateMachine, Execution…)
   effects.rs       dispatcher: Action -> task de tokio -> Message  (la frontera con el SDK)
   aws/context.rs   Env + AwsContext/ClientFactory (clients cacheados por ambiente)
   views/
     mod.rs         trait View + Registry genérico (no nombra ningún servicio concreto)
     logs.rs        CloudWatch log groups -> streams (drill, filtro)
+    sqs.rs         colas -> attributes + peek (drill, purge gated)
+    sfn.rs         state machines -> ejecuciones -> detalle/timeline (drill x3, redrive gated)
   ui/
     header.rs      indicador de ambiente (profile · region) + breadcrumbs
     command_bar.rs `:` comandos y `/` filtro (tui-input)
@@ -72,7 +74,9 @@ concretas se cablean en `main.rs`; `effects.rs` es la frontera deliberada con el
 
 `:` command bar · `/` filtro (con `↑/↓` navegas los resultados sin salir) · `enter` drill ·
 `esc` back de dos etapas (con filtro lo limpia; si no, un nivel; desde la raíz, al menú) ·
-`r` refresh · `ctrl-e` cambiar ambiente · `?` ayuda · `q` salir. (`y` copiar ARN/URL — más adelante.)
+`r` refresh · `ctrl-e` cambiar ambiente · `?` ayuda · `q` salir. Acciones mutantes gated por
+modo escritura (`:write`) + confirm: `p` purgar cola (`sqs`), `R` redrive ejecución (`sfn`).
+(`y` copiar ARN/URL — más adelante.)
 
 `esc` es navegación uniforme de **dos etapas** (estilo k9s): el `App` lo intercepta en
 `on_normal_key` y, si hay filtro aplicado, lo limpia y se queda en la vista (1a etapa, la vista
@@ -82,22 +86,33 @@ vista nunca nombra al menú.
 
 ## Stack
 
-tokio · ratatui + crossterm (feature `event-stream`) · color-eyre · tui-input ·
-aws-config + aws-sdk-cloudwatchlogs. **Sin `async-trait`.**
+tokio · ratatui + crossterm (feature `event-stream`) · color-eyre · tui-input · serde_json ·
+aws-config + aws-sdk-cloudwatchlogs / aws-sdk-sqs / aws-sdk-sfn. **Sin `async-trait`.**
 
 ## Estado
 
-**v0 + v1 completos.** Shell + vistas `logs` (`aws-sdk-cloudwatchlogs`) y `sqs`
-(`aws-sdk-sqs`) contra el SDK real, con `Backend::Mock` (`AWSDECK_MOCK=1`) para tests/demo
-offline. Header con `profile · region`, command bar (`:logs`/`:sqs`), filtro (`/`),
-drill/back, picker de profiles (`ctrl-e`) con epoch guard, selección de ambiente al iniciar si
-no hay `AWS_PROFILE` (`start_with_env_picker`), ayuda (`?`), status bar de errores.
+**v0 + v1 + v2 completos.** Shell + vistas `logs` (`aws-sdk-cloudwatchlogs`), `sqs`
+(`aws-sdk-sqs`) y `sfn` (`aws-sdk-sfn`) contra el SDK real, con `Backend::Mock` (`AWSDECK_MOCK=1`)
+para tests/demo offline. Header con `profile · region`, command bar (`:logs`/`:sqs`/`:sfn`),
+filtro (`/`), drill/back, picker de profiles (`ctrl-e`) con epoch guard, selección de ambiente al
+iniciar si no hay `AWS_PROFILE` (`start_with_env_picker`), ayuda (`?`), status bar de errores.
 
 **v1 `sqs`:** lista colas (badge `[fifo]`), drill a attributes (visible/in-flight/delayed/DLQ)
 + *peek* de mensajes (receive sin borrar, best-effort). Primera acción mutante **`PurgeQueue`**
 detrás del **gate prod-safe**: modo escritura (`:write`, badge rojo `[ESCRITURA]`) + confirm
 modal (`ui/confirm.rs`); el gate vive en `App::dispatch` (`is_mutating` → `request_confirm`) y
 es reusable para v2/v3. `switch_env` resetea el modo escritura.
+
+**v2 `sfn`:** primera vista de **3 niveles** (`Level::{Machines,Executions,Detail}`, cada uno
+carga los identificadores que `back()` reconstruye y `on_message` valida). L1 `list_state_machines`
+(badge tipo + fecha). L2 `list_executions` con status coloreado + duración; **guard EXPRESS** (la
+vista no emite `LoadExecutions` para máquinas EXPRESS → muestra nota, evita el error del SDK). L3
+`describe_execution` + `get_execution_history` combinados en un Message: input/output (pretty,
+truncado a 4KB), error/cause y **timeline de estados con duración** (`effects::parse_history`
+empareja StateEntered/StateExited por nombre, pura/testeada), resaltando y preseleccionando el
+estado que reventó. **`RedriveExecution`** (`R`) reusa el mismo gate prod-safe; la vista solo la
+ofrece si `ExecStatus::is_redrivable()`. DTOs con enums propios planos (`MachineType`/`ExecStatus`,
+no los `#[non_exhaustive]` del SDK); `DateTime → millis` vía `.to_millis().ok()` en effects.
 
 **Pulido (UX a escala):**
 - **Menú principal** como pantalla de inicio (`Screen::{Menu,View}` en `App`): lista las
@@ -124,9 +139,10 @@ es reusable para v2/v3. `switch_env` resetea el modo escritura.
   cuando no navegaste y respeta tu posición (flechas en filtro) cuando sí; cae al tope si el item
   desapareció. Aplica también al `r` refresh. (SQS ya solo hacía `clamp_selection`.)
 
-62 tests sin red (routing, epoch guard, gate de mutaciones, fuzzy, menú, búsqueda/staleness,
-drill, back→menú de dos etapas, navegación en filtro, preservación de selección, parsers, render
-con `TestBackend`). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
+89 tests sin red (routing, epoch guard, gate de mutaciones —purge y redrive—, fuzzy, menú,
+búsqueda/staleness, drill x3, back→menú de dos etapas, navegación en filtro, preservación de
+selección, guard EXPRESS, `parse_history`, parsers, render con `TestBackend`). `AWSDECK_MOCK=1
+cargo run` lo abre sin credenciales.
 
-Pendiente: v2 `sfn`, v3 `events` (no iniciadas), eventos de log (3er nivel en `logs`), `y`
-(copiar ARN), abrir en consola (`o`), config en disco.
+Pendiente: v3 `events` (no iniciada), eventos de log (3er nivel en `logs`), input/output por
+estado en el timeline de `sfn`, `y` (copiar ARN), abrir en consola (`o`), config en disco.

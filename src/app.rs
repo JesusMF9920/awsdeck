@@ -13,7 +13,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, ListState, Paragraph};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use tokio::sync::mpsc;
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
@@ -30,6 +30,12 @@ enum Mode {
     Normal,
     Command,
     Filter,
+}
+
+/// Pantalla activa: el menú principal de herramientas, o una vista concreta.
+enum Screen {
+    Menu,
+    View,
 }
 
 /// Línea de estado transitoria (errores e info), mostrada en el footer.
@@ -97,6 +103,10 @@ pub struct App {
     effects: Effects,
     rx: mpsc::Receiver<Envelope>,
 
+    /// Pantalla activa (menú principal o vista). Arranca en el menú.
+    screen: Screen,
+    /// Selección del menú principal (índice sobre `registry.metas()`).
+    menu: ListState,
     mode: Mode,
     /// Buffer de edición compartido por los modos `:` y `/`.
     input: Input,
@@ -128,6 +138,8 @@ impl App {
             registry,
             effects,
             rx,
+            screen: Screen::Menu,
+            menu: ListState::default().with_selected(Some(0)),
             mode: Mode::Normal,
             input: Input::default(),
             filter: String::new(),
@@ -143,12 +155,8 @@ impl App {
 
     /// Corre el loop principal hasta que el usuario sale.
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        // Con el picker de arranque abierto, esperar a que el usuario elija antes
-        // de cargar (no pintar datos del ambiente por defecto).
-        if !self.awaiting_startup_env {
-            self.activate_initial();
-        }
-
+        // Arranca en el menú principal (Screen::Menu por defecto). El picker de
+        // ambiente, si lo hay, se dibuja encima hasta que el usuario elija.
         let mut events = EventStream::new();
         while !self.should_quit {
             terminal.draw(|frame| self.render(frame))?;
@@ -168,15 +176,7 @@ impl App {
         Ok(())
     }
 
-    // --- Activación / routing -------------------------------------------------
-
-    /// Activa la primera vista registrada (si hay) y dispara su carga inicial.
-    fn activate_initial(&mut self) {
-        if !self.registry.is_empty() {
-            let actions = self.on_activate_active();
-            self.dispatch_all(actions);
-        }
-    }
+    // --- Routing --------------------------------------------------------------
 
     fn on_key(&mut self, key: KeyEvent) {
         // Cualquier tecla limpia el estado transitorio.
@@ -194,11 +194,67 @@ impl App {
             self.show_help = false;
             return;
         }
+        // Command/Filter son independientes de la pantalla (editan el input line).
         match self.mode {
-            Mode::Normal => self.on_normal_key(key),
-            Mode::Command => self.on_command_key(key),
-            Mode::Filter => self.on_filter_key(key),
+            Mode::Command => return self.on_command_key(key),
+            Mode::Filter => return self.on_filter_key(key),
+            Mode::Normal => {}
         }
+        // Modo normal: enruta según la pantalla activa.
+        match self.screen {
+            Screen::Menu => self.on_menu_key(key),
+            Screen::View => self.on_normal_key(key),
+        }
+    }
+
+    fn on_menu_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('q') => self.dispatch(Action::Quit),
+            KeyCode::Char(':') => self.enter_command_mode(),
+            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('e') if ctrl => self.open_picker(),
+            KeyCode::Char('j') | KeyCode::Down => self.menu_move(1),
+            KeyCode::Char('k') | KeyCode::Up => self.menu_move(-1),
+            KeyCode::Char('g') | KeyCode::Home => self.menu_select_edge(false),
+            KeyCode::Char('G') | KeyCode::End => self.menu_select_edge(true),
+            KeyCode::Enter => self.menu_activate(),
+            _ => {}
+        }
+    }
+
+    fn menu_len(&self) -> usize {
+        self.registry.metas().len()
+    }
+
+    fn menu_move(&mut self, delta: i32) {
+        let len = self.menu_len();
+        if len == 0 {
+            return;
+        }
+        let cur = self.menu.selected().unwrap_or(0) as i32;
+        self.menu
+            .select(Some((cur + delta).clamp(0, len as i32 - 1) as usize));
+    }
+
+    fn menu_select_edge(&mut self, last: bool) {
+        let len = self.menu_len();
+        if len > 0 {
+            self.menu.select(Some(if last { len - 1 } else { 0 }));
+        }
+    }
+
+    fn menu_activate(&mut self) {
+        let metas = self.registry.metas();
+        if let Some((id, _)) = self.menu.selected().and_then(|sel| metas.get(sel)) {
+            self.dispatch(Action::ActivateView(id.to_string()));
+        }
+    }
+
+    /// Vuelve al menú principal (desde `:menu` o backspace).
+    fn go_home(&mut self) {
+        self.screen = Screen::Menu;
+        self.clear_filter();
     }
 
     fn on_normal_key(&mut self, key: KeyEvent) {
@@ -209,6 +265,7 @@ impl App {
             KeyCode::Char('/') => self.enter_filter_mode(),
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('e') if ctrl => self.open_picker(),
+            KeyCode::Backspace => self.go_home(),
             // Resto: lo maneja la vista activa.
             _ => {
                 let actions = match self.registry.active_mut() {
@@ -272,6 +329,7 @@ impl App {
 
     fn activate_view(&mut self, id: &str) {
         if self.registry.activate(id) {
+            self.screen = Screen::View;
             self.clear_filter();
             let actions = self.on_activate_active();
             self.dispatch_all(actions);
@@ -291,8 +349,11 @@ impl App {
         self.effects.set_env(env);
         self.write_mode = false; // re-armar la seguridad al cambiar de cuenta
         self.clear_filter();
-        let actions = self.on_activate_active();
-        self.dispatch_all(actions);
+        // Solo recargar si estamos dentro de una vista; en el menú no hay qué cargar.
+        if matches!(self.screen, Screen::View) {
+            let actions = self.on_activate_active();
+            self.dispatch_all(actions);
+        }
         self.set_info(format!("ambiente: {}", self.env));
     }
 
@@ -324,12 +385,10 @@ impl App {
     fn on_picker_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
+                // Cancelar: cerrar el picker. En el de arranque, quedarse en el
+                // ambiente por defecto (se aterriza en el menú principal).
                 self.picker = None;
-                // En el picker de arranque, cancelar = usar el ambiente por defecto.
-                if self.awaiting_startup_env {
-                    self.awaiting_startup_env = false;
-                    self.activate_initial();
-                }
+                self.awaiting_startup_env = false;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if let Some(p) = self.picker.as_mut() {
@@ -425,6 +484,7 @@ impl App {
             "" => {}
             "q" | "quit" => self.dispatch(Action::Quit),
             "w" | "write" => self.toggle_write_mode(),
+            "menu" | "home" => self.go_home(),
             id => self.dispatch(Action::ActivateView(id.to_string())),
         }
     }
@@ -491,16 +551,22 @@ impl App {
         ])
         .areas(full);
 
-        let title = self
-            .registry
-            .active()
-            .map(|v| v.title())
-            .unwrap_or_else(|| "—".to_string());
+        let title = match self.screen {
+            Screen::Menu => "menú".to_string(),
+            Screen::View => self
+                .registry
+                .active()
+                .map(|v| v.title())
+                .unwrap_or_else(|| "—".to_string()),
+        };
         header::render(frame, header_area, &self.env, &title, self.write_mode);
 
-        match self.registry.active_mut() {
-            Some(view) => view.render(frame, body_area),
-            None => render_placeholder(frame, body_area),
+        match self.screen {
+            Screen::Menu => self.render_menu(frame, body_area),
+            Screen::View => match self.registry.active_mut() {
+                Some(view) => view.render(frame, body_area),
+                None => render_placeholder(frame, body_area),
+            },
         }
 
         command_bar::render(frame, footer_area, self.footer_state());
@@ -513,6 +579,32 @@ impl App {
         } else if self.show_help {
             help::render(frame, full);
         }
+    }
+
+    fn render_menu(&mut self, frame: &mut Frame, area: Rect) {
+        let metas = self.registry.metas();
+        let block = Block::bordered().title(" herramientas · enter para abrir ");
+        if metas.is_empty() {
+            frame.render_widget(
+                Paragraph::new("(sin herramientas registradas)").block(block),
+                area,
+            );
+            return;
+        }
+        let items: Vec<ListItem> = metas
+            .iter()
+            .map(|(id, desc)| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {id:<10}"), Style::new().bold()),
+                    Span::styled((*desc).to_string(), Style::new().dark_gray()),
+                ]))
+            })
+            .collect();
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(Style::new().reversed())
+            .highlight_symbol("› ");
+        frame.render_stateful_widget(list, area, &mut self.menu);
     }
 
     fn footer_state(&self) -> command_bar::Footer<'_> {
@@ -718,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_picker_esc_loads_default() {
+    fn startup_picker_esc_lands_on_menu() {
         let (mut app, activations) = app_with_counting_view();
         app.picker = Some(Picker::new(vec![profile("dev", None)]));
         app.awaiting_startup_env = true;
@@ -727,16 +819,13 @@ mod tests {
 
         assert!(app.picker.is_none());
         assert!(!app.awaiting_startup_env);
+        assert!(matches!(app.screen, Screen::Menu), "aterriza en el menú");
         assert_eq!(app.epoch, 0, "esc no cambia de ambiente");
-        assert_eq!(
-            activations.get(),
-            1,
-            "esc en el picker de arranque carga el ambiente por defecto"
-        );
+        assert_eq!(activations.get(), 0, "el menú no activa ninguna vista");
     }
 
     #[test]
-    fn startup_picker_enter_switches_and_loads() {
+    fn startup_picker_enter_switches_env_lands_on_menu() {
         let (mut app, activations) = app_with_counting_view();
         app.picker = Some(Picker::new(vec![profile("prod", Some("eu-west-1"))]));
         app.awaiting_startup_env = true;
@@ -747,7 +836,35 @@ mod tests {
         assert!(!app.awaiting_startup_env);
         assert_eq!(app.epoch, 1);
         assert_eq!(app.env, Env::new("prod", "eu-west-1"));
-        assert_eq!(activations.get(), 1, "elegir un profile recarga la vista");
+        assert!(
+            matches!(app.screen, Screen::Menu),
+            "tras elegir ambiente, al menú"
+        );
+        assert_eq!(activations.get(), 0, "el menú no activa ninguna vista");
+    }
+
+    #[test]
+    fn starts_on_menu() {
+        let app = test_app();
+        assert!(matches!(app.screen, Screen::Menu));
+    }
+
+    #[test]
+    fn menu_enter_activates_selected_view() {
+        let (mut app, activations) = app_with_counting_view();
+        assert!(matches!(app.screen, Screen::Menu));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.screen, Screen::View));
+        assert_eq!(activations.get(), 1, "enter en el menú activa la vista");
+    }
+
+    #[test]
+    fn menu_command_returns_home() {
+        let (mut app, _) = app_with_counting_view();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // entra a la vista
+        assert!(matches!(app.screen, Screen::View));
+        type_command(&mut app, "menu");
+        assert!(matches!(app.screen, Screen::Menu));
     }
 
     #[test]

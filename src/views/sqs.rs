@@ -224,6 +224,10 @@ impl View for SqsView {
         "sqs"
     }
 
+    fn description(&self) -> &'static str {
+        "Colas SQS: attributes, peek, purge"
+    }
+
     fn title(&self) -> String {
         match &self.level {
             Level::Queues => "sqs".to_string(),

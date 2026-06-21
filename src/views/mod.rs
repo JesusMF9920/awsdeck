@@ -42,6 +42,11 @@ pub trait View {
 
     /// Dibuja la vista dentro de `area`.
     fn render(&mut self, frame: &mut Frame, area: Rect);
+
+    /// Descripción de una línea para el menú principal. Default vacío.
+    fn description(&self) -> &'static str {
+        ""
+    }
 }
 
 /// Registro de vistas. Genérico: no conoce ningún servicio. La primera vista
@@ -62,10 +67,6 @@ impl Registry {
     /// Registra una vista concreta (llamado solo desde el composition root).
     pub fn register(&mut self, view: Box<dyn View>) {
         self.views.push(view);
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.views.is_empty()
     }
 
     /// Referencia a la vista activa, o `None` si el registry está vacío (p. ej.
@@ -95,6 +96,15 @@ impl Registry {
     /// Ids registrados (para validar comandos y, a futuro, autocompletar).
     pub fn ids(&self) -> Vec<&'static str> {
         self.views.iter().map(|v| v.id()).collect()
+    }
+
+    /// `(id, description)` de cada vista, en orden de registro. Lo usa el menú
+    /// principal; el core sigue sin nombrar servicios.
+    pub fn metas(&self) -> Vec<(&'static str, &'static str)> {
+        self.views
+            .iter()
+            .map(|v| (v.id(), v.description()))
+            .collect()
     }
 }
 

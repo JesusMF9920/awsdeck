@@ -175,6 +175,10 @@ impl View for LogsView {
         "logs"
     }
 
+    fn description(&self) -> &'static str {
+        "CloudWatch Log Groups & Streams"
+    }
+
     fn title(&self) -> String {
         match &self.level {
             Level::Groups => "logs".to_string(),

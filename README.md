@@ -55,7 +55,7 @@ se muestra en la **status bar** (no crashea).
 
 ```bash
 AWSDECK_MOCK=1 cargo run    # ver el TUI con datos, sin tocar AWS
-cargo test                  # 50 tests, sin red
+cargo test                  # 97 tests, sin red
 cargo clippy --all-targets  # lint
 cargo fmt --check           # formato
 ```
@@ -82,6 +82,11 @@ cuenta anterior (probado en `app::tests::epoch_guard_discards_stale_and_accepts_
 **Escala (logs):** con miles de log groups, `logs` no los carga todos — trae una página (≤50)
 y `/` consulta al servidor por substring (`logGroupNamePattern`, debounced ~280ms), rankeando
 los resultados con fuzzy local. El título indica `· parcial` cuando hay más en el servidor.
+
+**Escala (sfn):** las state machines se **paginan** (se traen todas, alcanzables por el fuzzy);
+las ejecuciones muestran las 50 más recientes y marcan `· parcial (recientes)` si hay más. El
+filtro **no se arrastra** al drillear (estilo k9s: cada nivel arranca limpio), y `/` filtra en
+los 3 niveles, incluido el timeline del detalle (por nombre de estado).
 
 ## Arquitectura (resumen)
 

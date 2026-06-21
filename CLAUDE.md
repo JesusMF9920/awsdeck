@@ -138,11 +138,25 @@ no los `#[non_exhaustive]` del SDK); `DateTime → millis` vía `.to_millis().ok
   `set_filter` ya pone la selección en el mejor match al teclear, esto conserva ese baseline
   cuando no navegaste y respeta tu posición (flechas en filtro) cuando sí; cae al tope si el item
   desapareció. Aplica también al `r` refresh. (SQS ya solo hacía `clamp_selection`.)
+- **Listas `sfn` sin truncado silencioso**: las máquinas se **paginan** (`fetch_state_machines`
+  sigue `next_token`, tope `MAX_MACHINE_PAGES=20` → todas alcanzables por el fuzzy); las
+  ejecuciones traen las 50 más recientes y marcan `· parcial (recientes)` si hay `next_token`.
+  `Message::{StateMachinesLoaded,ExecutionsLoaded}` llevan `more`; el título muestra `· parcial`
+  (espeja el patrón de `logs`).
+- **El filtro no se arrastra entre niveles** (`Action::ClearFilter`): intención core agnóstica
+  (como `Action::Back`) que la vista emite al drillear/back; el `App` —dueño del filtro— la
+  ejecuta (`clear_filter` + `fire_search_now`, recarga sin filtro en server-side, no-op en
+  client-side). Cablada en `logs`/`sqs`/`sfn`; `logs` además recarga la página completa al volver
+  a groups si veníamos de una búsqueda server-side (el cache estaba acotado a esa query).
+- **`/` filtra en los 3 niveles de `sfn`**: el timeline de `Detail` también se filtra por nombre
+  de estado (`filtered_history_indices`), útil en histories largos (Map/Parallel); la
+  preselección del estado fallido se mapea a su posición en la lista visible.
 
-89 tests sin red (routing, epoch guard, gate de mutaciones —purge y redrive—, fuzzy, menú,
+97 tests sin red (routing, epoch guard, gate de mutaciones —purge y redrive—, fuzzy, menú,
 búsqueda/staleness, drill x3, back→menú de dos etapas, navegación en filtro, preservación de
-selección, guard EXPRESS, `parse_history`, parsers, render con `TestBackend`). `AWSDECK_MOCK=1
-cargo run` lo abre sin credenciales.
+selección, `ClearFilter` al cambiar de nivel, señal `· parcial`, filtro del timeline, guard
+EXPRESS, `parse_history`, parsers, render con `TestBackend`). `AWSDECK_MOCK=1 cargo run` lo abre
+sin credenciales.
 
 Pendiente: v3 `events` (no iniciada), eventos de log (3er nivel en `logs`), input/output por
 estado en el timeline de `sfn`, `y` (copiar ARN), abrir en consola (`o`), config en disco.

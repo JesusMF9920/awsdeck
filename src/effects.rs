@@ -14,7 +14,9 @@ use tokio::sync::mpsc;
 
 use crate::action::Action;
 use crate::aws::context::{AwsContext, Env};
-use crate::message::{Envelope, LogGroupDto, LogStreamDto, Message};
+use crate::message::{
+    Envelope, LogGroupDto, LogStreamDto, Message, QueueAttrsDto, QueueDto, QueueMessageDto,
+};
 
 /// Fuente de datos.
 enum Backend {
@@ -62,6 +64,9 @@ impl Effects {
         match action {
             Action::LoadLogGroups => self.load_log_groups(epoch),
             Action::LoadLogStreams { group } => self.load_log_streams(group, epoch),
+            Action::LoadQueues => self.load_queues(epoch),
+            Action::LoadQueueDetail { queue_url } => self.load_queue_detail(queue_url, epoch),
+            Action::PurgeQueue { queue_url } => self.purge_queue(queue_url, epoch),
             Action::Quit | Action::ActivateView(_) | Action::SwitchEnv(_) => {}
         }
     }
@@ -115,6 +120,65 @@ impl Effects {
             }
         }
     }
+
+    fn load_queues(&self, epoch: u64) {
+        let tx = self.tx.clone();
+        match &self.backend {
+            Backend::Mock(env) => {
+                let env = env.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let msg = Message::QueuesLoaded(mock_queues(&env));
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+            // El backend real de SQS llega en "feat(sqs): backend real".
+            Backend::Real(_) => spawn_sqs_pending(tx, epoch),
+        }
+    }
+
+    fn load_queue_detail(&self, queue_url: String, epoch: u64) {
+        let tx = self.tx.clone();
+        match &self.backend {
+            Backend::Mock(_) => {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(450)).await;
+                    let (attrs, messages) = mock_queue_detail(&queue_url);
+                    let msg = Message::QueueDetailLoaded {
+                        queue_url,
+                        attrs,
+                        messages,
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+            Backend::Real(_) => spawn_sqs_pending(tx, epoch),
+        }
+    }
+
+    fn purge_queue(&self, queue_url: String, epoch: u64) {
+        let tx = self.tx.clone();
+        match &self.backend {
+            Backend::Mock(_) => {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let msg = Message::QueuePurged { queue_url };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+            Backend::Real(_) => spawn_sqs_pending(tx, epoch),
+        }
+    }
+}
+
+/// Stub temporal: el backend real de SQS llega en un commit posterior; por ahora
+/// responde con un error informativo para que el real no quede colgado en "cargando".
+fn spawn_sqs_pending(tx: mpsc::Sender<Envelope>, epoch: u64) {
+    tokio::spawn(async move {
+        let msg =
+            Message::Error("vista sqs contra AWS real: pendiente — usa AWSDECK_MOCK=1".into());
+        let _ = tx.send(Envelope::new(epoch, msg)).await;
+    });
 }
 
 // --- SDK real -----------------------------------------------------------------
@@ -211,6 +275,60 @@ fn mock_log_streams(group: &str) -> Vec<LogStreamDto> {
         .collect()
 }
 
+/// Colas SQS falsas del ambiente. Incluye una `.fifo` y una `*-dlq`; un par llevan
+/// el `profile` activo para que un cambio de ambiente sea visible.
+fn mock_queues(env: &Env) -> Vec<QueueDto> {
+    let names = [
+        format!("{}-orders", env.profile),
+        format!("{}-payments.fifo", env.profile),
+        "notifications".to_string(),
+        "checkout-events".to_string(),
+        "image-processing".to_string(),
+        "orders-dlq".to_string(),
+    ];
+    names
+        .into_iter()
+        .map(|name| {
+            let is_fifo = name.ends_with(".fifo");
+            let url = format!(
+                "https://sqs.{}.amazonaws.com/000000000000/{}",
+                env.region, name
+            );
+            QueueDto { name, url, is_fifo }
+        })
+        .collect()
+}
+
+/// Detalle falso (attributes + peek) de una cola, determinista por el URL. Las
+/// colas que no son `*-dlq` traen una DLQ configurada (RedrivePolicy).
+fn mock_queue_detail(url: &str) -> (QueueAttrsDto, Vec<QueueMessageDto>) {
+    let name = url.rsplit('/').next().unwrap_or(url);
+    let seed: i64 = url.bytes().map(i64::from).sum::<i64>();
+    let visible = seed % 137;
+    let is_dlq = name.contains("dlq");
+
+    let attrs = QueueAttrsDto {
+        visible: Some(visible),
+        in_flight: Some(seed % 19),
+        delayed: Some(0),
+        arn: Some(format!("arn:aws:sqs:us-east-1:000000000000:{name}")),
+        dlq_target_arn: (!is_dlq).then(|| format!("arn:aws:sqs:us-east-1:000000000000:{name}-dlq")),
+        max_receive_count: (!is_dlq).then_some(5),
+    };
+
+    let base_ts: i64 = 1_750_000_000_000;
+    let messages = (0..visible.min(8))
+        .map(|i| QueueMessageDto {
+            id: format!("{name}-msg-{i}"),
+            body: format!("{{\"event\":\"sample\",\"n\":{i},\"queue\":\"{name}\"}}"),
+            sent_ts: Some(base_ts - i * 53_000),
+            receive_count: Some((i % 3) + 1),
+        })
+        .collect();
+
+    (attrs, messages)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +375,67 @@ mod tests {
             }
             other => panic!("mensaje inesperado: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn mock_queues_loaded_with_epoch_and_fifo() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+
+        fx.dispatch(Action::LoadQueues, 5);
+
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        assert_eq!(envelope.epoch, 5);
+        match envelope.message {
+            Message::QueuesLoaded(queues) => {
+                assert!(!queues.is_empty());
+                assert!(queues.iter().any(|q| q.is_fifo), "hay una cola .fifo");
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_queue_detail_has_dlq_for_normal_queue() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+        let url = "https://sqs.us-east-1.amazonaws.com/000000000000/orders".to_string();
+
+        fx.dispatch(
+            Action::LoadQueueDetail {
+                queue_url: url.clone(),
+            },
+            2,
+        );
+
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        assert_eq!(envelope.epoch, 2);
+        match envelope.message {
+            Message::QueueDetailLoaded {
+                queue_url, attrs, ..
+            } => {
+                assert_eq!(queue_url, url);
+                assert!(attrs.has_dlq(), "una cola normal tiene DLQ configurada");
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_purge_replies_purged() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+        let url = "https://sqs.us-east-1.amazonaws.com/000000000000/orders".to_string();
+
+        fx.dispatch(
+            Action::PurgeQueue {
+                queue_url: url.clone(),
+            },
+            1,
+        );
+
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        assert_eq!(envelope.epoch, 1);
+        assert!(matches!(envelope.message, Message::QueuePurged { queue_url } if queue_url == url));
     }
 }

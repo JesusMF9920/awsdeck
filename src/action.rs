@@ -23,4 +23,12 @@ pub enum Action {
     LoadLogGroups,
     /// Hacer drill: pedir los log streams de un log group.
     LoadLogStreams { group: String },
+    /// Pedir la lista de colas SQS del ambiente activo.
+    LoadQueues,
+    /// Hacer drill a una cola: attributes + peek de mensajes.
+    LoadQueueDetail { queue_url: String },
+
+    // --- Mutantes: gated por el `App` (modo escritura + confirm) antes de effects ---
+    /// Purgar una cola: borra TODOS sus mensajes. Irreversible.
+    PurgeQueue { queue_url: String },
 }

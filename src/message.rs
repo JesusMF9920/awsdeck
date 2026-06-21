@@ -25,6 +25,41 @@ pub struct LogStreamDto {
     pub last_event_ts: Option<i64>,
 }
 
+/// Una cola de SQS (datos para la lista).
+#[derive(Clone, Debug)]
+pub struct QueueDto {
+    pub name: String,
+    pub url: String,
+    pub is_fifo: bool,
+}
+
+/// Attributes de una cola; se cargan al hacer drill (un request por cola).
+#[derive(Clone, Debug, Default)]
+pub struct QueueAttrsDto {
+    pub visible: Option<i64>,
+    pub in_flight: Option<i64>,
+    pub delayed: Option<i64>,
+    pub arn: Option<String>,
+    /// ARN de la DLQ (de `RedrivePolicy`), si la cola tiene una configurada.
+    pub dlq_target_arn: Option<String>,
+    pub max_receive_count: Option<i64>,
+}
+
+impl QueueAttrsDto {
+    pub fn has_dlq(&self) -> bool {
+        self.dlq_target_arn.is_some()
+    }
+}
+
+/// Un mensaje peekeado (receive sin borrar) de una cola.
+#[derive(Clone, Debug)]
+pub struct QueueMessageDto {
+    pub id: String,
+    pub body: String,
+    pub sent_ts: Option<i64>,
+    pub receive_count: Option<i64>,
+}
+
 /// Resultado de una operación async. Específico de servicio a propósito
 /// (`message.rs` es frontera permitida para nombrar servicios).
 #[derive(Clone, Debug)]
@@ -37,6 +72,17 @@ pub enum Message {
         group: String,
         streams: Vec<LogStreamDto>,
     },
+    /// Se cargaron las colas del ambiente activo.
+    QueuesLoaded(Vec<QueueDto>),
+    /// Detalle de una cola (attributes + peek). `queue_url` permite a la vista
+    /// confirmar que corresponde al drill actual.
+    QueueDetailLoaded {
+        queue_url: String,
+        attrs: QueueAttrsDto,
+        messages: Vec<QueueMessageDto>,
+    },
+    /// Se purgó una cola (acción mutante confirmada).
+    QueuePurged { queue_url: String },
     /// Algo falló: se muestra en la status bar, nunca hace panic.
     Error(String),
 }

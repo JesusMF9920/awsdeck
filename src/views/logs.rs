@@ -8,7 +8,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::View;
 use crate::action::Action;
@@ -70,6 +70,11 @@ pub struct LogsView {
     /// Generación de la consulta de tail vigente: sube en cada consulta *fresca*
     /// (ventana/patrón/drill) y NO en load-more; descarta respuestas con generation viejo.
     tail_gen: u64,
+    /// Línea expandida: índice ABSOLUTO en `events` del evento abierto en el panel de
+    /// detalle (`enter` sobre una línea). `None` = mostrando la lista.
+    detail: Option<usize>,
+    /// Scroll vertical del panel de detalle (líneas).
+    detail_scroll: u16,
     /// Selección de la lista visible (índice dentro de la lista filtrada).
     state: ListState,
 }
@@ -89,8 +94,44 @@ impl LogsView {
             tail_preset: DEFAULT_PRESET,
             tail_token: None,
             tail_gen: 0,
+            detail: None,
+            detail_scroll: 0,
             state: ListState::default().with_selected(Some(0)),
         }
+    }
+
+    /// Abre el panel de detalle del evento seleccionado (índice absoluto en `events`).
+    fn open_detail(&mut self) {
+        if let Some(sel) = self.state.selected()
+            && let Some(&idx) = self.filtered_event_indices().get(sel)
+        {
+            self.detail = Some(idx);
+            self.detail_scroll = 0;
+        }
+    }
+
+    fn close_detail(&mut self) {
+        self.detail = None;
+        self.detail_scroll = 0;
+    }
+
+    /// Teclas mientras el panel de detalle está abierto: scroll + cerrar.
+    fn detail_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.detail_scroll = self.detail_scroll.saturating_add(1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(1)
+            }
+            KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(10),
+            KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
+            KeyCode::Char('g') | KeyCode::Home => self.detail_scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => self.detail_scroll = u16::MAX, // clamp al render
+            KeyCode::Esc | KeyCode::Enter => self.close_detail(),
+            _ => {}
+        }
+        vec![]
     }
 
     /// Group del nivel actual: el seleccionado en `Groups`, o el del nivel si ya estás
@@ -250,8 +291,11 @@ impl LogsView {
                     None => vec![],
                 }
             }
-            // Hojas (líneas de log): enter no hace nada (v0 es solo-lectura).
-            Level::Events { .. } | Level::Tail { .. } => vec![],
+            // Hojas (líneas de log): enter expande la línea seleccionada.
+            Level::Events { .. } | Level::Tail { .. } => {
+                self.open_detail();
+                vec![]
+            }
         }
     }
 
@@ -431,6 +475,42 @@ impl LogsView {
             )
         }
     }
+
+    /// Pinta el evento expandido: cabecera (hora · stream) + mensaje completo con wrap
+    /// y scroll; JSON pretty si parsea. Ocupa el cuerpo entero (en vez de la lista).
+    fn render_detail(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(idx) = self.detail else { return };
+        if idx >= self.events.len() {
+            // El evento ya no existe (una recarga lo movió): cierra el detalle.
+            self.close_detail();
+            frame.render_widget(
+                Paragraph::new("(evento no disponible)").block(Block::bordered()),
+                area,
+            );
+            return;
+        }
+        let e = &self.events[idx];
+        let when =
+            e.ts.map(fmt_epoch_millis)
+                .unwrap_or_else(|| "—".to_string());
+        let stream = e
+            .stream
+            .as_deref()
+            .map(|s| format!(" · {s}"))
+            .unwrap_or_default();
+        let body = pretty_or_raw(&e.message); // string propio: libera el préstamo de `e`
+        let total = body.lines().count() as u16;
+
+        // Clampa el scroll (soporta `G` = u16::MAX) al final del contenido.
+        self.detail_scroll = self.detail_scroll.min(total.saturating_sub(1));
+
+        let title = format!(" {when}{stream} · esc cierra · j/k scroll ");
+        let para = Paragraph::new(body)
+            .block(Block::bordered().title(title))
+            .wrap(Wrap { trim: false })
+            .scroll((self.detail_scroll, 0));
+        frame.render_widget(para, area);
+    }
 }
 
 impl Default for LogsView {
@@ -472,6 +552,10 @@ impl View for LogsView {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        // Con el panel de detalle abierto, las teclas scrollean/cierran.
+        if self.detail.is_some() {
+            return self.detail_key(key);
+        }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.move_selection(1);
@@ -656,6 +740,12 @@ impl View for LogsView {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect) {
+        // Panel de detalle: ocupa el cuerpo entero con el mensaje completo.
+        if self.detail.is_some() {
+            self.render_detail(frame, area);
+            return;
+        }
+
         let block = Block::bordered().title(self.body_title());
 
         let items: Vec<ListItem> = match self.level {
@@ -745,8 +835,19 @@ fn event_item(e: &LogEventDto) -> ListItem<'static> {
             Style::new().cyan(),
         ));
     }
-    spans.push(Span::styled(e.message.clone(), severity_style(&e.message)));
+    // Preview de una sola fila: colapsa saltos (el mensaje completo se ve con `enter`).
+    let preview = e.message.replace(['\n', '\r'], " ");
+    spans.push(Span::styled(preview, severity_style(&e.message)));
     ListItem::new(Line::from(spans))
+}
+
+/// Pretty-print del mensaje si es JSON válido; si no, el texto tal cual. Para el panel
+/// de detalle (`enter`), donde sí queremos saltos de línea e indentación.
+fn pretty_or_raw(msg: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(msg.trim())
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| msg.to_string())
 }
 
 /// Sufijo corto e identificable de un nombre de stream (la parte tras `]`, p. ej.
@@ -1090,6 +1191,72 @@ mod tests {
             "el título muestra la ventana de tiempo"
         );
         assert!(text.contains("abc123"), "muestra el sufijo del stream");
+    }
+
+    #[test]
+    fn enter_opens_line_detail() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut v = LogsView::new();
+        into_events(&mut v);
+        let long = format!("INFO payload {}", "z".repeat(120));
+        v.on_message(&events_loaded("/svc", "stream-a", vec![ev(&long, 1)]));
+        v.on_key(key(KeyCode::Enter)); // abre el detalle del evento seleccionado
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|f| v.render(f, f.area())).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("esc cierra"),
+            "el panel de detalle muestra el hint"
+        );
+        assert!(
+            text.contains("zzzz"),
+            "muestra el contenido completo (wrapped) que la lista truncaría"
+        );
+    }
+
+    #[test]
+    fn esc_closes_line_detail() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut v = LogsView::new();
+        into_events(&mut v);
+        v.on_message(&events_loaded("/svc", "stream-a", vec![ev("INFO hola", 1)]));
+        v.on_key(key(KeyCode::Enter)); // abre
+        v.on_key(key(KeyCode::Esc)); // cierra
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal.draw(|f| v.render(f, f.area())).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("eventos"),
+            "vuelve a la lista (título eventos)"
+        );
+        assert!(!text.contains("esc cierra"), "el panel de detalle se cerró");
+    }
+
+    #[test]
+    fn detail_pretty_prints_json() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut v = LogsView::new();
+        into_events(&mut v);
+        v.on_message(&events_loaded(
+            "/svc",
+            "stream-a",
+            vec![ev(r#"{"orderId":"A-1","ok":true}"#, 1)],
+        ));
+        v.on_key(key(KeyCode::Enter));
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|f| v.render(f, f.area())).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("orderId"), "muestra la clave del JSON pretty");
+        assert!(text.contains("A-1"), "muestra el valor");
     }
 
     #[test]

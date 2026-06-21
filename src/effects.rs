@@ -620,9 +620,11 @@ const TAIL_LIMIT: i32 = 1000;
 /// Tope de páginas que `fetch_log_tail` junta por request (auto-paginación). Lo que
 /// quede más allá se reporta vía `next_token` y el usuario lo trae con `o` (load-more).
 const MAX_TAIL_PAGES: usize = 10;
-/// Tope por línea: las líneas de log pueden ser enormes (stack traces, JSON); no
-/// pasamos cientos de KB a la vista. Colapsa saltos de línea para una fila por evento.
-const MAX_LINE: usize = 2048;
+/// Tope por mensaje: las líneas de log pueden ser enormes (stack traces, JSON); no
+/// pasamos cientos de KB a la vista, pero sí lo suficiente para expandir y leer el
+/// evento completo (`enter` abre el detalle). Se conservan los saltos de línea (el
+/// detalle los muestra; la lista los colapsa al render).
+const MAX_LINE: usize = 16 * 1024;
 
 /// Epoch en millis (UTC) ahora. La vista nunca ve relojes: effects acota la ventana.
 fn now_millis() -> i64 {
@@ -632,17 +634,18 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// Recorta una línea de log a `MAX_LINE` y colapsa saltos a espacio (una fila/evento).
+/// Recorta un mensaje de log a `MAX_LINE` (preservando saltos de línea para el panel
+/// de detalle). La fila de la lista los colapsa a espacio al render.
 fn clip_message(raw: Option<&str>) -> String {
-    let one_line = raw.unwrap_or_default().replace(['\n', '\r'], " ");
-    if one_line.len() <= MAX_LINE {
-        return one_line;
+    let s = raw.unwrap_or_default();
+    if s.len() <= MAX_LINE {
+        return s.to_string();
     }
     let mut end = MAX_LINE;
-    while !one_line.is_char_boundary(end) {
+    while !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…", &one_line[..end])
+    format!("{}…", &s[..end])
 }
 
 /// Eventos recientes de un stream (`get_log_events`, hasta `EVENTS_LIMIT`). Orden

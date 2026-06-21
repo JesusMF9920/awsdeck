@@ -11,6 +11,9 @@
 pub struct LogGroupDto {
     pub name: String,
     pub stored_bytes: Option<i64>,
+    /// ARN del log group. Reservado para `y` (copiar ARN/URL) en v1; el SDK ya lo
+    /// puebla aunque v0 todavía no lo muestre.
+    #[allow(dead_code)]
     pub arn: Option<String>,
 }
 

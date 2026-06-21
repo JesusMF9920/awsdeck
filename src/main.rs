@@ -21,6 +21,7 @@ use crate::aws::context::Env;
 use crate::effects::Effects;
 use crate::tui::Tui;
 use crate::views::Registry;
+use crate::views::logs::LogsView;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -30,10 +31,10 @@ async fn main() -> Result<()> {
     let (tx, rx) = mpsc::channel(64);
     let effects = Effects::new(tx, env.clone());
 
-    // Registry de vistas. El commit "logs view" registra aquí la primera vista
-    // concreta: `registry.register(Box::new(LogsView::new()));`. Es el único
-    // punto donde se nombra un servicio en el arranque.
-    let registry = Registry::new();
+    // Registry de vistas. Aquí —y solo aquí, en el composition root— se nombran
+    // las vistas concretas. Agregar un servicio = registrar una línea más.
+    let mut registry = Registry::new();
+    registry.register(Box::new(LogsView::new()));
 
     let mut app = App::new(env, registry, effects, rx);
 

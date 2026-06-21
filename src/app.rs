@@ -127,7 +127,7 @@ impl App {
     fn on_normal_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.dispatch(Action::Quit),
             KeyCode::Char(':') => self.enter_command_mode(),
             KeyCode::Char('/') => self.enter_filter_mode(),
             KeyCode::Char('?') => self.show_help = true,
@@ -242,8 +242,8 @@ impl App {
     fn run_command(&mut self, cmd: &str) {
         match cmd {
             "" => {}
-            "q" | "quit" => self.should_quit = true,
-            id => self.activate_view(id),
+            "q" | "quit" => self.dispatch(Action::Quit),
+            id => self.dispatch(Action::ActivateView(id.to_string())),
         }
     }
 

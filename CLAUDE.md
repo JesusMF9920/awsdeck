@@ -92,8 +92,20 @@ detrás del **gate prod-safe**: modo escritura (`:write`, badge rojo `[ESCRITURA
 modal (`ui/confirm.rs`); el gate vive en `App::dispatch` (`is_mutating` → `request_confirm`) y
 es reusable para v2/v3. `switch_env` resetea el modo escritura.
 
-40 tests sin red (routing, epoch guard, gate de mutaciones, filtro, drill, parsers, render con
-`TestBackend`). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
+**Pulido (UX a escala):**
+- **Menú principal** como pantalla de inicio (`Screen::{Menu,View}` en `App`): lista las
+  herramientas (`Registry::metas` → `id` + `View::description`), navegación vim, `enter` abre,
+  `:menu`/backspace vuelve. Nuevas vistas aparecen solas. Tras el picker de ambiente se aterriza
+  en el menú (ya no auto-activa logs).
+- **Búsqueda fuzzy** (`util::fuzzy_score` + `util::ranked`): subsecuencia con ranking en `logs` y
+  `sqs` ("ordapi" encuentra "orders-api"); reemplaza el `contains`.
+- **Logs a escala**: no carga todos los groups. `LoadLogGroups { query }` trae una página
+  acotada (`describe_log_groups().limit(50)`); con query usa `log_group_name_pattern` (substring
+  server-side). `View::search` + debounce ~280ms en el loop (`sleep_until`): cada tecla re-rankea
+  local y, al parar, consulta al server. `last_query` descarta respuestas viejas (latest wins).
 
-Pendiente: v2 `sfn`, v3 `events` (no iniciadas), `y` (copiar ARN), abrir en consola (`o`),
-config en disco.
+50 tests sin red (routing, epoch guard, gate de mutaciones, fuzzy, menú, búsqueda/staleness,
+drill, parsers, render con `TestBackend`). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
+
+Pendiente: v2 `sfn`, v3 `events` (no iniciadas), eventos de log (3er nivel en `logs`), `y`
+(copiar ARN), abrir en consola (`o`), config en disco.

@@ -36,10 +36,11 @@ se muestra en la **status bar** (no crashea).
 
 | Tecla | Acción |
 |-------|--------|
-| `:` | command bar (saltar de servicio, p. ej. `:logs`, `:sqs`) |
-| `/` | filtrar la lista actual |
-| `enter` | drill (entrar al detalle) |
+| `:` | command bar (saltar de herramienta, p. ej. `:logs`, `:sqs`) |
+| `/` | buscar (fuzzy; en `logs` consulta al servidor) |
+| `enter` | abrir herramienta (menú) / drill al detalle |
 | `esc` | volver |
+| `:menu` · `backspace` | volver al menú principal |
 | `j` / `k` · `↑` / `↓` · `g` / `G` | navegar |
 | `r` | refrescar |
 | `p` | purgar cola SQS (gated: modo escritura + confirm) |
@@ -52,20 +53,26 @@ se muestra en la **status bar** (no crashea).
 
 ```bash
 AWSDECK_MOCK=1 cargo run    # ver el TUI con datos, sin tocar AWS
-cargo test                  # 18 tests, sin red
+cargo test                  # 50 tests, sin red
 cargo clippy --all-targets  # lint
 cargo fmt --check           # formato
 ```
 
 Recorrido rápido (con `AWSDECK_MOCK=1 cargo run`):
 
-1. Arranca en `logs` y lista log groups (el header muestra `profile · region`).
-2. `/` filtra en vivo; `enter` hace **drill** a los streams; `esc` regresa.
+1. Arranca en el **menú principal**; `j`/`k` + `enter` para abrir una herramienta (`logs`, `sqs`).
+   `:menu` o `backspace` vuelven al menú.
+2. En `logs`/`sqs`, `/` **busca fuzzy** (p. ej. `ordapi` encuentra `orders-api`); `enter` hace
+   **drill** al detalle; `esc` regresa.
 3. `ctrl-e` abre el picker; elige otro profile → el ambiente y la lista cambian.
 4. `?` muestra la ayuda; `q` sale y la terminal queda limpia.
 
 **Epoch guard:** al cambiar de ambiente con un request en vuelo, nunca se pintan datos de la
 cuenta anterior (probado en `app::tests::epoch_guard_discards_stale_and_accepts_fresh`).
+
+**Escala (logs):** con miles de log groups, `logs` no los carga todos — trae una página (≤50)
+y `/` consulta al servidor por substring (`logGroupNamePattern`, debounced ~280ms), rankeando
+los resultados con fuzzy local. El título indica `· parcial` cuando hay más en el servidor.
 
 ## Arquitectura (resumen)
 

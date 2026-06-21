@@ -148,9 +148,13 @@ Entrega:
 
 **Extensión (cierre del ciclo `cwtail`) — ✅ hecho:** `logs` ya no se queda en streams. 3er nivel
 **`Events`** (`enter` en un stream → sus líneas vía `get_log_events`, newest abajo, color por
-severidad) y **`Tail`** del group (tecla `t` → `filter_log_events` sobre todos sus streams, `/`
-filtra server-side por `filter_pattern`). Carga puntual + `r` (sin polling); `LogEventDto` plano,
-mock + real, sin gate (lectura). Pendiente: tail en vivo (`tail -f`) y expandir una línea completa.
+severidad) y **logs del group por rango de tiempo** (`Tail`, tecla `t` → `filter_log_events` sobre
+todos sus streams). El **rango** se elige con presets (`w`/`W`: 15m…7d) o por command bar
+(`:since 2d`, `:from 2026-06-19 [to …]`, UTC) vía el hook `View::on_command`; la ventana se **pagina**
+(auto + `o` para cargar más) con staleness por `generation`. `/` filtra server-side (`filter_pattern`).
+**Expandir una línea**: `enter` sobre un evento abre el mensaje completo (wrap + scroll, JSON pretty;
+`esc` cierra). `LogWindow` plano (el reloj solo en `effects`); mock + real, sin gate (lectura).
+Pendiente: tail en vivo (`tail -f`).
 
 ### v1 — Vista `sqs` — ✅ hecho
 Listar colas del ambiente; ver attributes (mensajes visibles, in-flight, DLQ); *peek* de mensajes (receive sin borrar). Acción mutante `PurgeQueue` detrás de confirm + modo escritura.

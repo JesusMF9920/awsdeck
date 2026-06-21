@@ -167,22 +167,32 @@ list/describe).
   preselección del estado fallido se mapea a su posición en la lista visible.
 - **Contenido de los logs (`logs` cierra el ciclo de `cwtail`)**: el `Level` de `logs` crece a 4.
   **`Events`** (3er nivel): `enter` en un stream → sus líneas más recientes (`get_log_events`, las
-  últimas 200, *newest abajo*); `esc` vuelve a streams (siguen en cache, no recarga). **`Tail`**
-  (tecla `t` sobre un group, *sibling* de streams): `filter_log_events` sobre **todos** los streams
-  del group en la última hora; `esc` vuelve a groups. `/` filtra **local** (substring) en `Events`
-  y **server-side** (`filter_pattern`, reusa `search`/`last_query` latest-wins) en `Tail`; color por
-  severidad (ERROR rojo, WARN amarillo); señal `· parcial`. DTO `LogEventDto` plano (`ts`/`message`/
-  `stream`); `stream: Some` solo en el tail. Lectura pura: **sin gate, sin tocar `app.rs`** (las
-  nuevas `Message` no cambian listados → no re-dispatch). Mock + SDK real; `effects` acota la ventana
-  del tail con `SystemTime` (la vista nunca ve relojes) y recorta líneas (`clip_message`, 2KB).
+  últimas 200, *newest abajo*; sigue `nextBackwardToken` porque la API puede devolver una página
+  vacía con eventos); `esc` vuelve a streams (siguen en cache). **`Tail`** = **logs del group por
+  rango de tiempo** (tecla `t`, *sibling* de streams; `filter_log_events` sobre **todos** los
+  streams): `esc` vuelve a groups.
+  - **Rango configurable de dos formas**: presets con `w`/`W` (15m/1h/6h/24h/3d/7d) y command bar
+    `:since 2d` / `:from 2026-06-19[T17:00] [to …]` (UTC), vía el hook agnóstico `View::on_command`
+    (el `App` reenvía comandos no-core a la vista). `LogWindow { Last | Range }` plano; el reloj vive
+    solo en `effects`. **Completitud**: `effects` auto-pagina la ventana (`MAX_TAIL_PAGES`) y `o`
+    carga la siguiente página (append). **Staleness por `generation`** (sube en consulta fresca:
+    ventana/patrón/drill; se conserva en load-more) en vez del eco de query.
+  - **Expandir una línea**: `enter` sobre un evento abre un panel (interno a la vista, sin overlay)
+    con el mensaje **completo** (wrap + scroll `j/k`,`g/G`,`PgUp/Dn`; JSON pretty si parsea); `esc`
+    cierra. `clip_message` conserva saltos (cap 16KB); la fila de la lista los colapsa al render.
+  - `/` filtra **local** (substring) en `Events` y **server-side** (`filter_pattern`) en `Tail`; color
+    por severidad (ERROR rojo, WARN amarillo); señal `· parcial`. Lectura pura: **sin gate** (las
+    nuevas `Message` no cambian listados → no re-dispatch). `util::parse_duration`/`parse_datetime`
+    (UTC, sin crate de fechas). Mock + SDK real.
 
-134 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, fuzzy, menú,
+149 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, fuzzy, menú,
 búsqueda/staleness, drill x3 en `sfn`/`events` y eventos/tail de `logs`, back→menú de dos etapas,
 navegación en filtro, preservación de selección, `ClearFilter` al cambiar de nivel, señal `· parcial`,
-filtro del timeline/targets/eventos, guard EXPRESS, `parse_history`, parsers, render con
-`TestBackend`). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
+rango de tiempo del tail —`w`/`o`/`:since`/`:from-to`, staleness por gen, append—, expandir línea
+(JSON pretty), parsers de fecha/duración, guard EXPRESS, `parse_history`, render con `TestBackend`).
+`AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
 
 Pendiente: `SendEvent` con payload editable (form multi-campo; v3 envía un evento canned), tail en
-vivo (`tail -f`) y ver una línea completa expandida en `logs` (hoy es carga puntual + `r`),
-input/output por estado en el timeline de `sfn`, `y` (copiar ARN), abrir en consola (`o`), config en
-disco. Backlog de vistas: Lambda, DynamoDB, ECS…
+vivo (`tail -f`) en `logs` (hoy es carga puntual + `r`/`o`), input/output por estado en el timeline de
+`sfn`, `y` (copiar ARN), abrir en consola (`o` ya se usa para paginar logs), config en disco. Backlog
+de vistas: Lambda, DynamoDB, ECS…

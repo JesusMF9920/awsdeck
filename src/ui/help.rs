@@ -12,12 +12,18 @@ const KEYS: &[(&str, &str)] = &[
     ("/", "buscar (fuzzy; ↑/↓ navega sin salir)"),
     (
         "enter",
-        "abrir herramienta / drill (group → stream → eventos)",
+        "drill (group → stream → eventos) · en una línea, expandir",
     ),
     ("esc", "con filtro: lo limpia; si no, volver (raíz → menú)"),
     (":menu / bksp", "volver al menú principal"),
     ("r", "refresh"),
-    ("t", "tail del group (logs) — eventos de todos sus streams"),
+    ("t", "logs del group (logs) — todos sus streams por rango"),
+    ("w / W", "logs: ciclar la ventana de tiempo (15m…7d)"),
+    ("o", "logs: cargar más líneas (paginación de la ventana)"),
+    (
+        ":since/:from",
+        "logs: rango — :since 2d · :from 2026-06-19 [to …] (UTC)",
+    ),
     ("p", "purgar cola SQS — gated por modo escritura"),
     ("R", "redrive ejecución sfn — gated por modo escritura"),
     ("S", "enviar evento de prueba (events) — gated"),
@@ -28,7 +34,7 @@ const KEYS: &[(&str, &str)] = &[
 ];
 
 pub fn render(frame: &mut Frame, area: Rect) {
-    let popup = super::popup_area(area, 66, KEYS.len() as u16 + 3);
+    let popup = super::popup_area(area, 76, KEYS.len() as u16 + 3);
     frame.render_widget(Clear, popup);
 
     let lines: Vec<Line> = KEYS

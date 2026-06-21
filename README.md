@@ -40,12 +40,15 @@ se muestra en la **status bar** (no crashea).
 |-------|--------|
 | `:` | command bar (saltar de herramienta, p. ej. `:logs`, `:sqs`, `:sfn`, `:events`) |
 | `/` | buscar (fuzzy; en `logs` consulta al servidor; `↑`/`↓` navegan los resultados sin salir) |
-| `enter` | abrir herramienta (menú) / drill al detalle (en `logs`: group → stream → **eventos**) |
+| `enter` | drill al detalle (en `logs`: group → stream → **eventos**); sobre una **línea**, la **expande** completa |
 | `esc` | con filtro aplicado lo limpia (1er `esc`); si no, vuelve un nivel (drill back; en la raíz, al menú) |
 | `:menu` · `backspace` | volver al menú principal |
-| `j` / `k` · `↑` / `↓` · `g` / `G` | navegar |
+| `j` / `k` · `↑` / `↓` · `g` / `G` | navegar (y scrollear el panel de detalle) |
 | `r` | refrescar |
-| `t` | tail del group (`logs`): líneas de **todos** sus streams (`/` filtra server-side) |
+| `t` | **logs del group** (`logs`): todos sus streams **por rango de tiempo** (`/` filtra server-side) |
+| `w` / `W` | `logs`: ciclar la **ventana de tiempo** (15m · 1h · 6h · 24h · 3d · 7d) |
+| `o` | `logs`: **cargar más** líneas (paginación de la ventana) |
+| `:since` · `:from`/`to` | `logs`: rango — `:since 2d` · `:from 2026-06-19 [to 2026-06-20]` (UTC) |
 | `p` | purgar cola SQS (gated: modo escritura + confirm) |
 | `R` | redrive ejecución `sfn` fallida (gated: modo escritura + confirm) |
 | `S` | enviar evento de prueba a un bus `events` (gated: modo escritura + confirm) |
@@ -58,7 +61,7 @@ se muestra en la **status bar** (no crashea).
 
 ```bash
 AWSDECK_MOCK=1 cargo run    # ver el TUI con datos, sin tocar AWS
-cargo test                  # 134 tests, sin red
+cargo test                  # 149 tests, sin red
 cargo clippy --all-targets  # lint
 cargo fmt --check           # formato
 ```
@@ -71,8 +74,10 @@ Recorrido rápido (con `AWSDECK_MOCK=1 cargo run`):
    filtro `↑`/`↓` navegan los resultados sin tener que salir; `enter` hace **drill** al detalle.
    `esc` es de **dos etapas** (estilo k9s): con un filtro aplicado lo limpia primero; el siguiente
    `esc` regresa un nivel (y desde la raíz de la vista, al menú). En `logs`, `enter` en un stream
-   abre sus **líneas** (`get_log_events`, newest abajo, `ERROR` en rojo) y `t` sobre un group hace
-   **tail** de todos sus streams (`/` filtra server-side).
+   abre sus **líneas** (`get_log_events`, newest abajo, `ERROR` en rojo) y `t` sobre un group abre
+   los **logs del group por rango de tiempo** (todos sus streams): `w`/`W` ciclan la ventana
+   (15m…7d), `:since 2d` / `:from … [to …]` la fijan (UTC), `o` carga más y `/` filtra server-side.
+   `enter` sobre una **línea** la **expande** completa (wrap + scroll, JSON pretty); `esc` cierra.
 3. En `sfn`, `enter` entra a una state machine → sus **ejecuciones con status coloreado** y duración;
    `enter` en una FAILED → detalle con input/output, error/cause y el **timeline de estados** (el que
    reventó va resaltado y preseleccionado). En una máquina `[express]` se muestra una nota (sus
@@ -90,7 +95,9 @@ cuenta anterior (probado en `app::tests::epoch_guard_discards_stale_and_accepts_
 
 **Escala (logs):** con miles de log groups, `logs` no los carga todos — trae una página (≤50)
 y `/` consulta al servidor por substring (`logGroupNamePattern`, debounced ~280ms), rankeando
-los resultados con fuzzy local. El título indica `· parcial` cuando hay más en el servidor.
+los resultados con fuzzy local. El título indica `· parcial` cuando hay más en el servidor. Los
+**logs del group** se traen por **rango de tiempo** (`w`/`:since`/`:from-to`) y se paginan en
+demanda (`o`); el reloj de la ventana vive solo en `effects` (la vista nunca lo ve).
 
 **Escala (sfn):** las state machines se **paginan** (se traen todas, alcanzables por el fuzzy);
 las ejecuciones muestran las 50 más recientes y marcan `· parcial (recientes)` si hay más. El
@@ -118,7 +125,8 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
 ## Roadmap
 
 - **v0** ✅ shell + `logs` (CloudWatch): groups → streams → **eventos** (`get_log_events`) +
-  **tail** del group (`filter_log_events`, `t`, filtro server-side).
+  **logs del group por rango de tiempo** (`filter_log_events`, `t`; `w`/`:since`/`:from-to`,
+  paginación `o`, filtro server-side) + **expandir una línea** (`enter`, JSON pretty).
 - **v1** ✅ `sqs` — colas, attributes, *peek*, `PurgeQueue` (gated por modo escritura + confirm).
 - **v2** ✅ `sfn` — state machines, ejecuciones (status coloreado), timeline de estados con duración,
   `Redrive` (gated).

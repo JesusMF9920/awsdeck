@@ -58,6 +58,15 @@ pub trait View {
         Vec::new()
     }
 
+    /// Comando del command bar (`:foo bar`) que el `App` no reconoció como core.
+    /// El `App` —agnóstico— no lo parsea: lo reenvía a la vista activa, que decide
+    /// (p. ej. `logs` interpreta `:since 2d`). Devolver `Vec` vacío = "no es mío";
+    /// el `App` cae entonces a tratarlo como `id` de vista (`ActivateView`).
+    fn on_command(&mut self, cmd: &str) -> Vec<Action> {
+        let _ = cmd;
+        Vec::new()
+    }
+
     /// Dibuja la vista dentro de `area`.
     fn render(&mut self, frame: &mut Frame, area: Rect);
 

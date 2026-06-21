@@ -565,7 +565,19 @@ impl App {
             "q" | "quit" => self.dispatch(Action::Quit),
             "w" | "write" => self.toggle_write_mode(),
             "menu" | "home" => self.go_home(),
-            id => self.dispatch(Action::ActivateView(id.to_string())),
+            // No es core: ofrécelo a la vista activa (p. ej. `logs` con `:since 2d`).
+            // Si la vista no lo reclama (Vec vacío), trátalo como id de vista.
+            other => {
+                let actions = match self.registry.active_mut() {
+                    Some(view) => view.on_command(other),
+                    None => Vec::new(),
+                };
+                if actions.is_empty() {
+                    self.dispatch(Action::ActivateView(other.to_string()));
+                } else {
+                    self.dispatch_all(actions);
+                }
+            }
         }
     }
 
@@ -853,6 +865,59 @@ mod tests {
         let status = app.status.as_ref().expect("debe haber status");
         assert!(status.error);
         assert!(status.text.contains("desconocido"));
+    }
+
+    /// Vista que reclama el comando `die` (emite `Quit`) y ningún otro.
+    struct CommandView;
+    impl View for CommandView {
+        fn id(&self) -> &'static str {
+            "logs"
+        }
+        fn title(&self) -> String {
+            "logs".to_string()
+        }
+        fn on_activate(&mut self) -> Vec<Action> {
+            Vec::new()
+        }
+        fn on_key(&mut self, _key: KeyEvent) -> Vec<Action> {
+            Vec::new()
+        }
+        fn on_message(&mut self, _message: &Message) {}
+        fn set_filter(&mut self, _filter: &str) {}
+        fn on_command(&mut self, cmd: &str) -> Vec<Action> {
+            if cmd == "die" {
+                vec![Action::Quit]
+            } else {
+                Vec::new()
+            }
+        }
+        fn render(&mut self, _frame: &mut Frame, _area: Rect) {}
+    }
+
+    fn app_with_command_view() -> App {
+        let (tx, rx) = mpsc::channel(8);
+        let env = Env::new("default", "us-east-1");
+        let effects = Effects::new_mock(tx, env.clone());
+        let mut registry = Registry::new();
+        registry.register(Box::new(CommandView));
+        App::new(env, registry, effects, rx)
+    }
+
+    #[test]
+    fn command_routes_to_active_view() {
+        let mut app = app_with_command_view();
+        // La vista reclama `:die` → su acción (Quit) se despacha.
+        type_command(&mut app, "die");
+        assert!(app.should_quit, "el comando de la vista se despachó");
+    }
+
+    #[test]
+    fn command_not_claimed_by_view_falls_back_to_activate() {
+        let mut app = app_with_command_view();
+        // `:nope` no lo reclama la vista → cae a ActivateView (id inexistente) → error.
+        type_command(&mut app, "nope");
+        let status = app.status.as_ref().expect("status");
+        assert!(status.error && status.text.contains("desconocido"));
     }
 
     /// Vista que simula un cambio de nivel: cualquier tecla emite `ClearFilter`

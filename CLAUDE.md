@@ -113,10 +113,15 @@ es reusable para v2/v3. `switch_env` resetea el modo escritura.
 - **Navegar dentro del filtro**: en `Mode::Filter`, `↑/↓` se reenvían a la vista activa (mueven
   su selección sobre la lista ya filtrada) sin salir del filtro ni editar el texto (estilo fzf);
   el resto de teclas siguen editando el `tui-input`.
+- **La recarga async no pisa la navegación** (`logs`): `on_message(LogGroupsLoaded)` preserva la
+  selección **por nombre** (`restore_selection`) en vez de forzar `select(Some(0))`. Como
+  `set_filter` ya pone la selección en el mejor match al teclear, esto conserva ese baseline
+  cuando no navegaste y respeta tu posición (flechas en filtro) cuando sí; cae al tope si el item
+  desapareció. Aplica también al `r` refresh. (SQS ya solo hacía `clamp_selection`.)
 
-56 tests sin red (routing, epoch guard, gate de mutaciones, fuzzy, menú, búsqueda/staleness,
-drill, back→menú, navegación en filtro, parsers, render con `TestBackend`). `AWSDECK_MOCK=1
-cargo run` lo abre sin credenciales.
+61 tests sin red (routing, epoch guard, gate de mutaciones, fuzzy, menú, búsqueda/staleness,
+drill, back→menú, navegación en filtro, preservación de selección, parsers, render con
+`TestBackend`). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
 
 Pendiente: v2 `sfn`, v3 `events` (no iniciadas), eventos de log (3er nivel en `logs`), `y`
 (copiar ARN), abrir en consola (`o`), config en disco.

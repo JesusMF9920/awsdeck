@@ -102,6 +102,22 @@ impl LogsView {
         }
     }
 
+    /// Tras reemplazar `groups` con datos async (refresh o respuesta de la búsqueda
+    /// server-side), re-selecciona el group con este nombre si sigue en la lista
+    /// filtrada; si no está (o no había selección), cae al tope (mejor match). Así
+    /// una recarga no pisa la posición que el usuario movió con las flechas:
+    /// `set_filter` ya dejó la selección en el mejor match al teclear, de modo que
+    /// esto conserva ese baseline cuando el usuario no navegó.
+    fn restore_selection(&mut self, name: Option<&str>) {
+        let pos = name.and_then(|n| {
+            self.filtered_group_indices()
+                .iter()
+                .position(|&i| self.groups[i].name == n)
+        });
+        self.state.select(Some(pos.unwrap_or(0)));
+        self.clamp_selection();
+    }
+
     fn selected_group_name(&self) -> Option<String> {
         let sel = self.state.selected()?;
         let idx = *self.filtered_group_indices().get(sel)?;
@@ -255,12 +271,14 @@ impl View for LogsView {
                 if query != &self.last_query {
                     return;
                 }
+                // Capturar la selección ANTES de reemplazar, para preservarla por
+                // nombre y no pisar la navegación del usuario con la recarga async.
+                let keep = self.selected_group_name();
                 self.groups = groups.clone();
                 self.partial = *more;
                 if matches!(self.level, Level::Groups) {
                     self.loading = false;
-                    self.state.select(Some(0)); // mejor match arriba tras la búsqueda
-                    self.clamp_selection();
+                    self.restore_selection(keep.as_deref());
                 }
             }
             Message::LogStreamsLoaded { group, streams } => {
@@ -534,6 +552,46 @@ mod tests {
         let actions = v.on_key(key(KeyCode::Esc));
         assert!(actions.is_empty(), "esc en streams se consume en la vista");
         assert!(matches!(v.level, Level::Groups));
+    }
+
+    #[test]
+    fn debounced_reload_does_not_stomp_navigation() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![
+            group("/svc-a"),
+            group("/svc-b"),
+            group("/svc-c"),
+        ]));
+        // El usuario lanza una búsqueda server-side y, antes de que responda, navega.
+        let _ = v.search("svc"); // last_query = Some("svc")
+        v.on_key(key(KeyCode::Down));
+        v.on_key(key(KeyCode::Down)); // en "/svc-c"
+        assert_eq!(v.selected_group_name().as_deref(), Some("/svc-c"));
+
+        // Llega la respuesta debounced (misma data): la selección NO salta al tope.
+        v.on_message(&Message::LogGroupsLoaded {
+            groups: vec![group("/svc-a"), group("/svc-b"), group("/svc-c")],
+            query: Some("svc".into()),
+            more: false,
+        });
+        assert_eq!(
+            v.selected_group_name().as_deref(),
+            Some("/svc-c"),
+            "la recarga async no debe pisar la navegación del usuario"
+        );
+    }
+
+    #[test]
+    fn reload_falls_back_to_top_when_selection_gone() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/a"), group("/b"), group("/c")]));
+        v.on_key(key(KeyCode::Down));
+        v.on_key(key(KeyCode::Down)); // en "/c"
+        assert_eq!(v.selected_group_name().as_deref(), Some("/c"));
+
+        // La recarga ya no contiene "/c": la selección cae al tope (mejor match).
+        v.on_message(&loaded(vec![group("/a"), group("/b")]));
+        assert_eq!(v.selected_group_name().as_deref(), Some("/a"));
     }
 
     #[test]

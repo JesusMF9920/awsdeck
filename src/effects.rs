@@ -15,8 +15,9 @@ use tokio::sync::mpsc;
 use crate::action::Action;
 use crate::aws::context::{AwsContext, Env};
 use crate::message::{
-    Envelope, ExecStatus, ExecutionDetailDto, ExecutionDto, LogGroupDto, LogStreamDto, MachineType,
-    Message, QueueAttrsDto, QueueDto, QueueMessageDto, StateMachineDto, StateSpanDto,
+    Envelope, EventBusDto, ExecStatus, ExecutionDetailDto, ExecutionDto, LogGroupDto, LogStreamDto,
+    MachineType, Message, QueueAttrsDto, QueueDto, QueueMessageDto, RuleDetailDto, RuleDto,
+    RuleState, StateMachineDto, StateSpanDto, TargetDto,
 };
 
 /// Fuente de datos.
@@ -76,6 +77,13 @@ impl Effects {
             Action::RedriveExecution { execution_arn } => {
                 self.redrive_execution(execution_arn, epoch)
             }
+            Action::LoadEventBuses => self.load_event_buses(epoch),
+            Action::LoadRules { event_bus_name } => self.load_rules(event_bus_name, epoch),
+            Action::LoadRuleDetail {
+                event_bus_name,
+                rule_name,
+            } => self.load_rule_detail(event_bus_name, rule_name, epoch),
+            Action::SendEvent { event_bus_name } => self.send_event(event_bus_name, epoch),
             Action::Quit
             | Action::ActivateView(_)
             | Action::Back
@@ -333,6 +341,124 @@ impl Effects {
                     let msg = match redrive_execution_real(&ctx, &execution_arn).await {
                         Ok(()) => Message::ExecutionRedriven { execution_arn },
                         Err(e) => Message::Error(format!("redrive_execution: {e}")),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+        }
+    }
+
+    // --- EventBridge (v3) -----------------------------------------------------
+
+    fn load_event_buses(&self, epoch: u64) {
+        let tx = self.tx.clone();
+        match &self.backend {
+            Backend::Mock(env) => {
+                let env = env.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let msg = Message::EventBusesLoaded {
+                        buses: mock_event_buses(&env),
+                        more: false,
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match fetch_event_buses(&ctx).await {
+                        Ok((buses, more)) => Message::EventBusesLoaded { buses, more },
+                        Err(e) => Message::Error(format!("list_event_buses: {e}")),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+        }
+    }
+
+    fn load_rules(&self, event_bus_name: String, epoch: u64) {
+        let tx = self.tx.clone();
+        match &self.backend {
+            Backend::Mock(_) => {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(450)).await;
+                    let rules = mock_rules(&event_bus_name);
+                    let msg = Message::RulesLoaded {
+                        event_bus_name,
+                        rules,
+                        more: false,
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match fetch_rules(&ctx, &event_bus_name).await {
+                        Ok((rules, more)) => Message::RulesLoaded {
+                            event_bus_name,
+                            rules,
+                            more,
+                        },
+                        Err(e) => Message::Error(format!("list_rules: {e}")),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+        }
+    }
+
+    fn load_rule_detail(&self, event_bus_name: String, rule_name: String, epoch: u64) {
+        let tx = self.tx.clone();
+        match &self.backend {
+            Backend::Mock(_) => {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(450)).await;
+                    let (detail, targets) = mock_rule_detail(&event_bus_name, &rule_name);
+                    let msg = Message::RuleDetailLoaded {
+                        event_bus_name,
+                        rule_name,
+                        detail,
+                        targets,
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match fetch_rule_detail(&ctx, &event_bus_name, &rule_name).await {
+                        Ok((detail, targets)) => Message::RuleDetailLoaded {
+                            event_bus_name,
+                            rule_name,
+                            detail,
+                            targets,
+                        },
+                        Err(e) => Message::Error(format!("rule detail: {e}")),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+        }
+    }
+
+    fn send_event(&self, event_bus_name: String, epoch: u64) {
+        let tx = self.tx.clone();
+        match &self.backend {
+            Backend::Mock(_) => {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let msg = Message::EventSent { event_bus_name };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match send_event_real(&ctx, &event_bus_name).await {
+                        Ok(()) => Message::EventSent { event_bus_name },
+                        Err(e) => Message::Error(format!("put_events: {e}")),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -668,6 +794,152 @@ async fn redrive_execution_real(ctx: &AwsContext, execution_arn: &str) -> color_
     Ok(())
 }
 
+// --- EventBridge: SDK real ----------------------------------------------------
+
+/// Tope de páginas al listar buses/rules: sin filtro server-side, lo que quede
+/// fuera sería inalcanzable por el fuzzy, así que paginamos todo (son pocos por
+/// cuenta). Si se topa con más pendientes, `more = true` (la vista muestra `· parcial`).
+const MAX_EVENTS_PAGES: usize = 20;
+
+/// `RuleState` del SDK (`#[non_exhaustive]`) → enum propio plano. Cualquier estado
+/// no `Disabled` cuenta como habilitado (incluye `EnabledWithAllCloudTrail…`).
+fn rule_state(s: Option<&aws_sdk_eventbridge::types::RuleState>) -> RuleState {
+    use aws_sdk_eventbridge::types::RuleState as S;
+    match s {
+        Some(S::Disabled) => RuleState::Disabled,
+        _ => RuleState::Enabled,
+    }
+}
+
+async fn fetch_event_buses(ctx: &AwsContext) -> color_eyre::Result<(Vec<EventBusDto>, bool)> {
+    let client = ctx.eventbridge().await;
+    let mut buses: Vec<EventBusDto> = Vec::new();
+    let mut next: Option<String> = None;
+    let mut more = false;
+    for page in 0..MAX_EVENTS_PAGES {
+        let out = client
+            .list_event_buses()
+            .limit(100)
+            .set_next_token(next)
+            .send()
+            .await?;
+        buses.extend(out.event_buses().iter().map(|b| EventBusDto {
+            arn: b.arn().unwrap_or_default().to_string(),
+            name: b.name().unwrap_or_default().to_string(),
+        }));
+        next = out.next_token().map(str::to_string);
+        if next.is_none() {
+            break;
+        }
+        if page == MAX_EVENTS_PAGES - 1 {
+            more = true;
+        }
+    }
+    Ok((buses, more))
+}
+
+async fn fetch_rules(
+    ctx: &AwsContext,
+    event_bus_name: &str,
+) -> color_eyre::Result<(Vec<RuleDto>, bool)> {
+    let client = ctx.eventbridge().await;
+    let mut rules: Vec<RuleDto> = Vec::new();
+    let mut next: Option<String> = None;
+    let mut more = false;
+    for page in 0..MAX_EVENTS_PAGES {
+        let out = client
+            .list_rules()
+            .event_bus_name(event_bus_name)
+            .limit(100)
+            .set_next_token(next)
+            .send()
+            .await?;
+        rules.extend(out.rules().iter().map(|r| RuleDto {
+            name: r.name().unwrap_or_default().to_string(),
+            event_bus_name: event_bus_name.to_string(),
+            state: rule_state(r.state()),
+            description: r.description().map(str::to_string),
+        }));
+        next = out.next_token().map(str::to_string);
+        if next.is_none() {
+            break;
+        }
+        if page == MAX_EVENTS_PAGES - 1 {
+            more = true;
+        }
+    }
+    Ok((rules, more))
+}
+
+/// Combina `describe_rule` (patrón/estado/descr/schedule) + `list_targets_by_rule`
+/// en una sola task (como `fetch_execution_detail`). Targets ≤5 por regla → una llamada.
+async fn fetch_rule_detail(
+    ctx: &AwsContext,
+    event_bus_name: &str,
+    rule_name: &str,
+) -> color_eyre::Result<(RuleDetailDto, Vec<TargetDto>)> {
+    let client = ctx.eventbridge().await;
+
+    let r = client
+        .describe_rule()
+        .name(rule_name)
+        .event_bus_name(event_bus_name)
+        .send()
+        .await?;
+    let detail = RuleDetailDto {
+        state: rule_state(r.state()),
+        description: r.description().map(str::to_string),
+        event_pattern: pretty_truncate(r.event_pattern()),
+        schedule_expression: r.schedule_expression().map(str::to_string),
+    };
+
+    let t = client
+        .list_targets_by_rule()
+        .rule(rule_name)
+        .event_bus_name(event_bus_name)
+        .send()
+        .await?;
+    let targets = t
+        .targets()
+        .iter()
+        .map(|tg| TargetDto {
+            id: tg.id().to_string(),
+            arn: tg.arn().to_string(),
+            input: pretty_truncate(tg.input()),
+        })
+        .collect();
+
+    Ok((detail, targets))
+}
+
+/// Publica un evento de prueba (canned) en el bus. PutEvents puede fallar
+/// parcialmente (HTTP 200 con `failed_entry_count > 0`): se traduce a error.
+async fn send_event_real(ctx: &AwsContext, event_bus_name: &str) -> color_eyre::Result<()> {
+    use aws_sdk_eventbridge::types::PutEventsRequestEntry;
+    let entry = PutEventsRequestEntry::builder()
+        .source("awsdeck.manual")
+        .detail_type("awsdeck test event")
+        .detail(r#"{"sentBy":"awsdeck","note":"manual test event"}"#)
+        .event_bus_name(event_bus_name)
+        .build();
+    let out = ctx
+        .eventbridge()
+        .await
+        .put_events()
+        .entries(entry)
+        .send()
+        .await?;
+    if out.failed_entry_count() > 0 {
+        let why = out
+            .entries()
+            .iter()
+            .find_map(|e| e.error_code().or(e.error_message()))
+            .unwrap_or("evento rechazado");
+        return Err(color_eyre::eyre::eyre!("{why}"));
+    }
+    Ok(())
+}
+
 /// Empareja eventos `StateEntered`/`StateExited` (en orden cronológico) en spans con
 /// duración y marca el estado que reventó. Pura → testeable sin red.
 ///
@@ -963,6 +1235,92 @@ fn mock_execution_detail(
         ];
         (detail, history, None)
     }
+}
+
+/// Buses falsos del ambiente: `default` + dos que reflejan el `profile` activo
+/// (para que un switch de ambiente sea visible).
+fn mock_event_buses(env: &Env) -> Vec<EventBusDto> {
+    ["default", "app-bus", "ingest-bus"]
+        .into_iter()
+        .map(|name| {
+            let full = if name == "default" {
+                "default".to_string()
+            } else {
+                format!("{}-{name}", env.profile)
+            };
+            EventBusDto {
+                arn: format!(
+                    "arn:aws:events:{}:000000000000:event-bus/{full}",
+                    env.region
+                ),
+                name: full,
+            }
+        })
+        .collect()
+}
+
+/// Rules falsas de un bus, deterministas. Incluye al menos una `Disabled` (su
+/// nombre lleva `disabled`, que `mock_rule_detail` lee para el detalle coherente).
+fn mock_rules(event_bus_name: &str) -> Vec<RuleDto> {
+    let specs: [(&str, RuleState, &str); 4] = [
+        (
+            "orders-created",
+            RuleState::Enabled,
+            "Route OrderCreated to fulfillment",
+        ),
+        (
+            "payments-failed",
+            RuleState::Enabled,
+            "Alert on PaymentFailed",
+        ),
+        (
+            "nightly-disabled",
+            RuleState::Disabled,
+            "Nightly batch (apagada)",
+        ),
+        ("audit-all", RuleState::Enabled, "Archive every event"),
+    ];
+    specs
+        .into_iter()
+        .map(|(name, state, desc)| RuleDto {
+            name: name.to_string(),
+            event_bus_name: event_bus_name.to_string(),
+            state,
+            description: Some(desc.to_string()),
+        })
+        .collect()
+}
+
+/// Detalle falso de una rule: patrón JSON (pretty) + 1–2 targets. Si el nombre
+/// lleva `disabled` → `Disabled`.
+fn mock_rule_detail(event_bus_name: &str, rule_name: &str) -> (RuleDetailDto, Vec<TargetDto>) {
+    let state = if rule_name.contains("disabled") {
+        RuleState::Disabled
+    } else {
+        RuleState::Enabled
+    };
+    let pattern = pretty_truncate(Some(
+        r#"{"source":["my.app"],"detail-type":["OrderCreated"]}"#,
+    ));
+    let detail = RuleDetailDto {
+        state,
+        description: Some(format!("Rule {rule_name} en {event_bus_name}")),
+        event_pattern: pattern,
+        schedule_expression: None,
+    };
+    let targets = vec![
+        TargetDto {
+            id: "target-lambda".to_string(),
+            arn: "arn:aws:lambda:us-east-1:000000000000:function:fulfillment".to_string(),
+            input: None,
+        },
+        TargetDto {
+            id: "target-sqs".to_string(),
+            arn: "arn:aws:sqs:us-east-1:000000000000:orders-dlq".to_string(),
+            input: pretty_truncate(Some(r#"{"forwarded":true}"#)),
+        },
+    ];
+    (detail, targets)
 }
 
 #[cfg(test)]
@@ -1261,6 +1619,102 @@ mod tests {
         assert_eq!(envelope.epoch, 1);
         assert!(
             matches!(envelope.message, Message::ExecutionRedriven { execution_arn } if execution_arn == arn)
+        );
+    }
+
+    // --- EventBridge ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn mock_event_buses_tag_epoch_and_reflect_profile() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+
+        fx.dispatch(Action::LoadEventBuses, 7);
+
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        assert_eq!(envelope.epoch, 7);
+        match envelope.message {
+            Message::EventBusesLoaded { buses, more } => {
+                assert!(!more, "el mock cabe en una página");
+                assert!(buses.iter().any(|b| b.name == "default"));
+                assert!(
+                    buses.iter().any(|b| b.name.contains("dev")),
+                    "la data mock refleja el profile activo"
+                );
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_rules_include_enabled_and_disabled() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+
+        fx.dispatch(
+            Action::LoadRules {
+                event_bus_name: "default".into(),
+            },
+            3,
+        );
+
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        match envelope.message {
+            Message::RulesLoaded {
+                event_bus_name,
+                rules,
+                more,
+            } => {
+                assert!(!more);
+                assert_eq!(event_bus_name, "default");
+                assert!(rules.iter().any(|r| r.state == RuleState::Enabled));
+                assert!(rules.iter().any(|r| r.state == RuleState::Disabled));
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_rule_detail_has_pattern_and_targets() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+
+        fx.dispatch(
+            Action::LoadRuleDetail {
+                event_bus_name: "default".into(),
+                rule_name: "orders-created".into(),
+            },
+            4,
+        );
+
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        match envelope.message {
+            Message::RuleDetailLoaded {
+                detail, targets, ..
+            } => {
+                assert!(detail.event_pattern.is_some());
+                assert!(!targets.is_empty());
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_send_event_replies_event_sent() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+
+        fx.dispatch(
+            Action::SendEvent {
+                event_bus_name: "default".into(),
+            },
+            1,
+        );
+
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        assert_eq!(envelope.epoch, 1);
+        assert!(
+            matches!(envelope.message, Message::EventSent { event_bus_name } if event_bus_name == "default")
         );
     }
 

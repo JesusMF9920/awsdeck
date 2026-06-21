@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 use crate::action::Action;
 use crate::message::Message;
 
+pub mod events;
 pub mod logs;
 pub mod sfn;
 pub mod sqs;

@@ -495,6 +495,11 @@ impl App {
                     action,
                 }
             }
+            Action::SendEvent { event_bus_name } => Confirm {
+                title: " enviar evento de prueba ".to_string(),
+                body: format!("se publicará un evento de prueba en el bus:\n{event_bus_name}"),
+                action,
+            },
             // `is_mutating` ya filtró; cualquier otra no debería llegar aquí.
             _ => return,
         };
@@ -524,6 +529,9 @@ impl App {
             Message::Error(e) => self.set_error(e.clone()),
             Message::QueuePurged { .. } => self.set_info("cola purgada — refrescando…"),
             Message::ExecutionRedriven { .. } => self.set_info("redrive enviado — refrescando…"),
+            Message::EventSent { event_bus_name } => {
+                self.set_info(format!("evento enviado a {event_bus_name}"))
+            }
             _ => {}
         }
         if let Some(view) = self.registry.active_mut() {
@@ -725,7 +733,7 @@ impl App {
 fn is_mutating(action: &Action) -> bool {
     matches!(
         action,
-        Action::PurgeQueue { .. } | Action::RedriveExecution { .. }
+        Action::PurgeQueue { .. } | Action::RedriveExecution { .. } | Action::SendEvent { .. }
     )
 }
 
@@ -1255,5 +1263,59 @@ mod tests {
             envelope.message,
             Message::ExecutionDetailLoaded { execution_arn, .. } if execution_arn == arn
         ));
+    }
+
+    // --- Gate de SendEvent (events) reusa el mismo gate genérico --------------
+
+    fn send_event(bus: &str) -> Action {
+        Action::SendEvent {
+            event_bus_name: bus.to_string(),
+        }
+    }
+
+    #[test]
+    fn send_event_blocked_without_write_mode() {
+        let mut app = test_app();
+        app.dispatch(send_event("default"));
+        assert!(app.confirm.is_none(), "sin modo escritura no abre confirm");
+        let status = app.status.as_ref().expect("status de bloqueo");
+        assert!(status.error && status.text.contains("escritura"));
+    }
+
+    #[test]
+    fn send_event_with_write_mode_opens_confirm() {
+        let mut app = test_app();
+        app.write_mode = true;
+        app.dispatch(send_event("default"));
+        assert!(app.confirm.is_some(), "con modo escritura abre el confirm");
+    }
+
+    #[tokio::test]
+    async fn confirm_y_dispatches_send_event_to_effects() {
+        let mut app = test_app_mock();
+        app.write_mode = true;
+        app.dispatch(send_event("default"));
+        assert!(app.confirm.is_some());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.confirm.is_none(), "y confirma y cierra el modal");
+
+        let envelope = app.rx.recv().await.expect("debe llegar un envelope");
+        assert!(matches!(envelope.message, Message::EventSent { .. }));
+    }
+
+    #[test]
+    fn event_sent_envelope_shows_info_without_reload() {
+        let mut app = test_app_mock();
+        app.on_envelope(Envelope::new(
+            0,
+            Message::EventSent {
+                event_bus_name: "default".into(),
+            },
+        ));
+        let status = app.status.as_ref().expect("status info");
+        assert!(!status.error && status.text.contains("default"));
+        // PutEvents no cambia ningún listado → no se re-dispara nada.
+        assert!(app.rx.try_recv().is_err(), "EventSent no dispara recargas");
     }
 }

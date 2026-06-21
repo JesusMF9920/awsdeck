@@ -42,10 +42,21 @@ pub enum Action {
     LoadExecutions { machine_arn: String },
     /// Hacer drill a una ejecución: describe + history (timeline de estados).
     LoadExecutionDetail { execution_arn: String },
+    /// Pedir los event buses de EventBridge del ambiente activo.
+    LoadEventBuses,
+    /// Hacer drill a un bus: sus rules.
+    LoadRules { event_bus_name: String },
+    /// Hacer drill a una rule: describe + targets (patrón + destinos).
+    LoadRuleDetail {
+        event_bus_name: String,
+        rule_name: String,
+    },
 
     // --- Mutantes: gated por el `App` (modo escritura + confirm) antes de effects ---
     /// Purgar una cola: borra TODOS sus mensajes. Irreversible.
     PurgeQueue { queue_url: String },
     /// Redrive de una ejecución fallida: la relanza desde el último estado fallido.
     RedriveExecution { execution_arn: String },
+    /// Publicar un evento de prueba (canned) contra un bus de EventBridge.
+    SendEvent { event_bus_name: String },
 }

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_cloudwatchlogs::Client as LogsClient;
+use aws_sdk_eventbridge::Client as EventBridgeClient;
 use aws_sdk_sfn::Client as SfnClient;
 use aws_sdk_sqs::Client as SqsClient;
 use tokio::sync::OnceCell;
@@ -46,6 +47,7 @@ pub struct AwsContext {
     logs: OnceCell<LogsClient>,
     sqs: OnceCell<SqsClient>,
     sfn: OnceCell<SfnClient>,
+    eventbridge: OnceCell<EventBridgeClient>,
 }
 
 impl AwsContext {
@@ -56,6 +58,7 @@ impl AwsContext {
             logs: OnceCell::new(),
             sqs: OnceCell::new(),
             sfn: OnceCell::new(),
+            eventbridge: OnceCell::new(),
         }
     }
 
@@ -92,6 +95,13 @@ impl AwsContext {
     pub async fn sfn(&self) -> &SfnClient {
         self.sfn
             .get_or_init(|| async { SfnClient::new(self.config().await) })
+            .await
+    }
+
+    /// Cliente de EventBridge, cacheado de forma perezosa.
+    pub async fn eventbridge(&self) -> &EventBridgeClient {
+        self.eventbridge
+            .get_or_init(|| async { EventBridgeClient::new(self.config().await) })
             .await
     }
 }

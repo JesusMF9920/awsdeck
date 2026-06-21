@@ -146,6 +146,59 @@ pub struct StateSpanDto {
     pub failed: bool,
 }
 
+// --- EventBridge (v3) ---------------------------------------------------------
+
+/// Estado de una rule. Enum propio plano (el del SDK es `#[non_exhaustive]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleState {
+    Enabled,
+    Disabled,
+}
+
+impl RuleState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Enabled => "ENABLED",
+            Self::Disabled => "DISABLED",
+        }
+    }
+}
+
+/// Un event bus (datos para la lista).
+#[derive(Clone, Debug)]
+pub struct EventBusDto {
+    pub arn: String,
+    pub name: String,
+}
+
+/// Una rule de un bus (datos para la lista).
+#[derive(Clone, Debug)]
+pub struct RuleDto {
+    pub name: String,
+    pub event_bus_name: String,
+    pub state: RuleState,
+    pub description: Option<String>,
+}
+
+/// Detalle de una rule (de `describe_rule`). El nombre/bus ya los conoce la vista
+/// por el nivel de drill. `event_pattern` ya viene pretty-printeado/truncado.
+#[derive(Clone, Debug)]
+pub struct RuleDetailDto {
+    pub state: RuleState,
+    pub description: Option<String>,
+    pub event_pattern: Option<String>,
+    pub schedule_expression: Option<String>,
+}
+
+/// Un target de una rule (de `list_targets_by_rule`). `input` ya viene
+/// pretty-printeado/truncado desde `effects`.
+#[derive(Clone, Debug)]
+pub struct TargetDto {
+    pub id: String,
+    pub arn: String,
+    pub input: Option<String>,
+}
+
 /// Resultado de una operación async. Específico de servicio a propósito
 /// (`message.rs` es frontera permitida para nombrar servicios).
 #[derive(Clone, Debug)]
@@ -202,6 +255,27 @@ pub enum Message {
     },
     /// Se relanzó una ejecución vía redrive (acción mutante confirmada).
     ExecutionRedriven { execution_arn: String },
+
+    // --- EventBridge (v3) ---
+    /// Se cargaron los event buses del ambiente activo. `more` = se topó la
+    /// paginación con más buses pendientes (caso patológico).
+    EventBusesLoaded { buses: Vec<EventBusDto>, more: bool },
+    /// Rules de un bus (`event_bus_name` para confirmar el drill actual).
+    RulesLoaded {
+        event_bus_name: String,
+        rules: Vec<RuleDto>,
+        more: bool,
+    },
+    /// Detalle de una rule (`describe_rule` + `list_targets_by_rule`).
+    /// `event_bus_name`+`rule_name` confirman el drill actual.
+    RuleDetailLoaded {
+        event_bus_name: String,
+        rule_name: String,
+        detail: RuleDetailDto,
+        targets: Vec<TargetDto>,
+    },
+    /// Se publicó un evento de prueba en un bus (acción mutante confirmada).
+    EventSent { event_bus_name: String },
 
     /// Algo falló: se muestra en la status bar, nunca hace panic.
     Error(String),

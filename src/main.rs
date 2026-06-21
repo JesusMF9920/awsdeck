@@ -22,6 +22,7 @@ use crate::aws::context::Env;
 use crate::effects::Effects;
 use crate::tui::Tui;
 use crate::views::Registry;
+use crate::views::events::EventsView;
 use crate::views::logs::LogsView;
 use crate::views::sfn::SfnView;
 use crate::views::sqs::SqsView;
@@ -45,6 +46,7 @@ async fn main() -> Result<()> {
     registry.register(Box::new(LogsView::new()));
     registry.register(Box::new(SqsView::new()));
     registry.register(Box::new(SfnView::new()));
+    registry.register(Box::new(EventsView::new()));
 
     let mut app = App::new(env, registry, effects, rx);
 

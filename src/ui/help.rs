@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 const KEYS: &[(&str, &str)] = &[
-    (":", "command bar (p. ej. :logs, :sqs, :sfn)"),
+    (":", "command bar (p. ej. :logs, :sqs, :sfn, :events)"),
     ("/", "buscar (fuzzy; ↑/↓ navega sin salir)"),
     ("enter", "abrir herramienta / drill al detalle"),
     ("esc", "con filtro: lo limpia; si no, volver (raíz → menú)"),
@@ -16,6 +16,7 @@ const KEYS: &[(&str, &str)] = &[
     ("r", "refresh"),
     ("p", "purgar cola SQS — gated por modo escritura"),
     ("R", "redrive ejecución sfn — gated por modo escritura"),
+    ("S", "enviar evento de prueba (events) — gated"),
     (":write", "alternar modo escritura (acciones mutantes)"),
     ("ctrl-e", "cambiar de ambiente"),
     ("?", "mostrar/ocultar esta ayuda"),

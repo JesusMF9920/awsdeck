@@ -23,6 +23,7 @@ use crate::effects::Effects;
 use crate::tui::Tui;
 use crate::views::Registry;
 use crate::views::logs::LogsView;
+use crate::views::sqs::SqsView;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -41,6 +42,7 @@ async fn main() -> Result<()> {
     // las vistas concretas. Agregar un servicio = registrar una línea más.
     let mut registry = Registry::new();
     registry.register(Box::new(LogsView::new()));
+    registry.register(Box::new(SqsView::new()));
 
     let mut app = App::new(env, registry, effects, rx);
 

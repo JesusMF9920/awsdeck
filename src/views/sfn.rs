@@ -47,6 +47,10 @@ pub struct SfnView {
     failed_state: Option<String>,
     filter: String,
     loading: bool,
+    /// Se alcanzó el tope de paginación de máquinas (hay más sin traer).
+    machines_partial: bool,
+    /// El servidor tiene más ejecuciones (`next_token`): se muestran las recientes.
+    executions_partial: bool,
     state: ListState,
 }
 
@@ -61,6 +65,8 @@ impl SfnView {
             failed_state: None,
             filter: String::new(),
             loading: false,
+            machines_partial: false,
+            executions_partial: false,
             state: ListState::default().with_selected(Some(0)),
         }
     }
@@ -143,6 +149,7 @@ impl SfnView {
                         machine_type: m.machine_type,
                     };
                     self.executions.clear();
+                    self.executions_partial = false;
                     self.state.select(Some(0));
                     if express {
                         // EXPRESS no soporta list_executions (van a CloudWatch Logs):
@@ -279,10 +286,18 @@ impl SfnView {
     fn machines_title(&self) -> String {
         let total = self.machines.len();
         let shown = self.filtered_machine_indices().len();
-        if self.filter.is_empty() {
-            format!(" {total} state machines ")
+        let partial = if self.machines_partial {
+            " · parcial"
         } else {
-            format!(" {shown}/{total} state machines · filtro: {} ", self.filter)
+            ""
+        };
+        if self.filter.is_empty() {
+            format!(" {total} state machines{partial} ")
+        } else {
+            format!(
+                " {shown}/{total} state machines{partial} · filtro: {} ",
+                self.filter
+            )
         }
     }
 
@@ -295,10 +310,18 @@ impl SfnView {
         };
         let total = self.executions.len();
         let shown = self.filtered_execution_indices().len();
-        if self.filter.is_empty() {
-            format!(" {name} · {total} ejecuciones ")
+        let partial = if self.executions_partial {
+            " · parcial (recientes)"
         } else {
-            format!(" {name} · {shown}/{total} · filtro: {} ", self.filter)
+            ""
+        };
+        if self.filter.is_empty() {
+            format!(" {name} · {total} ejecuciones{partial} ")
+        } else {
+            format!(
+                " {name} · {shown}/{total}{partial} · filtro: {} ",
+                self.filter
+            )
         }
     }
 
@@ -409,6 +432,8 @@ impl View for SfnView {
         self.history.clear();
         self.failed_state = None;
         self.loading = true;
+        self.machines_partial = false;
+        self.executions_partial = false;
         self.state.select(Some(0));
         vec![Action::LoadStateMachines]
     }
@@ -441,8 +466,9 @@ impl View for SfnView {
 
     fn on_message(&mut self, message: &Message) {
         match message {
-            Message::StateMachinesLoaded(machines) => {
+            Message::StateMachinesLoaded { machines, more } => {
                 self.machines = machines.clone();
+                self.machines_partial = *more;
                 if matches!(self.level, Level::Machines) {
                     self.loading = false;
                     self.clamp_selection();
@@ -451,6 +477,7 @@ impl View for SfnView {
             Message::ExecutionsLoaded {
                 machine_arn,
                 executions,
+                more,
             } => {
                 if let Level::Executions {
                     machine_arn: current,
@@ -459,6 +486,7 @@ impl View for SfnView {
                     && current == machine_arn
                 {
                     self.executions = executions.clone();
+                    self.executions_partial = *more;
                     self.loading = false;
                     self.clamp_selection();
                 }
@@ -697,6 +725,14 @@ mod tests {
         }
     }
 
+    /// Construye un `StateMachinesLoaded` no-parcial (el caso típico en tests).
+    fn machines_msg(machines: Vec<StateMachineDto>) -> Message {
+        Message::StateMachinesLoaded {
+            machines,
+            more: false,
+        }
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         use ratatui::crossterm::event::KeyModifiers;
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -705,15 +741,13 @@ mod tests {
     /// Lleva la vista a `Detail` con un detalle del status dado.
     fn view_in_detail(status: ExecStatus) -> SfnView {
         let mut v = SfnView::new();
-        v.on_message(&Message::StateMachinesLoaded(vec![machine(
-            "m1",
-            MachineType::Standard,
-        )]));
+        v.on_message(&machines_msg(vec![machine("m1", MachineType::Standard)]));
         v.on_key(key(KeyCode::Enter)); // → Executions
         let machine_arn = "arn:aws:states:us-east-1:000:stateMachine:m1".to_string();
         v.on_message(&Message::ExecutionsLoaded {
             machine_arn,
             executions: vec![exec("e1", status)],
+            more: false,
         });
         v.on_key(key(KeyCode::Enter)); // → Detail
         let execution_arn = exec("e1", status).arn;
@@ -760,7 +794,7 @@ mod tests {
     #[test]
     fn ingests_machines_via_message() {
         let mut v = SfnView::new();
-        v.on_message(&Message::StateMachinesLoaded(vec![
+        v.on_message(&machines_msg(vec![
             machine("a", MachineType::Standard),
             machine("b", MachineType::Express),
         ]));
@@ -770,7 +804,7 @@ mod tests {
     #[test]
     fn filter_narrows_machine_list() {
         let mut v = SfnView::new();
-        v.on_message(&Message::StateMachinesLoaded(vec![
+        v.on_message(&machines_msg(vec![
             machine("order-saga", MachineType::Standard),
             machine("payment-flow", MachineType::Standard),
             machine("ingest-fast", MachineType::Express),
@@ -783,9 +817,33 @@ mod tests {
     }
 
     #[test]
+    fn partial_flag_shows_in_titles() {
+        let mut v = SfnView::new();
+        // Sin parcial: el título no menciona "parcial".
+        v.on_message(&machines_msg(vec![machine("m1", MachineType::Standard)]));
+        assert!(!v.machines_title().contains("parcial"));
+        // Con parcial (tope de paginación): aparece la señal.
+        v.on_message(&Message::StateMachinesLoaded {
+            machines: vec![machine("m1", MachineType::Standard)],
+            more: true,
+        });
+        assert!(v.machines_title().contains("parcial"));
+
+        // Ejecuciones: drill a la máquina y cargar con more=true.
+        v.on_key(key(KeyCode::Enter)); // → Executions
+        let machine_arn = "arn:aws:states:us-east-1:000:stateMachine:m1".to_string();
+        v.on_message(&Message::ExecutionsLoaded {
+            machine_arn,
+            executions: vec![exec("e1", ExecStatus::Succeeded)],
+            more: true,
+        });
+        assert!(v.executions_title().contains("parcial"));
+    }
+
+    #[test]
     fn enter_drills_into_standard_machine_executions() {
         let mut v = SfnView::new();
-        v.on_message(&Message::StateMachinesLoaded(vec![machine(
+        v.on_message(&machines_msg(vec![machine(
             "order-saga",
             MachineType::Standard,
         )]));
@@ -802,7 +860,7 @@ mod tests {
     #[test]
     fn express_machine_does_not_request_executions() {
         let mut v = SfnView::new();
-        v.on_message(&Message::StateMachinesLoaded(vec![machine(
+        v.on_message(&machines_msg(vec![machine(
             "ingest-fast",
             MachineType::Express,
         )]));
@@ -824,14 +882,12 @@ mod tests {
     #[test]
     fn enter_drills_into_execution_detail_and_back() {
         let mut v = SfnView::new();
-        v.on_message(&Message::StateMachinesLoaded(vec![machine(
-            "m1",
-            MachineType::Standard,
-        )]));
+        v.on_message(&machines_msg(vec![machine("m1", MachineType::Standard)]));
         v.on_key(key(KeyCode::Enter)); // → Executions
         v.on_message(&Message::ExecutionsLoaded {
             machine_arn: "arn:aws:states:us-east-1:000:stateMachine:m1".into(),
             executions: vec![exec("e1", ExecStatus::Succeeded)],
+            more: false,
         });
         let actions = v.on_key(key(KeyCode::Enter)); // → Detail
         match actions.as_slice() {
@@ -852,10 +908,7 @@ mod tests {
     #[test]
     fn esc_at_root_emits_back() {
         let mut v = SfnView::new();
-        v.on_message(&Message::StateMachinesLoaded(vec![machine(
-            "m1",
-            MachineType::Standard,
-        )]));
+        v.on_message(&machines_msg(vec![machine("m1", MachineType::Standard)]));
         let actions = v.on_key(key(KeyCode::Esc));
         assert!(matches!(actions.as_slice(), [Action::Back]));
         assert!(matches!(v.level, Level::Machines));
@@ -871,10 +924,7 @@ mod tests {
     #[test]
     fn esc_in_executions_pops_without_back() {
         let mut v = SfnView::new();
-        v.on_message(&Message::StateMachinesLoaded(vec![machine(
-            "m1",
-            MachineType::Standard,
-        )]));
+        v.on_message(&machines_msg(vec![machine("m1", MachineType::Standard)]));
         v.on_key(key(KeyCode::Enter)); // → Executions
         let actions = v.on_key(key(KeyCode::Esc));
         assert!(
@@ -887,14 +937,12 @@ mod tests {
     #[test]
     fn executions_from_wrong_machine_are_ignored() {
         let mut v = SfnView::new();
-        v.on_message(&Message::StateMachinesLoaded(vec![machine(
-            "m1",
-            MachineType::Standard,
-        )]));
+        v.on_message(&machines_msg(vec![machine("m1", MachineType::Standard)]));
         v.on_key(key(KeyCode::Enter)); // drill m1 → Executions
         v.on_message(&Message::ExecutionsLoaded {
             machine_arn: "arn:aws:states:us-east-1:000:stateMachine:OTRA".into(),
             executions: vec![exec("x", ExecStatus::Succeeded)],
+            more: false,
         });
         assert_eq!(
             v.visible_len(),
@@ -906,14 +954,12 @@ mod tests {
     #[test]
     fn detail_from_wrong_execution_is_ignored() {
         let mut v = SfnView::new();
-        v.on_message(&Message::StateMachinesLoaded(vec![machine(
-            "m1",
-            MachineType::Standard,
-        )]));
+        v.on_message(&machines_msg(vec![machine("m1", MachineType::Standard)]));
         v.on_key(key(KeyCode::Enter));
         v.on_message(&Message::ExecutionsLoaded {
             machine_arn: "arn:aws:states:us-east-1:000:stateMachine:m1".into(),
             executions: vec![exec("e1", ExecStatus::Succeeded)],
+            more: false,
         });
         v.on_key(key(KeyCode::Enter)); // → Detail de e1
         v.on_message(&Message::ExecutionDetailLoaded {
@@ -959,10 +1005,7 @@ mod tests {
     #[test]
     fn arrow_on_empty_filter_is_safe() {
         let mut v = SfnView::new();
-        v.on_message(&Message::StateMachinesLoaded(vec![machine(
-            "m1",
-            MachineType::Standard,
-        )]));
+        v.on_message(&machines_msg(vec![machine("m1", MachineType::Standard)]));
         v.set_filter("zzz"); // 0 coincidencias
         assert_eq!(v.visible_len(), 0);
         v.on_key(key(KeyCode::Down));
@@ -992,7 +1035,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut v = SfnView::new();
-        v.on_message(&Message::StateMachinesLoaded(vec![
+        v.on_message(&machines_msg(vec![
             machine("order-saga", MachineType::Standard),
             machine("ingest-fast", MachineType::Express),
         ]));

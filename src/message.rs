@@ -177,12 +177,19 @@ pub enum Message {
     QueuePurged { queue_url: String },
 
     // --- Step Functions (v2) ---
-    /// Se cargaron las state machines del ambiente activo.
-    StateMachinesLoaded(Vec<StateMachineDto>),
+    /// Se cargaron las state machines del ambiente activo. `more` indica que se
+    /// alcanzó el tope de paginación con más máquinas pendientes (caso patológico).
+    StateMachinesLoaded {
+        machines: Vec<StateMachineDto>,
+        more: bool,
+    },
     /// Ejecuciones de una máquina (`machine_arn` para confirmar el drill actual).
+    /// `more` indica que el servidor tiene más (`next_token`): se muestran las 50
+    /// más recientes.
     ExecutionsLoaded {
         machine_arn: String,
         executions: Vec<ExecutionDto>,
+        more: bool,
     },
     /// Detalle de una ejecución (`describe_execution` + history ya parseado).
     /// `execution_arn` permite a la vista confirmar el drill actual; `failed_state`

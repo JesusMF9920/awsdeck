@@ -227,7 +227,10 @@ impl Effects {
                 let env = env.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    let msg = Message::StateMachinesLoaded(mock_state_machines(&env));
+                    let msg = Message::StateMachinesLoaded {
+                        machines: mock_state_machines(&env),
+                        more: false,
+                    };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
             }
@@ -235,7 +238,7 @@ impl Effects {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
                     let msg = match fetch_state_machines(&ctx).await {
-                        Ok(machines) => Message::StateMachinesLoaded(machines),
+                        Ok((machines, more)) => Message::StateMachinesLoaded { machines, more },
                         Err(e) => Message::Error(format!("list_state_machines: {e}")),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
@@ -254,6 +257,7 @@ impl Effects {
                     let msg = Message::ExecutionsLoaded {
                         machine_arn,
                         executions,
+                        more: false,
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -262,9 +266,10 @@ impl Effects {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
                     let msg = match fetch_executions(&ctx, &machine_arn).await {
-                        Ok(executions) => Message::ExecutionsLoaded {
+                        Ok((executions, more)) => Message::ExecutionsLoaded {
                             machine_arn,
                             executions,
+                            more,
                         },
                         Err(e) => Message::Error(format!("list_executions: {e}")),
                     };
@@ -543,31 +548,48 @@ fn pretty_truncate(raw: Option<&str>) -> Option<String> {
     Some(format!("{}\n… (truncado)", &pretty[..end]))
 }
 
-async fn fetch_state_machines(ctx: &AwsContext) -> color_eyre::Result<Vec<StateMachineDto>> {
-    let out = ctx
-        .sfn()
-        .await
-        .list_state_machines()
-        .max_results(50)
-        .send()
-        .await?;
-    let machines = out
-        .state_machines()
-        .iter()
-        .map(|m| StateMachineDto {
+/// Tope de páginas al listar state machines: sin filtro server-side, las máquinas
+/// que queden fuera serían inalcanzables, así que las traemos todas (son pocas por
+/// cuenta). El tope evita colgarse en una cuenta patológica; si se alcanza con más
+/// pendientes, se reporta `more = true` (la vista muestra `· parcial`).
+const MAX_MACHINE_PAGES: usize = 20;
+
+async fn fetch_state_machines(
+    ctx: &AwsContext,
+) -> color_eyre::Result<(Vec<StateMachineDto>, bool)> {
+    let client = ctx.sfn().await;
+    let mut machines: Vec<StateMachineDto> = Vec::new();
+    let mut next: Option<String> = None;
+    let mut more = false;
+    for page in 0..MAX_MACHINE_PAGES {
+        let out = client
+            .list_state_machines()
+            .max_results(50)
+            .set_next_token(next)
+            .send()
+            .await?;
+        machines.extend(out.state_machines().iter().map(|m| StateMachineDto {
             arn: m.state_machine_arn().to_string(),
             name: m.name().to_string(),
             machine_type: machine_type(m.r#type()),
             created_ts: dt_millis(m.creation_date()),
-        })
-        .collect();
-    Ok(machines)
+        }));
+        next = out.next_token().map(str::to_string);
+        if next.is_none() {
+            break;
+        }
+        // Última iteración con token aún presente: hay más de las que trajimos.
+        if page == MAX_MACHINE_PAGES - 1 {
+            more = true;
+        }
+    }
+    Ok((machines, more))
 }
 
 async fn fetch_executions(
     ctx: &AwsContext,
     machine_arn: &str,
-) -> color_eyre::Result<Vec<ExecutionDto>> {
+) -> color_eyre::Result<(Vec<ExecutionDto>, bool)> {
     let out = ctx
         .sfn()
         .await
@@ -587,7 +609,7 @@ async fn fetch_executions(
             stop_ts: opt_dt_millis(e.stop_date()),
         })
         .collect();
-    Ok(executions)
+    Ok((executions, out.next_token().is_some()))
 }
 
 /// Combina `describe_execution` (status/tiempos/input/output/error) +
@@ -1107,7 +1129,8 @@ mod tests {
         let envelope = rx.recv().await.expect("debe llegar un envelope");
         assert_eq!(envelope.epoch, 4);
         match envelope.message {
-            Message::StateMachinesLoaded(machines) => {
+            Message::StateMachinesLoaded { machines, more } => {
+                assert!(!more, "el mock cabe en una página");
                 assert!(
                     machines
                         .iter()
@@ -1145,7 +1168,9 @@ mod tests {
             Message::ExecutionsLoaded {
                 machine_arn,
                 executions,
+                more,
             } => {
+                assert!(!more, "el mock cabe en una página");
                 assert!(machine_arn.contains("order-saga"));
                 assert!(executions.iter().any(|e| e.status == ExecStatus::Failed));
                 assert!(

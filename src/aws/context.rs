@@ -5,7 +5,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use aws_config::{BehaviorVersion, Region};
+use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_cloudwatchlogs::Client as LogsClient;
 use tokio::sync::OnceCell;
 
@@ -40,6 +40,7 @@ impl fmt::Display for Env {
 /// Al cambiar de ambiente se crea un `AwsContext` nuevo (cache fresco).
 pub struct AwsContext {
     env: Env,
+    config: OnceCell<SdkConfig>,
     logs: OnceCell<LogsClient>,
 }
 
@@ -47,23 +48,30 @@ impl AwsContext {
     pub fn new(env: Env) -> Self {
         Self {
             env,
+            config: OnceCell::new(),
             logs: OnceCell::new(),
         }
     }
 
-    /// Cliente de CloudWatch Logs, construido y cacheado de forma perezosa vía
-    /// `aws-config` (profile + región del `Env`). Credenciales/SSO los resuelve
-    /// `aws-config`; nunca se hardcodea nada.
-    pub async fn logs(&self) -> &LogsClient {
-        self.logs
+    /// `SdkConfig` del ambiente (profile + región), resuelto una sola vez vía
+    /// `aws-config` y compartido por todos los clients. Credenciales/SSO los
+    /// resuelve `aws-config`; nunca se hardcodea nada.
+    async fn config(&self) -> &SdkConfig {
+        self.config
             .get_or_init(|| async {
-                let config = aws_config::defaults(BehaviorVersion::latest())
+                aws_config::defaults(BehaviorVersion::latest())
                     .profile_name(&self.env.profile)
                     .region(Region::new(self.env.region.clone()))
                     .load()
-                    .await;
-                LogsClient::new(&config)
+                    .await
             })
+            .await
+    }
+
+    /// Cliente de CloudWatch Logs, cacheado de forma perezosa.
+    pub async fn logs(&self) -> &LogsClient {
+        self.logs
+            .get_or_init(|| async { LogsClient::new(self.config().await) })
             .await
     }
 }

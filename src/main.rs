@@ -11,6 +11,7 @@ mod effects;
 mod message;
 mod tui;
 mod ui;
+mod util;
 mod views;
 
 use color_eyre::eyre::Result;

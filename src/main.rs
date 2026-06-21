@@ -29,7 +29,12 @@ async fn main() -> Result<()> {
 
     // Canal de resultados async: effects manda, App recibe en el select! loop.
     let (tx, rx) = mpsc::channel(64);
-    let effects = Effects::new(tx, env.clone());
+    // `AWSDECK_MOCK=1` usa datos falsos en memoria: demo/QA sin red ni credenciales.
+    let effects = if std::env::var_os("AWSDECK_MOCK").is_some() {
+        Effects::new_mock(tx, env.clone())
+    } else {
+        Effects::new(tx, env.clone())
+    };
 
     // Registry de vistas. Aquí —y solo aquí, en el composition root— se nombran
     // las vistas concretas. Agregar un servicio = registrar una línea más.

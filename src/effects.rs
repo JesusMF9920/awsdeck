@@ -18,9 +18,7 @@ use crate::message::{Envelope, LogGroupDto, LogStreamDto, Message};
 
 /// Fuente de datos.
 enum Backend {
-    /// Datos en memoria para tests / desarrollo sin red (ver `Effects::new_mock`).
-    /// El binario de producción siempre usa `Real`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Datos en memoria para tests y para `AWSDECK_MOCK=1` (demo sin red).
     Mock(Env),
     Real(Arc<AwsContext>),
 }
@@ -41,8 +39,7 @@ impl Effects {
         }
     }
 
-    /// Effects contra datos mock en memoria (tests / desarrollo sin red).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Effects contra datos mock en memoria (tests y `AWSDECK_MOCK=1`).
     pub fn new_mock(tx: mpsc::Sender<Envelope>, env: Env) -> Self {
         Self {
             tx,

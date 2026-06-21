@@ -5,6 +5,10 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use aws_config::{BehaviorVersion, Region};
+use aws_sdk_cloudwatchlogs::Client as LogsClient;
+use tokio::sync::OnceCell;
+
 /// El ambiente activo: identidad de la cuenta/region contra la que trabajamos.
 /// Es estado global de primera clase del `App`; cambiarlo sube el epoch y
 /// reconstruye los clients.
@@ -27,6 +31,40 @@ impl fmt::Display for Env {
     /// Render para el header: `profile · region`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} · {}", self.profile, self.region)
+    }
+}
+
+/// ClientFactory por ambiente: construye y cachea de forma lazy los clients
+/// tipados del SDK. `new` es síncrono (solo guarda el `Env`); el client real se
+/// construye la primera vez que se usa, dentro de una task async de `effects`.
+/// Al cambiar de ambiente se crea un `AwsContext` nuevo (cache fresco).
+pub struct AwsContext {
+    env: Env,
+    logs: OnceCell<LogsClient>,
+}
+
+impl AwsContext {
+    pub fn new(env: Env) -> Self {
+        Self {
+            env,
+            logs: OnceCell::new(),
+        }
+    }
+
+    /// Cliente de CloudWatch Logs, construido y cacheado de forma perezosa vía
+    /// `aws-config` (profile + región del `Env`). Credenciales/SSO los resuelve
+    /// `aws-config`; nunca se hardcodea nada.
+    pub async fn logs(&self) -> &LogsClient {
+        self.logs
+            .get_or_init(|| async {
+                let config = aws_config::defaults(BehaviorVersion::latest())
+                    .profile_name(&self.env.profile)
+                    .region(Region::new(self.env.region.clone()))
+                    .load()
+                    .await;
+                LogsClient::new(&config)
+            })
+            .await
     }
 }
 
@@ -73,18 +111,19 @@ fn parse_profiles(content: &str) -> Vec<ProfileEntry> {
             let name = if header == "default" {
                 Some("default".to_string())
             } else {
-                header.strip_prefix("profile ").map(|n| n.trim().to_string())
+                header
+                    .strip_prefix("profile ")
+                    .map(|n| n.trim().to_string())
             };
             current = name.map(|name| {
                 entries.push(ProfileEntry { name, region: None });
                 entries.len() - 1
             });
-        } else if let Some(idx) = current {
-            if let Some((key, value)) = line.split_once('=') {
-                if key.trim() == "region" {
-                    entries[idx].region = Some(value.trim().to_string());
-                }
-            }
+        } else if let Some(idx) = current
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == "region"
+        {
+            entries[idx].region = Some(value.trim().to_string());
         }
     }
 

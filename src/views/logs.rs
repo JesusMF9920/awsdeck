@@ -236,12 +236,12 @@ impl View for LogsView {
             }
             Message::LogStreamsLoaded { group, streams } => {
                 // Aceptar solo si corresponden al group del drill actual.
-                if let Level::Streams { group: current } = &self.level {
-                    if current == group {
-                        self.streams = streams.clone();
-                        self.loading = false;
-                        self.clamp_selection();
-                    }
+                if let Level::Streams { group: current } = &self.level
+                    && current == group
+                {
+                    self.streams = streams.clone();
+                    self.loading = false;
+                    self.clamp_selection();
                 }
             }
             // El App ya muestra el error en la status bar; aquí cortamos el loading.

@@ -1,53 +1,66 @@
 //! `effects` — el dispatcher y la ÚNICA frontera con el SDK. Recibe un `Action`,
-//! hace `tokio::spawn` de una task contra la fuente de datos correcta y manda un
-//! `Message` de vuelta por el canal mpsc, etiquetado con el `epoch` del `Env` que
-//! lo lanzó.
+//! hace `tokio::spawn` de una task contra el client correcto y manda un `Message`
+//! de vuelta por el canal mpsc, etiquetado con el `epoch` del `Env` que lo lanzó.
 //!
-//! En este commit la fuente es `Backend::Mock` (datos en memoria + un delay
-//! artificial para ejercitar el path async y hacer observable el epoch guard).
-//! El commit "SDK real" agrega `Backend::Real(AwsContext)` sin tocar vistas ni
-//! `app.rs`, porque los `Message`/DTOs no cambian.
+//! `Backend::Real` usa `aws-sdk-cloudwatchlogs` (vía `AwsContext`); `Backend::Mock`
+//! sirve para tests y desarrollo sin red. Como los `Message`/DTOs son los mismos,
+//! ni las vistas ni `app.rs` distinguen entre uno y otro. Cualquier fallo del SDK
+//! se reporta como `Message::Error` (lo pinta la status bar, nunca hace panic).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 use crate::action::Action;
-use crate::aws::context::Env;
+use crate::aws::context::{AwsContext, Env};
 use crate::message::{Envelope, LogGroupDto, LogStreamDto, Message};
 
-/// Fuente de datos. Arranca en `Mock`; "SDK real" agrega `Real`.
+/// Fuente de datos.
 enum Backend {
-    Mock,
+    /// Datos en memoria para tests / desarrollo sin red (ver `Effects::new_mock`).
+    /// El binario de producción siempre usa `Real`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Mock(Env),
+    Real(Arc<AwsContext>),
 }
 
-/// Traduce `Action`s de efecto en tasks async. Mantiene la identidad del ambiente
-/// activo (en mock, para etiquetar la data; en real, el `AwsContext` cacheado) y
-/// el `Sender` por donde regresan los `Message`.
+/// Traduce `Action`s de efecto en tasks async. Mantiene la fuente activa (el
+/// `AwsContext` por ambiente, o el `Env` en mock) y el `Sender` de resultados.
 pub struct Effects {
     tx: mpsc::Sender<Envelope>,
-    env: Env,
     backend: Backend,
 }
 
 impl Effects {
+    /// Effects contra el SDK real (aws-config + aws-sdk-cloudwatchlogs).
     pub fn new(tx: mpsc::Sender<Envelope>, env: Env) -> Self {
         Self {
             tx,
-            env,
-            backend: Backend::Mock,
+            backend: Backend::Real(Arc::new(AwsContext::new(env))),
         }
     }
 
-    /// Cambia el ambiente activo de la fuente. En mock solo re-etiqueta la data;
-    /// en real reconstruirá el cliente cacheado.
+    /// Effects contra datos mock en memoria (tests / desarrollo sin red).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn new_mock(tx: mpsc::Sender<Envelope>, env: Env) -> Self {
+        Self {
+            tx,
+            backend: Backend::Mock(env),
+        }
+    }
+
+    /// Cambia el ambiente activo: en real reconstruye el `AwsContext` (cache
+    /// fresco de clients); en mock solo re-etiqueta la data.
     pub fn set_env(&mut self, env: Env) {
-        self.env = env;
+        self.backend = match &self.backend {
+            Backend::Mock(_) => Backend::Mock(env),
+            Backend::Real(_) => Backend::Real(Arc::new(AwsContext::new(env))),
+        };
     }
 
     /// Despacha una `Action` de efecto: lanza la task y retorna de inmediato (no
-    /// bloquea el render). Las `Action` core las maneja el `App`; si alguna llega
-    /// aquí por error, se ignora.
+    /// bloquea el render). Las `Action` core las maneja el `App`.
     pub fn dispatch(&self, action: Action, epoch: u64) {
         match action {
             Action::LoadLogGroups => self.load_log_groups(epoch),
@@ -58,14 +71,24 @@ impl Effects {
 
     fn load_log_groups(&self, epoch: u64) {
         let tx = self.tx.clone();
-        let env = self.env.clone();
         match &self.backend {
-            Backend::Mock => {
+            Backend::Mock(env) => {
+                let env = env.clone();
                 tokio::spawn(async move {
                     // Delay artificial: ejercita el path async y hace observable el
                     // epoch guard (cambiar de ambiente con un request en vuelo).
                     tokio::time::sleep(Duration::from_millis(600)).await;
                     let msg = Message::LogGroupsLoaded(mock_log_groups(&env));
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match fetch_log_groups(&ctx).await {
+                        Ok(groups) => Message::LogGroupsLoaded(groups),
+                        Err(e) => Message::Error(format!("describe_log_groups: {e}")),
+                    };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
             }
@@ -75,7 +98,7 @@ impl Effects {
     fn load_log_streams(&self, group: String, epoch: u64) {
         let tx = self.tx.clone();
         match &self.backend {
-            Backend::Mock => {
+            Backend::Mock(_) => {
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(400)).await;
                     let streams = mock_log_streams(&group);
@@ -83,11 +106,63 @@ impl Effects {
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
             }
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match fetch_log_streams(&ctx, &group).await {
+                        Ok(streams) => Message::LogStreamsLoaded { group, streams },
+                        Err(e) => Message::Error(format!("describe_log_streams: {e}")),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
         }
     }
 }
 
-// --- Datos mock (en memoria) ---------------------------------------------------
+// --- SDK real -----------------------------------------------------------------
+
+async fn fetch_log_groups(ctx: &AwsContext) -> color_eyre::Result<Vec<LogGroupDto>> {
+    let client = ctx.logs().await;
+    let mut pages = client.describe_log_groups().into_paginator().items().send();
+
+    let mut groups = Vec::new();
+    while let Some(item) = pages.next().await {
+        let g = item?;
+        groups.push(LogGroupDto {
+            name: g.log_group_name().unwrap_or_default().to_string(),
+            stored_bytes: g.stored_bytes(),
+            arn: g.arn().map(str::to_string),
+        });
+    }
+    Ok(groups)
+}
+
+async fn fetch_log_streams(ctx: &AwsContext, group: &str) -> color_eyre::Result<Vec<LogStreamDto>> {
+    use aws_sdk_cloudwatchlogs::types::OrderBy;
+
+    let client = ctx.logs().await;
+    let mut pages = client
+        .describe_log_streams()
+        .log_group_name(group)
+        .order_by(OrderBy::LastEventTime)
+        .descending(true)
+        .into_paginator()
+        .items()
+        .send();
+
+    let mut streams = Vec::new();
+    while let Some(item) = pages.next().await {
+        let s = item?;
+        streams.push(LogStreamDto {
+            name: s.log_stream_name().unwrap_or_default().to_string(),
+            last_event_ts: s.last_event_timestamp(),
+        });
+    }
+    Ok(streams)
+}
+
+// --- Mock (tests / sin red) ---------------------------------------------------
 
 /// Log groups falsos del ambiente. Un par de nombres llevan el `profile` activo
 /// para que un cambio de ambiente sea visible en la lista.
@@ -107,7 +182,6 @@ fn mock_log_groups(env: &Env) -> Vec<LogGroupDto> {
     names
         .into_iter()
         .map(|name| {
-            // pseudo-tamaño determinista (sin RNG, para builds reproducibles).
             let stored = (name.len() as i64) * 7_919 % 5_000_000;
             let arn = format!(
                 "arn:aws:logs:{}:000000000000:log-group:{}:*",
@@ -129,7 +203,9 @@ fn mock_log_streams(group: &str) -> Vec<LogStreamDto> {
     let base_ts: i64 = 1_750_000_000_000; // ~2025, epoch millis
     (0..14)
         .map(|i| {
-            let id = seed.wrapping_mul(0x9E37_79B9).wrapping_add((i as u64) * 0x1000);
+            let id = seed
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add((i as u64) * 0x1000);
             LogStreamDto {
                 name: format!("2026/06/20/[$LATEST]{id:016x}"),
                 last_event_ts: Some(base_ts - (i as i64) * 137_000),
@@ -145,7 +221,7 @@ mod tests {
     #[tokio::test]
     async fn mock_log_groups_tag_epoch_and_reflect_profile() {
         let (tx, mut rx) = mpsc::channel(8);
-        let fx = Effects::new(tx, Env::new("dev", "us-east-1"));
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
 
         fx.dispatch(Action::LoadLogGroups, 7);
 
@@ -166,7 +242,7 @@ mod tests {
     #[tokio::test]
     async fn mock_log_streams_echo_group_and_epoch() {
         let (tx, mut rx) = mpsc::channel(8);
-        let fx = Effects::new(tx, Env::new("dev", "us-east-1"));
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
 
         fx.dispatch(
             Action::LoadLogStreams {

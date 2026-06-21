@@ -9,9 +9,9 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 
 const KEYS: &[(&str, &str)] = &[
     (":", "command bar (p. ej. :logs, :sqs)"),
-    ("/", "buscar (fuzzy; en logs consulta el server)"),
+    ("/", "buscar (fuzzy; ↑/↓ navega sin salir)"),
     ("enter", "abrir herramienta / drill al detalle"),
-    ("esc", "volver"),
+    ("esc", "volver un nivel (en la raíz, al menú)"),
     (":menu / bksp", "volver al menú principal"),
     ("r", "refresh"),
     ("p", "purgar cola SQS — gated por modo escritura"),

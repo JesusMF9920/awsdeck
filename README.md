@@ -37,9 +37,9 @@ se muestra en la **status bar** (no crashea).
 | Tecla | Acción |
 |-------|--------|
 | `:` | command bar (saltar de herramienta, p. ej. `:logs`, `:sqs`) |
-| `/` | buscar (fuzzy; en `logs` consulta al servidor) |
+| `/` | buscar (fuzzy; en `logs` consulta al servidor; `↑`/`↓` navegan los resultados sin salir) |
 | `enter` | abrir herramienta (menú) / drill al detalle |
-| `esc` | volver |
+| `esc` | volver un nivel (drill back; en la raíz de la vista, al menú) |
 | `:menu` · `backspace` | volver al menú principal |
 | `j` / `k` · `↑` / `↓` · `g` / `G` | navegar |
 | `r` | refrescar |
@@ -62,8 +62,9 @@ Recorrido rápido (con `AWSDECK_MOCK=1 cargo run`):
 
 1. Arranca en el **menú principal**; `j`/`k` + `enter` para abrir una herramienta (`logs`, `sqs`).
    `:menu` o `backspace` vuelven al menú.
-2. En `logs`/`sqs`, `/` **busca fuzzy** (p. ej. `ordapi` encuentra `orders-api`); `enter` hace
-   **drill** al detalle; `esc` regresa.
+2. En `logs`/`sqs`, `/` **busca fuzzy** (p. ej. `ordapi` encuentra `orders-api`) y dentro del
+   filtro `↑`/`↓` navegan los resultados sin tener que salir; `enter` hace **drill** al detalle;
+   `esc` regresa un nivel (y desde la raíz de la vista, al menú).
 3. `ctrl-e` abre el picker; elige otro profile → el ambiente y la lista cambian.
 4. `?` muestra la ayuda; `q` sale y la terminal queda limpia.
 

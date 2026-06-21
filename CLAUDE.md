@@ -70,8 +70,13 @@ concretas se cablean en `main.rs`; `effects.rs` es la frontera deliberada con el
 
 ## Keybindings (iguales en todas las vistas)
 
-`:` command bar · `/` filtro · `enter` drill · `esc` back · `r` refresh ·
+`:` command bar · `/` filtro (con `↑/↓` navegas los resultados sin salir) · `enter` drill ·
+`esc` back (un nivel; desde la raíz de la vista, al menú) · `r` refresh ·
 `ctrl-e` cambiar ambiente · `?` ayuda · `q` salir. (`y` copiar ARN/URL — más adelante.)
+
+`esc` es navegación uniforme: despoja un nivel de drill y, en la raíz, la vista emite
+`Action::Back` (intención core agnóstica) que el `App` mapea a "volver al menú". La vista
+nunca nombra al menú.
 
 ## Stack
 
@@ -103,9 +108,15 @@ es reusable para v2/v3. `switch_env` resetea el modo escritura.
   acotada (`describe_log_groups().limit(50)`); con query usa `log_group_name_pattern` (substring
   server-side). `View::search` + debounce ~280ms en el loop (`sleep_until`): cada tecla re-rankea
   local y, al parar, consulta al server. `last_query` descarta respuestas viejas (latest wins).
+- **`esc` vuelve al menú** desde la raíz de una vista (antes era no-op): la vista emite
+  `Action::Back` y el `App` hace `go_home()`. Drill back interno sigue consumiéndose en la vista.
+- **Navegar dentro del filtro**: en `Mode::Filter`, `↑/↓` se reenvían a la vista activa (mueven
+  su selección sobre la lista ya filtrada) sin salir del filtro ni editar el texto (estilo fzf);
+  el resto de teclas siguen editando el `tui-input`.
 
-50 tests sin red (routing, epoch guard, gate de mutaciones, fuzzy, menú, búsqueda/staleness,
-drill, parsers, render con `TestBackend`). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
+56 tests sin red (routing, epoch guard, gate de mutaciones, fuzzy, menú, búsqueda/staleness,
+drill, back→menú, navegación en filtro, parsers, render con `TestBackend`). `AWSDECK_MOCK=1
+cargo run` lo abre sin credenciales.
 
 Pendiente: v2 `sfn`, v3 `events` (no iniciadas), eventos de log (3er nivel en `logs`), `y`
 (copiar ARN), abrir en consola (`o`), config en disco.

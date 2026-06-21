@@ -10,10 +10,14 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 const KEYS: &[(&str, &str)] = &[
     (":", "command bar (p. ej. :logs, :sqs, :sfn, :events)"),
     ("/", "buscar (fuzzy; ↑/↓ navega sin salir)"),
-    ("enter", "abrir herramienta / drill al detalle"),
+    (
+        "enter",
+        "abrir herramienta / drill (group → stream → eventos)",
+    ),
     ("esc", "con filtro: lo limpia; si no, volver (raíz → menú)"),
     (":menu / bksp", "volver al menú principal"),
     ("r", "refresh"),
+    ("t", "tail del group (logs) — eventos de todos sus streams"),
     ("p", "purgar cola SQS — gated por modo escritura"),
     ("R", "redrive ejecución sfn — gated por modo escritura"),
     ("S", "enviar evento de prueba (events) — gated"),

@@ -12,19 +12,33 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::View;
 use crate::action::Action;
-use crate::message::{LogGroupDto, LogStreamDto, Message};
-use crate::util::{fmt_epoch_millis, fuzzy_score, ranked};
+use crate::message::{LogEventDto, LogGroupDto, LogStreamDto, Message};
+use crate::util::{fmt_clock_millis, fmt_epoch_millis, fuzzy_score, ranked};
 
 /// Nivel de drill actual.
 enum Level {
     Groups,
-    Streams { group: String },
+    Streams {
+        group: String,
+    },
+    /// Eventos de un stream (`get_log_events`).
+    Events {
+        group: String,
+        stream: String,
+    },
+    /// Tail del group (`filter_log_events` sobre todos sus streams). Sibling de
+    /// `Streams`: ambos bajan un nivel desde un group y `esc` vuelve a `Groups`.
+    Tail {
+        group: String,
+    },
 }
 
 pub struct LogsView {
     level: Level,
     groups: Vec<LogGroupDto>,
     streams: Vec<LogStreamDto>,
+    /// Buffer de líneas para las hojas `Events`/`Tail` (solo una activa a la vez).
+    events: Vec<LogEventDto>,
     filter: String,
     loading: bool,
     /// Última query server-side enviada (None = primeros 50). Guard "latest wins":
@@ -42,6 +56,7 @@ impl LogsView {
             level: Level::Groups,
             groups: Vec::new(),
             streams: Vec::new(),
+            events: Vec::new(),
             filter: String::new(),
             loading: false,
             last_query: None,
@@ -64,10 +79,22 @@ impl LogsView {
         })
     }
 
+    /// Filtro de líneas de log: substring case-insensitive sobre el mensaje (no
+    /// fuzzy — más apropiado para texto largo), preservando el orden cronológico.
+    fn filtered_event_indices(&self) -> Vec<usize> {
+        let needle = self.filter.to_lowercase();
+        (0..self.events.len())
+            .filter(|&i| {
+                needle.is_empty() || self.events[i].message.to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
     fn visible_len(&self) -> usize {
         match self.level {
             Level::Groups => self.filtered_group_indices().len(),
             Level::Streams { .. } => self.filtered_stream_indices().len(),
+            Level::Events { .. } | Level::Tail { .. } => self.filtered_event_indices().len(),
         }
     }
 
@@ -124,10 +151,16 @@ impl LogsView {
         Some(self.groups[idx].name.clone())
     }
 
+    fn selected_stream_name(&self) -> Option<String> {
+        let sel = self.state.selected()?;
+        let idx = *self.filtered_stream_indices().get(sel)?;
+        Some(self.streams[idx].name.clone())
+    }
+
     // --- Navegación -----------------------------------------------------------
 
     fn drill(&mut self) -> Vec<Action> {
-        match self.level {
+        match &self.level {
             Level::Groups => match self.selected_group_name() {
                 Some(group) => {
                     self.level = Level::Streams {
@@ -142,30 +175,82 @@ impl LogsView {
                 }
                 None => vec![],
             },
-            // Ya en el último nivel: enter no hace nada (v0 es solo-lectura).
-            Level::Streams { .. } => vec![],
+            Level::Streams { group } => {
+                let group = group.clone();
+                match self.selected_stream_name() {
+                    Some(stream) => {
+                        self.level = Level::Events {
+                            group: group.clone(),
+                            stream: stream.clone(),
+                        };
+                        self.events.clear();
+                        self.loading = true;
+                        self.state.select(Some(0));
+                        vec![Action::ClearFilter, Action::LoadLogEvents { group, stream }]
+                    }
+                    None => vec![],
+                }
+            }
+            // Hojas (líneas de log): enter no hace nada (v0 es solo-lectura).
+            Level::Events { .. } | Level::Tail { .. } => vec![],
+        }
+    }
+
+    /// `t` desde la raíz: tail del group seleccionado (`filter_log_events` sobre
+    /// todos sus streams). Sibling del drill a streams; `esc` vuelve a groups.
+    fn tail(&mut self) -> Vec<Action> {
+        match self.selected_group_name() {
+            Some(group) => {
+                self.level = Level::Tail {
+                    group: group.clone(),
+                };
+                self.events.clear();
+                self.loading = true;
+                self.last_query = None; // el tail arranca sin filtro server-side
+                self.state.select(Some(0));
+                vec![
+                    Action::ClearFilter,
+                    Action::LoadLogTail {
+                        group,
+                        pattern: None,
+                    },
+                ]
+            }
+            None => vec![],
         }
     }
 
     /// `esc`: despoja un nivel de drill. En la raíz (groups) no hay nada que
-    /// despojar → emite `Back` para que el `App` vuelva al menú.
+    /// despojar → emite `Back` para que el `App` vuelva al menú. (El `App` ya limpió
+    /// el filtro en la 1a etapa de `esc`, así que aquí no hace falta `ClearFilter`.)
     fn back(&mut self) -> Vec<Action> {
-        if matches!(self.level, Level::Streams { .. }) {
-            self.level = Level::Groups;
-            self.state.select(Some(0));
-            self.clamp_selection();
-            // Si veníamos de una búsqueda server-side, los groups en cache están
-            // acotados a esa query; como el filtro ya se limpió al drillear,
-            // recargamos la página completa. Sin búsqueda previa, siguen en cache.
-            if self.last_query.take().is_some() {
-                self.loading = true;
-                vec![Action::LoadLogGroups { query: None }]
-            } else {
+        match &self.level {
+            // Events → Streams: los streams siguen en cache, no se recargan.
+            Level::Events { group, .. } => {
+                self.level = Level::Streams {
+                    group: group.clone(),
+                };
+                self.state.select(Some(0));
+                self.clamp_selection();
                 self.loading = false;
                 vec![]
             }
-        } else {
-            vec![Action::Back]
+            // Streams/Tail → Groups. Si veníamos de una búsqueda server-side, los
+            // groups en cache están acotados a esa query → recargamos la página
+            // completa. Sin búsqueda previa, siguen en cache.
+            Level::Streams { .. } | Level::Tail { .. } => {
+                self.level = Level::Groups;
+                self.state.select(Some(0));
+                self.clamp_selection();
+                if self.last_query.take().is_some() {
+                    self.loading = true;
+                    vec![Action::LoadLogGroups { query: None }]
+                } else {
+                    self.loading = false;
+                    vec![]
+                }
+            }
+            Level::Groups => vec![Action::Back],
         }
     }
 
@@ -178,6 +263,15 @@ impl LogsView {
             }],
             Level::Streams { group } => vec![Action::LoadLogStreams {
                 group: group.clone(),
+            }],
+            Level::Events { group, stream } => vec![Action::LoadLogEvents {
+                group: group.clone(),
+                stream: stream.clone(),
+            }],
+            // El tail recarga con el mismo filtro server-side vigente (si lo hay).
+            Level::Tail { group } => vec![Action::LoadLogTail {
+                group: group.clone(),
+                pattern: self.last_query.clone(),
             }],
         }
     }
@@ -196,11 +290,26 @@ impl LogsView {
                 self.streams.len(),
                 self.filtered_stream_indices().len(),
             ),
+            Level::Events { .. } => (
+                "eventos",
+                self.events.len(),
+                self.filtered_event_indices().len(),
+            ),
+            Level::Tail { .. } => (
+                "tail",
+                self.events.len(),
+                self.filtered_event_indices().len(),
+            ),
         };
-        let partial = if self.partial && matches!(self.level, Level::Groups) {
-            " · parcial (/ busca server-side)"
-        } else {
+        let partial = if !self.partial {
             ""
+        } else {
+            match self.level {
+                Level::Groups => " · parcial (/ busca server-side)",
+                Level::Events { .. } => " · parcial (más viejas arriba)",
+                Level::Tail { .. } => " · parcial (acota con /)",
+                Level::Streams { .. } => "",
+            }
         };
         if self.filter.is_empty() {
             format!(" {total} {kind}{partial} ")
@@ -225,19 +334,22 @@ impl View for LogsView {
     }
 
     fn description(&self) -> &'static str {
-        "CloudWatch Log Groups & Streams"
+        "CloudWatch Logs — groups, streams, eventos y tail"
     }
 
     fn title(&self) -> String {
         match &self.level {
             Level::Groups => "logs".to_string(),
             Level::Streams { group } => format!("logs / {group}"),
+            Level::Events { group, stream } => format!("logs / {group} / {stream}"),
+            Level::Tail { group } => format!("logs / {group} (tail)"),
         }
     }
 
     fn on_activate(&mut self) -> Vec<Action> {
         self.level = Level::Groups;
         self.streams.clear();
+        self.events.clear();
         self.loading = true;
         self.last_query = None;
         self.partial = false;
@@ -266,6 +378,8 @@ impl View for LogsView {
             KeyCode::Enter => self.drill(),
             KeyCode::Esc => self.back(),
             KeyCode::Char('r') => self.refresh(),
+            // Tail del group seleccionado (solo desde la raíz; sibling de streams).
+            KeyCode::Char('t') if matches!(self.level, Level::Groups) => self.tail(),
             _ => vec![],
         }
     }
@@ -301,6 +415,45 @@ impl View for LogsView {
                     self.clamp_selection();
                 }
             }
+            Message::LogEventsLoaded {
+                group,
+                stream,
+                events,
+                more,
+            } => {
+                // Aceptar solo si corresponden al stream del drill actual.
+                if let Level::Events {
+                    group: g,
+                    stream: s,
+                } = &self.level
+                    && g == group
+                    && s == stream
+                {
+                    self.events = events.clone();
+                    self.partial = *more;
+                    self.loading = false;
+                    self.select_edge(true); // newest abajo (convención de terminal)
+                }
+            }
+            Message::LogTailLoaded {
+                group,
+                query,
+                events,
+                more,
+            } => {
+                // Guard "latest wins" (filtro server-side) + correspondencia de group.
+                if query != &self.last_query {
+                    return;
+                }
+                if let Level::Tail { group: g } = &self.level
+                    && g == group
+                {
+                    self.events = events.clone();
+                    self.partial = *more;
+                    self.loading = false;
+                    self.select_edge(true);
+                }
+            }
             // El App ya muestra el error en la status bar; aquí cortamos el loading.
             Message::Error(_) => self.loading = false,
             // Mensajes de otras vistas (p. ej. SQS): se ignoran.
@@ -315,15 +468,27 @@ impl View for LogsView {
     }
 
     fn search(&mut self, query: &str) -> Vec<Action> {
-        // Solo busca server-side en el nivel de groups.
-        if !matches!(self.level, Level::Groups) {
-            return Vec::new();
+        // Búsqueda server-side: en groups (logGroupNamePattern) y en el tail del
+        // group (filter_pattern). En los demás niveles, `/` filtra local.
+        match &self.level {
+            Level::Groups => {
+                self.last_query = (!query.is_empty()).then(|| query.to_string());
+                self.loading = true;
+                vec![Action::LoadLogGroups {
+                    query: self.last_query.clone(),
+                }]
+            }
+            Level::Tail { group } => {
+                let group = group.clone();
+                self.last_query = (!query.is_empty()).then(|| query.to_string());
+                self.loading = true;
+                vec![Action::LoadLogTail {
+                    group,
+                    pattern: self.last_query.clone(),
+                }]
+            }
+            _ => Vec::new(),
         }
-        self.last_query = (!query.is_empty()).then(|| query.to_string());
-        self.loading = true;
-        vec![Action::LoadLogGroups {
-            query: self.last_query.clone(),
-        }]
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -339,6 +504,11 @@ impl View for LogsView {
                 .filtered_stream_indices()
                 .into_iter()
                 .map(|i| stream_item(&self.streams[i]))
+                .collect(),
+            Level::Events { .. } | Level::Tail { .. } => self
+                .filtered_event_indices()
+                .into_iter()
+                .map(|i| event_item(&self.events[i]))
                 .collect(),
         };
 
@@ -388,6 +558,48 @@ fn stream_item(s: &LogStreamDto) -> ListItem<'static> {
     ]))
 }
 
+/// Una línea de log: `HH:MM:SS  [stream]  message`. El `[stream]` solo aparece en el
+/// tail (varios streams mezclados). Color por severidad del mensaje.
+fn event_item(e: &LogEventDto) -> ListItem<'static> {
+    let when =
+        e.ts.map(fmt_clock_millis)
+            .unwrap_or_else(|| "--:--:--".to_string());
+    let mut spans = vec![
+        Span::styled(when, Style::new().dark_gray()),
+        Span::raw("  "),
+    ];
+    if let Some(stream) = &e.stream {
+        spans.push(Span::styled(
+            format!("{}  ", stream_suffix(stream)),
+            Style::new().cyan(),
+        ));
+    }
+    spans.push(Span::styled(e.message.clone(), severity_style(&e.message)));
+    ListItem::new(Line::from(spans))
+}
+
+/// Sufijo corto e identificable de un nombre de stream (la parte tras `]`, p. ej.
+/// `2026/06/21/[$LATEST]ab12cd` → `ab12cd`), recortado para no robar ancho a la línea.
+fn stream_suffix(name: &str) -> String {
+    let tail = name
+        .rsplit(']')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(name);
+    tail.chars().take(12).collect()
+}
+
+/// Resalta líneas de error (rojo) y warning (amarillo); el resto en estilo normal.
+fn severity_style(msg: &str) -> Style {
+    if msg.contains("ERROR") || msg.contains("Exception") || msg.contains("panic") {
+        Style::new().red()
+    } else if msg.contains("WARN") {
+        Style::new().yellow()
+    } else {
+        Style::new()
+    }
+}
+
 fn human_bytes(n: i64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = n as f64;
@@ -427,6 +639,243 @@ mod tests {
     fn key(code: KeyCode) -> KeyEvent {
         use ratatui::crossterm::event::KeyModifiers;
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn stream(name: &str) -> Message {
+        Message::LogStreamsLoaded {
+            group: "/svc".into(),
+            streams: vec![LogStreamDto {
+                name: name.to_string(),
+                last_event_ts: None,
+            }],
+        }
+    }
+
+    fn ev(msg: &str, ts: i64) -> LogEventDto {
+        LogEventDto {
+            ts: Some(ts),
+            message: msg.to_string(),
+            stream: None,
+        }
+    }
+
+    fn events_loaded(group: &str, stream: &str, events: Vec<LogEventDto>) -> Message {
+        Message::LogEventsLoaded {
+            group: group.into(),
+            stream: stream.into(),
+            events,
+            more: false,
+        }
+    }
+
+    fn tail_loaded(group: &str, query: Option<&str>, events: Vec<LogEventDto>) -> Message {
+        Message::LogTailLoaded {
+            group: group.into(),
+            query: query.map(str::to_string),
+            events,
+            more: false,
+        }
+    }
+
+    /// Helper: deja a la vista en `Level::Events` del stream `stream-a` de `/svc`.
+    fn into_events(v: &mut LogsView) {
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Enter)); // groups → streams
+        v.on_message(&stream("stream-a"));
+        v.on_key(key(KeyCode::Enter)); // streams → events
+    }
+
+    #[test]
+    fn enter_on_stream_drills_into_events() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Enter)); // groups → streams
+        v.on_message(&stream("stream-a"));
+        let actions = v.on_key(key(KeyCode::Enter)); // streams → events
+        match actions.as_slice() {
+            [Action::ClearFilter, Action::LoadLogEvents { group, stream }] => {
+                assert_eq!(group, "/svc");
+                assert_eq!(stream, "stream-a");
+            }
+            other => panic!("se esperaba ClearFilter+LoadLogEvents, llegó {other:?}"),
+        }
+        assert!(matches!(v.level, Level::Events { .. }));
+    }
+
+    #[test]
+    fn t_on_group_opens_tail() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        let actions = v.on_key(key(KeyCode::Char('t')));
+        match actions.as_slice() {
+            [Action::ClearFilter, Action::LoadLogTail { group, pattern }] => {
+                assert_eq!(group, "/svc");
+                assert!(pattern.is_none(), "el tail arranca sin filtro");
+            }
+            other => panic!("se esperaba ClearFilter+LoadLogTail, llegó {other:?}"),
+        }
+        assert!(matches!(v.level, Level::Tail { .. }));
+    }
+
+    #[test]
+    fn ingests_events_selects_bottom() {
+        let mut v = LogsView::new();
+        into_events(&mut v);
+        v.on_message(&events_loaded(
+            "/svc",
+            "stream-a",
+            vec![ev("a", 1), ev("b", 2), ev("c", 3)],
+        ));
+        assert_eq!(v.visible_len(), 3);
+        assert_eq!(
+            v.state.selected(),
+            Some(2),
+            "newest (último) preseleccionado, convención de terminal"
+        );
+    }
+
+    #[test]
+    fn events_from_wrong_stream_ignored() {
+        let mut v = LogsView::new();
+        into_events(&mut v); // events de stream-a
+        v.on_message(&events_loaded("/svc", "otro-stream", vec![ev("x", 1)]));
+        assert_eq!(v.visible_len(), 0, "no se aceptan eventos de otro stream");
+    }
+
+    #[test]
+    fn tail_from_wrong_group_ignored() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Char('t'))); // tail de /svc (last_query = None)
+        v.on_message(&tail_loaded("/otro", None, vec![ev("x", 1)]));
+        assert_eq!(v.visible_len(), 0, "tail de otro group ignorado");
+    }
+
+    #[test]
+    fn tail_search_is_server_side() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Char('t')));
+        let actions = v.search("error");
+        match actions.as_slice() {
+            [Action::LoadLogTail { group, pattern }] => {
+                assert_eq!(group, "/svc");
+                assert_eq!(pattern.as_deref(), Some("error"), "filtro server-side");
+            }
+            other => panic!("el tail busca server-side (LoadLogTail), llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tail_discards_stale_results() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Char('t')));
+        let _ = v.search("err"); // last_query = Some("err")
+
+        // Respuesta de un filtro VIEJO ("er") → descartada.
+        v.on_message(&tail_loaded("/svc", Some("er"), vec![ev("viejo", 1)]));
+        assert_eq!(v.visible_len(), 0, "respuesta de filtro viejo descartada");
+
+        // Respuesta del filtro VIGENTE ("err") → aceptada.
+        v.on_message(&tail_loaded(
+            "/svc",
+            Some("err"),
+            vec![ev("error nuevo", 1)],
+        ));
+        assert_eq!(v.visible_len(), 1);
+    }
+
+    #[test]
+    fn esc_in_events_pops_to_streams() {
+        let mut v = LogsView::new();
+        into_events(&mut v);
+        assert!(matches!(v.level, Level::Events { .. }));
+        let actions = v.on_key(key(KeyCode::Esc));
+        assert!(
+            actions.is_empty(),
+            "esc en events se consume en la vista (streams en cache)"
+        );
+        assert!(matches!(v.level, Level::Streams { .. }));
+        assert_eq!(v.visible_len(), 1, "los streams siguen en cache");
+    }
+
+    #[test]
+    fn esc_in_tail_pops_to_groups() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/a"), group("/b")]));
+        v.on_key(key(KeyCode::Char('t'))); // tail de /a
+        assert!(matches!(v.level, Level::Tail { .. }));
+        let actions = v.on_key(key(KeyCode::Esc));
+        assert!(actions.is_empty(), "sin búsqueda previa, no recarga");
+        assert!(matches!(v.level, Level::Groups));
+        assert_eq!(v.visible_len(), 2, "los groups siguen en cache");
+    }
+
+    #[test]
+    fn filter_narrows_events_local() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Char('t')));
+        v.on_message(&tail_loaded(
+            "/svc",
+            None,
+            vec![ev("INFO ok", 1), ev("ERROR boom", 2)],
+        ));
+        assert_eq!(v.visible_len(), 2);
+        v.set_filter("error");
+        assert_eq!(
+            v.visible_len(),
+            1,
+            "filtro local por substring (case-insensitive)"
+        );
+    }
+
+    #[test]
+    fn render_events_without_panicking() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut v = LogsView::new();
+        into_events(&mut v);
+        v.on_message(&events_loaded(
+            "/svc",
+            "stream-a",
+            vec![ev("INFO hello", 1), ev("ERROR boom", 2)],
+        ));
+
+        let mut terminal = Terminal::new(TestBackend::new(70, 8)).unwrap();
+        terminal.draw(|f| v.render(f, f.area())).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("boom"), "debe pintar la línea de log");
+        assert!(text.contains("eventos"), "el título muestra el conteo");
+    }
+
+    #[test]
+    fn render_tail_without_panicking() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Char('t')));
+        v.on_message(&tail_loaded(
+            "/svc",
+            None,
+            vec![LogEventDto {
+                ts: Some(1),
+                message: "INFO a".into(),
+                stream: Some("2026/06/21/[$LATEST]abc123".into()),
+            }],
+        ));
+
+        let mut terminal = Terminal::new(TestBackend::new(70, 8)).unwrap();
+        terminal.draw(|f| v.render(f, f.area())).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("tail"), "el título muestra (tail)");
+        assert!(text.contains("abc123"), "muestra el sufijo del stream");
     }
 
     #[test]

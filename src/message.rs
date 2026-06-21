@@ -25,6 +25,17 @@ pub struct LogStreamDto {
     pub last_event_ts: Option<i64>,
 }
 
+/// Un evento (línea) de log. `message` ya viene recortado desde `effects`.
+#[derive(Clone, Debug)]
+pub struct LogEventDto {
+    /// Epoch en milisegundos del evento, si lo hay.
+    pub ts: Option<i64>,
+    pub message: String,
+    /// Stream de origen. `Some` solo en el *tail* del group (`filter_log_events`
+    /// trae eventos de varios streams); `None` por-stream (ya conoces el stream).
+    pub stream: Option<String>,
+}
+
 /// Una cola de SQS (datos para la lista).
 #[derive(Clone, Debug)]
 pub struct QueueDto {
@@ -216,6 +227,23 @@ pub enum Message {
     LogStreamsLoaded {
         group: String,
         streams: Vec<LogStreamDto>,
+    },
+    /// Eventos de un stream (`get_log_events`). `group`+`stream` confirman el drill
+    /// actual; `more` indica que hay líneas más viejas que las traídas.
+    LogEventsLoaded {
+        group: String,
+        stream: String,
+        events: Vec<LogEventDto>,
+        more: bool,
+    },
+    /// Tail de un group (`filter_log_events` sobre todos sus streams). `group`
+    /// confirma el drill actual; `query` ecoa el filtro server-side (guard
+    /// latest-wins, espeja `LogGroupsLoaded`); `more` = hay más en la ventana.
+    LogTailLoaded {
+        group: String,
+        query: Option<String>,
+        events: Vec<LogEventDto>,
+        more: bool,
     },
     /// Se cargaron las colas del ambiente activo.
     QueuesLoaded(Vec<QueueDto>),

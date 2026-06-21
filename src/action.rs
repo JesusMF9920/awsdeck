@@ -32,6 +32,14 @@ pub enum Action {
     LoadLogGroups { query: Option<String> },
     /// Hacer drill: pedir los log streams de un log group.
     LoadLogStreams { group: String },
+    /// Hacer drill a un stream: sus eventos más recientes (`get_log_events`).
+    LoadLogEvents { group: String, stream: String },
+    /// Tail de un group: eventos de todos sus streams (`filter_log_events`).
+    /// `pattern=None` = ventana reciente; `pattern=Some(p)` = filtro server-side.
+    LoadLogTail {
+        group: String,
+        pattern: Option<String>,
+    },
     /// Pedir la lista de colas SQS del ambiente activo.
     LoadQueues,
     /// Hacer drill a una cola: attributes + peek de mensajes.

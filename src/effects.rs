@@ -8,16 +8,16 @@
 //! se reporta como `Message::Error` (lo pinta la status bar, nunca hace panic).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 
 use crate::action::Action;
 use crate::aws::context::{AwsContext, Env};
 use crate::message::{
-    Envelope, EventBusDto, ExecStatus, ExecutionDetailDto, ExecutionDto, LogGroupDto, LogStreamDto,
-    MachineType, Message, QueueAttrsDto, QueueDto, QueueMessageDto, RuleDetailDto, RuleDto,
-    RuleState, StateMachineDto, StateSpanDto, TargetDto,
+    Envelope, EventBusDto, ExecStatus, ExecutionDetailDto, ExecutionDto, LogEventDto, LogGroupDto,
+    LogStreamDto, MachineType, Message, QueueAttrsDto, QueueDto, QueueMessageDto, RuleDetailDto,
+    RuleDto, RuleState, StateMachineDto, StateSpanDto, TargetDto,
 };
 
 /// Fuente de datos.
@@ -66,6 +66,8 @@ impl Effects {
         match action {
             Action::LoadLogGroups { query } => self.load_log_groups(query, epoch),
             Action::LoadLogStreams { group } => self.load_log_streams(group, epoch),
+            Action::LoadLogEvents { group, stream } => self.load_log_events(group, stream, epoch),
+            Action::LoadLogTail { group, pattern } => self.load_log_tail(group, pattern, epoch),
             Action::LoadQueues => self.load_queues(epoch),
             Action::LoadQueueDetail { queue_url } => self.load_queue_detail(queue_url, epoch),
             Action::PurgeQueue { queue_url } => self.purge_queue(queue_url, epoch),
@@ -144,6 +146,74 @@ impl Effects {
                     let msg = match fetch_log_streams(&ctx, &group).await {
                         Ok(streams) => Message::LogStreamsLoaded { group, streams },
                         Err(e) => Message::Error(format!("describe_log_streams: {e}")),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+        }
+    }
+
+    fn load_log_events(&self, group: String, stream: String, epoch: u64) {
+        let tx = self.tx.clone();
+        match &self.backend {
+            Backend::Mock(_) => {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let events = mock_log_events(&group, &stream);
+                    let msg = Message::LogEventsLoaded {
+                        group,
+                        stream,
+                        events,
+                        more: false,
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match fetch_log_events(&ctx, &group, &stream).await {
+                        Ok((events, more)) => Message::LogEventsLoaded {
+                            group,
+                            stream,
+                            events,
+                            more,
+                        },
+                        Err(e) => Message::Error(format!("get_log_events: {e}")),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+        }
+    }
+
+    fn load_log_tail(&self, group: String, pattern: Option<String>, epoch: u64) {
+        let tx = self.tx.clone();
+        match &self.backend {
+            Backend::Mock(_) => {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(450)).await;
+                    let events = mock_log_tail(&group, pattern.as_deref());
+                    let msg = Message::LogTailLoaded {
+                        group,
+                        query: pattern,
+                        events,
+                        more: false,
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match fetch_log_tail(&ctx, &group, pattern.as_deref()).await {
+                        Ok((events, more)) => Message::LogTailLoaded {
+                            group,
+                            query: pattern,
+                            events,
+                            more,
+                        },
+                        Err(e) => Message::Error(format!("filter_log_events: {e}")),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -516,6 +586,100 @@ async fn fetch_log_streams(ctx: &AwsContext, group: &str) -> color_eyre::Result<
         });
     }
     Ok(streams)
+}
+
+/// Tope de líneas por carga. `get_log_events` con `start_from_head(false)` trae las
+/// más recientes; `more = len == EVENTS_LIMIT` (heurístico: sus tokens vienen aun sin
+/// más, así que no sirven para `more`).
+const EVENTS_LIMIT: i32 = 200;
+/// Ventana del *tail*: `filter_log_events` sin `start_time` devuelve lo más viejo, así
+/// que acotamos a la última hora para "recientes".
+const TAIL_LOOKBACK_MS: i64 = 60 * 60 * 1000;
+/// Tope de eventos del *tail* en una sola página; `more = next_token.is_some()`.
+const TAIL_LIMIT: i32 = 1000;
+/// Tope por línea: las líneas de log pueden ser enormes (stack traces, JSON); no
+/// pasamos cientos de KB a la vista. Colapsa saltos de línea para una fila por evento.
+const MAX_LINE: usize = 2048;
+
+/// Epoch en millis (UTC) ahora. La vista nunca ve relojes: effects acota la ventana.
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Recorta una línea de log a `MAX_LINE` y colapsa saltos a espacio (una fila/evento).
+fn clip_message(raw: Option<&str>) -> String {
+    let one_line = raw.unwrap_or_default().replace(['\n', '\r'], " ");
+    if one_line.len() <= MAX_LINE {
+        return one_line;
+    }
+    let mut end = MAX_LINE;
+    while !one_line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &one_line[..end])
+}
+
+/// Eventos recientes de un stream (`get_log_events`, las últimas `EVENTS_LIMIT`).
+/// Devuelve `(events, hay_más_viejas)`; orden cronológico ascendente (newest abajo).
+async fn fetch_log_events(
+    ctx: &AwsContext,
+    group: &str,
+    stream: &str,
+) -> color_eyre::Result<(Vec<LogEventDto>, bool)> {
+    let out = ctx
+        .logs()
+        .await
+        .get_log_events()
+        .log_group_name(group)
+        .log_stream_name(stream)
+        .limit(EVENTS_LIMIT)
+        .start_from_head(false)
+        .send()
+        .await?;
+    let events: Vec<LogEventDto> = out
+        .events()
+        .iter()
+        .map(|e| LogEventDto {
+            ts: e.timestamp(),
+            message: clip_message(e.message()),
+            stream: None,
+        })
+        .collect();
+    let more = events.len() as i32 == EVENTS_LIMIT;
+    Ok((events, more))
+}
+
+/// Tail de un group (`filter_log_events` sobre todos sus streams) en la ventana
+/// reciente. Con `pattern`, filtra server-side (`filter_pattern`). Cada evento trae
+/// su `log_stream_name`. Devuelve `(events, hay_más_en_la_ventana)`.
+async fn fetch_log_tail(
+    ctx: &AwsContext,
+    group: &str,
+    pattern: Option<&str>,
+) -> color_eyre::Result<(Vec<LogEventDto>, bool)> {
+    let out = ctx
+        .logs()
+        .await
+        .filter_log_events()
+        .log_group_name(group)
+        .set_filter_pattern(pattern.map(str::to_string))
+        .start_time(now_millis() - TAIL_LOOKBACK_MS)
+        .limit(TAIL_LIMIT)
+        .send()
+        .await?;
+    let events = out
+        .events()
+        .iter()
+        .map(|e| LogEventDto {
+            ts: e.timestamp(),
+            message: clip_message(e.message()),
+            stream: e.log_stream_name().map(str::to_string),
+        })
+        .collect();
+    Ok((events, out.next_token().is_some()))
 }
 
 async fn fetch_queues(ctx: &AwsContext) -> color_eyre::Result<Vec<QueueDto>> {
@@ -1052,6 +1216,69 @@ fn mock_log_streams(group: &str) -> Vec<LogStreamDto> {
         .collect()
 }
 
+/// Eventos falsos de un stream, deterministas por `group`+`stream`. Orden ascendente
+/// (newest al final). Incluye una línea `ERROR` y una `WARN` para ejercitar el color.
+fn mock_log_events(group: &str, stream: &str) -> Vec<LogEventDto> {
+    let seed: i64 = group.bytes().chain(stream.bytes()).map(i64::from).sum();
+    let base_ts: i64 = 1_750_000_000_000; // ~2025, epoch millis
+    let lines = [
+        "START RequestId: 3f9a-1d2b Version: $LATEST",
+        "INFO cold start: init 412ms",
+        "INFO handler invoked: { \"orderId\": \"A-1001\" }",
+        "INFO fetching order from dynamodb",
+        "WARN retry 1/3: throttled by downstream",
+        "INFO charge authorized: 4200 cents",
+        "INFO publishing OrderProcessed event",
+        "ERROR unhandled: NullPointer at process.js:42",
+        "INFO emitting metrics: { \"latencyMs\": 318 }",
+        "END RequestId: 3f9a-1d2b",
+    ];
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, msg)| LogEventDto {
+            // Eventos cada ~ (seed-derivado) segundos; ascendente.
+            ts: Some(base_ts + (i as i64) * (1_000 + seed % 700)),
+            message: msg.to_string(),
+            stream: None,
+        })
+        .collect()
+}
+
+/// Tail falso de un group: líneas intercaladas de 3 streams (`filter_log_events` trae
+/// el stream de cada evento). Con `pattern`, filtra por substring case-insensitive
+/// (mimetiza el `filter_pattern` del server, que en real es más rico).
+fn mock_log_tail(group: &str, pattern: Option<&str>) -> Vec<LogEventDto> {
+    let base_ts: i64 = 1_750_000_000_000;
+    let seed: i64 = group.bytes().map(i64::from).sum();
+    let streams = [
+        format!("2026/06/21/[$LATEST]{:08x}", seed as u32),
+        format!("2026/06/21/[$LATEST]{:08x}", (seed as u32).wrapping_mul(7)),
+        format!("2026/06/21/[$LATEST]{:08x}", (seed as u32).wrapping_mul(13)),
+    ];
+    let raw = [
+        "INFO request accepted",
+        "INFO validating payload",
+        "WARN deprecated field 'legacyId' present",
+        "ERROR downstream 502: payments-api unavailable",
+        "INFO falling back to cache",
+        "INFO response sent 200",
+    ];
+    let pat = pattern.map(str::to_lowercase);
+    raw.into_iter()
+        .enumerate()
+        .filter(|(_, msg)| {
+            pat.as_deref()
+                .is_none_or(|p| msg.to_lowercase().contains(p))
+        })
+        .map(|(i, msg)| LogEventDto {
+            ts: Some(base_ts + (i as i64) * 1_700),
+            message: msg.to_string(),
+            stream: Some(streams[i % streams.len()].clone()),
+        })
+        .collect()
+}
+
 /// Colas SQS falsas del ambiente. Incluye una `.fifo` y una `*-dlq`; un par llevan
 /// el `profile` activo para que un cambio de ambiente sea visible.
 fn mock_queues(env: &Env) -> Vec<QueueDto> {
@@ -1399,6 +1626,117 @@ mod tests {
             Message::LogStreamsLoaded { group, streams } => {
                 assert_eq!(group, "/ecs/checkout-service");
                 assert!(!streams.is_empty());
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_log_events_have_lines_and_epoch() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+
+        fx.dispatch(
+            Action::LoadLogEvents {
+                group: "/ecs/checkout-service".into(),
+                stream: "2026/06/21/[$LATEST]abc".into(),
+            },
+            4,
+        );
+
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        assert_eq!(envelope.epoch, 4);
+        match envelope.message {
+            Message::LogEventsLoaded {
+                group,
+                stream,
+                events,
+                more,
+            } => {
+                assert_eq!(group, "/ecs/checkout-service");
+                assert_eq!(stream, "2026/06/21/[$LATEST]abc");
+                assert!(!more);
+                assert!(!events.is_empty());
+                assert!(
+                    events.iter().all(|e| e.stream.is_none()),
+                    "por-stream: sin stream"
+                );
+                assert!(
+                    events.iter().any(|e| e.message.contains("ERROR")),
+                    "incluye una línea de error"
+                );
+                // Orden ascendente (newest al final).
+                assert!(
+                    events.windows(2).all(|w| w[0].ts <= w[1].ts),
+                    "los eventos vienen en orden cronológico"
+                );
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_log_tail_reflects_multiple_streams() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+
+        fx.dispatch(
+            Action::LoadLogTail {
+                group: "/ecs/checkout-service".into(),
+                pattern: None,
+            },
+            6,
+        );
+
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        assert_eq!(envelope.epoch, 6);
+        match envelope.message {
+            Message::LogTailLoaded {
+                group,
+                query,
+                events,
+                more,
+            } => {
+                assert_eq!(group, "/ecs/checkout-service");
+                assert!(query.is_none());
+                assert!(!more);
+                assert!(
+                    events.iter().all(|e| e.stream.is_some()),
+                    "tail trae el stream"
+                );
+                let distinct: std::collections::HashSet<_> =
+                    events.iter().filter_map(|e| e.stream.clone()).collect();
+                assert!(distinct.len() > 1, "el tail mezcla varios streams");
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_log_tail_filters_by_pattern() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+
+        fx.dispatch(
+            Action::LoadLogTail {
+                group: "/ecs/checkout-service".into(),
+                pattern: Some("error".into()),
+            },
+            8,
+        );
+
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        assert_eq!(envelope.epoch, 8);
+        match envelope.message {
+            Message::LogTailLoaded { query, events, .. } => {
+                assert_eq!(query.as_deref(), Some("error"), "la query se ecoa");
+                assert!(!events.is_empty());
+                assert!(
+                    events
+                        .iter()
+                        .all(|e| e.message.to_lowercase().contains("error")),
+                    "el mock filtra por substring como el server"
+                );
             }
             other => panic!("mensaje inesperado: {other:?}"),
         }

@@ -10,6 +10,15 @@ pub fn fmt_epoch_millis(ms: i64) -> String {
     format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}Z")
 }
 
+/// Epoch en milisegundos -> `HH:MM:SS` (UTC). Compacto para listas de líneas de log,
+/// donde la fecha gastaría ancho (casi siempre es "hoy").
+pub fn fmt_clock_millis(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let tod = secs.rem_euclid(86_400);
+    let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    format!("{h:02}:{mi:02}:{s:02}")
+}
+
 /// Días desde 1970-01-01 -> (año, mes, día). Algoritmo de Howard Hinnant.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;

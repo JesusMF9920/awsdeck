@@ -43,6 +43,12 @@ async fn main() -> Result<()> {
 
     let mut app = App::new(env, registry, effects, rx);
 
+    // Si no fijaste AWS_PROFILE, al iniciar te dejamos elegir con qué profile
+    // trabajar (lee ~/.aws/config). Con AWS_PROFILE seteada, arranca directo.
+    if std::env::var_os("AWS_PROFILE").is_none() {
+        app.start_with_env_picker();
+    }
+
     // El guard de terminal vive hasta el final: restaura en Drop (también si
     // `run` devuelve Err) antes de que color-eyre imprima el reporte.
     let mut tui = Tui::init()?;

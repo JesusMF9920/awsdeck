@@ -30,7 +30,7 @@ pub fn render(frame: &mut Frame, area: Rect, profiles: &[ProfileEntry], state: &
         .collect();
 
     let list = List::new(items)
-        .block(Block::bordered().title(" cambiar ambiente (enter · esc) "))
+        .block(Block::bordered().title(" ambiente · enter elige · esc cancela "))
         .highlight_style(Style::new().reversed())
         .highlight_symbol("› ");
     frame.render_stateful_widget(list, popup, state);

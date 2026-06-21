@@ -63,6 +63,13 @@ impl Picker {
         self.state.select(Some(next));
     }
 
+    /// Preselecciona el profile con este nombre; si no existe, deja la selección.
+    fn preselect(&mut self, name: &str) {
+        if let Some(idx) = self.profiles.iter().position(|p| p.name == name) {
+            self.state.select(Some(idx));
+        }
+    }
+
     /// `Env` del profile seleccionado: usa su región declarada o, si no tiene,
     /// conserva la región actual.
     fn selected_env(&self, current: &Env) -> Option<Env> {
@@ -90,6 +97,9 @@ pub struct App {
     status: Option<StatusLine>,
     show_help: bool,
     picker: Option<Picker>,
+    /// `true` mientras el picker de arranque espera que el usuario elija ambiente;
+    /// difiere la carga inicial para no pintar datos del default.
+    awaiting_startup_env: bool,
     should_quit: bool,
 }
 
@@ -112,13 +122,18 @@ impl App {
             status: None,
             show_help: false,
             picker: None,
+            awaiting_startup_env: false,
             should_quit: false,
         }
     }
 
     /// Corre el loop principal hasta que el usuario sale.
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        self.activate_initial();
+        // Con el picker de arranque abierto, esperar a que el usuario elija antes
+        // de cargar (no pintar datos del ambiente por defecto).
+        if !self.awaiting_startup_env {
+            self.activate_initial();
+        }
 
         let mut events = EventStream::new();
         while !self.should_quit {
@@ -271,9 +286,30 @@ impl App {
         }
     }
 
+    /// Abre el picker al arrancar (si hay profiles), preseleccionando el ambiente
+    /// actual, y difiere la carga inicial hasta que el usuario elija (enter) o
+    /// cancele (esc). Sin profiles no hace nada: `run` cargará con el default.
+    pub fn start_with_env_picker(&mut self) {
+        let profiles = list_profiles();
+        if profiles.is_empty() {
+            return;
+        }
+        let mut picker = Picker::new(profiles);
+        picker.preselect(&self.env.profile);
+        self.picker = Some(picker);
+        self.awaiting_startup_env = true;
+    }
+
     fn on_picker_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.picker = None,
+            KeyCode::Esc => {
+                self.picker = None;
+                // En el picker de arranque, cancelar = usar el ambiente por defecto.
+                if self.awaiting_startup_env {
+                    self.awaiting_startup_env = false;
+                    self.activate_initial();
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 if let Some(p) = self.picker.as_mut() {
                     p.move_selection(1);
@@ -289,6 +325,7 @@ impl App {
                 let env = self.picker.as_ref().and_then(|p| p.selected_env(&self.env));
                 if let Some(env) = env {
                     self.picker = None;
+                    self.awaiting_startup_env = false;
                     self.dispatch(Action::SwitchEnv(env));
                 }
             }
@@ -454,14 +491,57 @@ fn render_placeholder(frame: &mut Frame, area: Rect) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use super::*;
     use crate::message::Message;
+    use crate::views::View;
 
     fn test_app() -> App {
         let (tx, rx) = mpsc::channel(8);
         let env = Env::new("dev", "us-east-1");
         let effects = Effects::new(tx, env.clone());
         App::new(env, Registry::new(), effects, rx)
+    }
+
+    /// Vista falsa que cuenta cuántas veces se activó (carga). Devuelve `vec![]`
+    /// para no disparar efectos (que necesitarían un runtime de tokio).
+    struct CountingView {
+        activations: Rc<Cell<u32>>,
+    }
+
+    impl View for CountingView {
+        fn id(&self) -> &'static str {
+            "logs"
+        }
+        fn title(&self) -> String {
+            "logs".to_string()
+        }
+        fn on_activate(&mut self) -> Vec<Action> {
+            self.activations.set(self.activations.get() + 1);
+            Vec::new()
+        }
+        fn on_key(&mut self, _key: KeyEvent) -> Vec<Action> {
+            Vec::new()
+        }
+        fn on_message(&mut self, _message: &Message) {}
+        fn set_filter(&mut self, _filter: &str) {}
+        fn render(&mut self, _frame: &mut Frame, _area: Rect) {}
+    }
+
+    /// `App` con una `CountingView` registrada; devuelve también el contador de
+    /// activaciones para verificar que la carga se disparó.
+    fn app_with_counting_view() -> (App, Rc<Cell<u32>>) {
+        let counter = Rc::new(Cell::new(0));
+        let (tx, rx) = mpsc::channel(8);
+        let env = Env::new("default", "us-east-1");
+        let effects = Effects::new_mock(tx, env.clone());
+        let mut registry = Registry::new();
+        registry.register(Box::new(CountingView {
+            activations: counter.clone(),
+        }));
+        (App::new(env, registry, effects, rx), counter)
     }
 
     fn ch(c: char) -> KeyEvent {
@@ -541,6 +621,54 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.picker.is_none());
         assert_eq!(app.epoch, 0, "esc no cambia de ambiente");
+    }
+
+    #[test]
+    fn preselect_picks_matching_profile_else_keeps_first() {
+        let cur = Env::new("x", "us-east-1");
+        let mut p = Picker::new(vec![
+            profile("dev", None),
+            profile("prod", Some("eu-west-1")),
+            profile("stage", None),
+        ]);
+        p.preselect("prod");
+        assert_eq!(p.selected_env(&cur), Some(Env::new("prod", "eu-west-1")));
+        // Nombre inexistente: no cambia la selección.
+        p.preselect("nope");
+        assert_eq!(p.selected_env(&cur), Some(Env::new("prod", "eu-west-1")));
+    }
+
+    #[test]
+    fn startup_picker_esc_loads_default() {
+        let (mut app, activations) = app_with_counting_view();
+        app.picker = Some(Picker::new(vec![profile("dev", None)]));
+        app.awaiting_startup_env = true;
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.picker.is_none());
+        assert!(!app.awaiting_startup_env);
+        assert_eq!(app.epoch, 0, "esc no cambia de ambiente");
+        assert_eq!(
+            activations.get(),
+            1,
+            "esc en el picker de arranque carga el ambiente por defecto"
+        );
+    }
+
+    #[test]
+    fn startup_picker_enter_switches_and_loads() {
+        let (mut app, activations) = app_with_counting_view();
+        app.picker = Some(Picker::new(vec![profile("prod", Some("eu-west-1"))]));
+        app.awaiting_startup_env = true;
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.picker.is_none());
+        assert!(!app.awaiting_startup_env);
+        assert_eq!(app.epoch, 1);
+        assert_eq!(app.env, Env::new("prod", "eu-west-1"));
+        assert_eq!(activations.get(), 1, "elegir un profile recarga la vista");
     }
 
     #[test]

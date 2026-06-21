@@ -80,12 +80,20 @@ aws-config + aws-sdk-cloudwatchlogs. **Sin `async-trait`.**
 
 ## Estado
 
-**v0 completo.** Shell + vista `logs` contra `aws-sdk-cloudwatchlogs` real (con `Backend::Mock`
-para tests offline). Header con `profile · region`, command bar (`:logs`), filtro (`/`),
-drill/back groups↔streams, picker de profiles (`ctrl-e`) con epoch guard, selección de ambiente
-al iniciar si no hay `AWS_PROFILE` (`start_with_env_picker` difiere la carga hasta elegir),
-ayuda (`?`), status bar de errores. 18 tests (routing, epoch guard, filtro, drill, parser de `~/.aws/config`,
-render con `TestBackend`). `cargo run` lo abre.
+**v0 + v1 completos.** Shell + vistas `logs` (`aws-sdk-cloudwatchlogs`) y `sqs`
+(`aws-sdk-sqs`) contra el SDK real, con `Backend::Mock` (`AWSDECK_MOCK=1`) para tests/demo
+offline. Header con `profile · region`, command bar (`:logs`/`:sqs`), filtro (`/`),
+drill/back, picker de profiles (`ctrl-e`) con epoch guard, selección de ambiente al iniciar si
+no hay `AWS_PROFILE` (`start_with_env_picker`), ayuda (`?`), status bar de errores.
 
-Pendiente: v1 `sqs`, v2 `sfn`, v3 `events` (no iniciadas), `y` (copiar ARN), abrir en consola
-(`o`), config en disco.
+**v1 `sqs`:** lista colas (badge `[fifo]`), drill a attributes (visible/in-flight/delayed/DLQ)
++ *peek* de mensajes (receive sin borrar, best-effort). Primera acción mutante **`PurgeQueue`**
+detrás del **gate prod-safe**: modo escritura (`:write`, badge rojo `[ESCRITURA]`) + confirm
+modal (`ui/confirm.rs`); el gate vive en `App::dispatch` (`is_mutating` → `request_confirm`) y
+es reusable para v2/v3. `switch_env` resetea el modo escritura.
+
+40 tests sin red (routing, epoch guard, gate de mutaciones, filtro, drill, parsers, render con
+`TestBackend`). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
+
+Pendiente: v2 `sfn`, v3 `events` (no iniciadas), `y` (copiar ARN), abrir en consola (`o`),
+config en disco.

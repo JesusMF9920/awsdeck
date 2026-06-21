@@ -125,7 +125,7 @@ src/
 
 Cada fase deja algo que **ya uso**. Un servicio nuevo = un PR autocontenido contra un core estable.
 
-### v0 — El shell + vista `logs` (reemplaza `cwtail`)
+### v0 — El shell + vista `logs` (reemplaza `cwtail`) — ✅ hecho
 **Objetivo:** probar toda la arquitectura end-to-end con una sola vista real, y jubilar `cwtail` desde el día uno.
 
 Entrega:
@@ -146,8 +146,10 @@ Entrega:
 - [ ] Un switch de ambiente con un request en vuelo no pinta datos del ambiente anterior.
 - [ ] El core (`app`, `effects`, `views/mod`) no referencia ningún servicio concreto salvo por el registry.
 
-### v1 — Vista `sqs`
+### v1 — Vista `sqs` — ✅ hecho
 Listar colas del ambiente; ver attributes (mensajes visibles, in-flight, DLQ); *peek* de mensajes (receive sin borrar). Acción mutante `PurgeQueue` detrás de confirm + modo escritura.
+
+Entregado: lista de colas (badge `[fifo]`); drill a attributes (visible/in-flight/delayed/DLQ con maxReceiveCount) + peek (10 msgs, `visibility_timeout(0)`, best-effort); `PurgeQueue` gated por modo escritura (`:write`, badge `[ESCRITURA]`) + confirm modal. Gate genérico en `App::dispatch`, reusable para v2/v3. Mock (`AWSDECK_MOCK=1`) y SDK real (`aws-sdk-sqs`).
 
 ### v2 — Vista `sfn` (Step Functions)
 Listar ejecuciones por state machine con status coloreado; drill al timeline de estados con duración; en fallos, saltar al estado que reventó y mostrar input/output. `Redrive` como acción gated.

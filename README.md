@@ -5,7 +5,7 @@ para saltar entre los servicios de AWS que uso a diario —CloudWatch Logs hoy; 
 Functions y EventBridge en camino— con la misma navegación, los mismos keybindings y el
 ambiente (cuenta + región) siempre visible y cambiable al instante.
 
-> Estado: **v0** — el shell extensible + la vista `logs` (CloudWatch Log Groups → Streams).
+> Estado: **v0 + v1** — el shell extensible + las vistas `logs` (CloudWatch) y `sqs` (colas, peek, purge gated).
 > Diseño completo en [`ROADMAP.md`](ROADMAP.md); notas de arquitectura en [`CLAUDE.md`](CLAUDE.md).
 
 ## Requisitos
@@ -36,12 +36,14 @@ se muestra en la **status bar** (no crashea).
 
 | Tecla | Acción |
 |-------|--------|
-| `:` | command bar (saltar de servicio, p. ej. `:logs`) |
+| `:` | command bar (saltar de servicio, p. ej. `:logs`, `:sqs`) |
 | `/` | filtrar la lista actual |
 | `enter` | drill (entrar al detalle) |
 | `esc` | volver |
 | `j` / `k` · `↑` / `↓` · `g` / `G` | navegar |
 | `r` | refrescar |
+| `p` | purgar cola SQS (gated: modo escritura + confirm) |
+| `:write` | alternar modo escritura (habilita acciones mutantes) |
 | `ctrl-e` | cambiar de ambiente (picker de profiles) |
 | `?` | ayuda |
 | `q` | salir |
@@ -86,7 +88,7 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
 ## Roadmap
 
 - **v0** ✅ shell + `logs` (CloudWatch).
-- **v1** `sqs` — colas, attributes, *peek*, `PurgeQueue` (gated).
+- **v1** ✅ `sqs` — colas, attributes, *peek*, `PurgeQueue` (gated por modo escritura + confirm).
 - **v2** `sfn` — ejecuciones, timeline, `Redrive` (gated).
 - **v3** `events` — buses, rules, `SendEvent` (gated).
 

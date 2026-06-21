@@ -24,9 +24,13 @@ cargo run
 AWSDECK_MOCK=1 cargo run
 ```
 
-El ambiente inicial sale de `AWS_PROFILE` / `AWS_REGION` (defaults: `default` / `us-east-1`).
-Cámbialo en vivo con `ctrl-e`. Si un profile no tiene credenciales válidas, el error se muestra
-en la **status bar** (no crashea).
+**Al iniciar**, si **no** fijaste `AWS_PROFILE`, aparece un selector con los profiles de
+`~/.aws/config` para elegir con cuál trabajar (preselecciona el default; `enter` confirma,
+`esc` usa el default). Si fijaste `AWS_PROFILE=algún-profile`, arranca directo a esa cuenta sin
+preguntar. La región sale de `AWS_REGION` o del profile (default `us-east-1`).
+
+Cambia de ambiente en vivo con `ctrl-e`. Si un profile no tiene credenciales válidas, el error
+se muestra en la **status bar** (no crashea).
 
 ## Keybindings
 

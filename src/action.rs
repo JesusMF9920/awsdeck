@@ -24,14 +24,3 @@ pub enum Action {
     /// Hacer drill: pedir los log streams de un log group.
     LoadLogStreams { group: String },
 }
-
-impl Action {
-    /// `true` si la maneja el core (`App`); `false` si se reenvía a `effects`.
-    /// Permite a `App` enrutar sin necesidad de conocer las variantes de servicio.
-    pub fn is_core(&self) -> bool {
-        matches!(
-            self,
-            Action::Quit | Action::ActivateView(_) | Action::SwitchEnv(_)
-        )
-    }
-}

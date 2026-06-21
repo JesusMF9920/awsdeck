@@ -67,15 +67,17 @@ impl Registry {
         self.views.is_empty()
     }
 
-    /// Referencia a la vista activa. Asume que hay al menos una vista registrada
-    /// (el `App` valida esa invariante al construirse).
-    pub fn active(&self) -> &dyn View {
-        self.views[self.active].as_ref()
+    /// Referencia a la vista activa, o `None` si el registry está vacío (p. ej.
+    /// antes de registrar cualquier vista). Sin panics.
+    pub fn active(&self) -> Option<&dyn View> {
+        self.views.get(self.active).map(|v| v.as_ref())
     }
 
-    /// Referencia mutable a la vista activa.
-    pub fn active_mut(&mut self) -> &mut dyn View {
-        self.views[self.active].as_mut()
+    /// Referencia mutable a la vista activa, o `None` si no hay ninguna.
+    /// El object lifetime es `'static` (las vistas no toman prestado nada); la
+    /// del préstamo `&mut` se elide a la de `&mut self`.
+    pub fn active_mut(&mut self) -> Option<&mut (dyn View + 'static)> {
+        self.views.get_mut(self.active).map(|v| v.as_mut())
     }
 
     /// Activa la vista con este `id`. Devuelve `true` si existía.

@@ -14,45 +14,42 @@ mod ui;
 mod views;
 
 use color_eyre::eyre::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::Alignment;
-use ratatui::style::Stylize;
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Paragraph};
+use tokio::sync::mpsc;
 
+use crate::app::App;
+use crate::aws::context::Env;
+use crate::effects::Effects;
 use crate::tui::Tui;
+use crate::views::Registry;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // SMOKE TEST temporal del Tui guard (se reemplaza por el loop `tokio::select!`
-    // real en el commit "app loop + ui shell"). Valida el criterio de aceptación:
-    // `cargo run` abre el TUI y al salir (o en panic) la terminal queda limpia.
+    let env = initial_env();
+
+    // Canal de resultados async: effects manda, App recibe en el select! loop.
+    let (tx, rx) = mpsc::channel(64);
+    let effects = Effects::new(tx, env.clone());
+
+    // Registry de vistas. El commit "logs view" registra aquí la primera vista
+    // concreta: `registry.register(Box::new(LogsView::new()));`. Es el único
+    // punto donde se nombra un servicio en el arranque.
+    let registry = Registry::new();
+
+    let mut app = App::new(env, registry, effects, rx);
+
+    // El guard de terminal vive hasta el final: restaura en Drop (también si
+    // `run` devuelve Err) antes de que color-eyre imprima el reporte.
     let mut tui = Tui::init()?;
+    let result = app.run(&mut tui.terminal).await;
+    drop(tui);
+    result
+}
 
-    loop {
-        tui.terminal.draw(|frame| {
-            let body = Paragraph::new(vec![
-                Line::from("awsdeck".bold()),
-                Line::from(""),
-                Line::from("TUI guard OK — la terminal se restaura al salir y en panic."),
-                Line::from("Presiona q para salir.".dim()),
-            ])
-            .alignment(Alignment::Center)
-            .block(Block::bordered().title(" awsdeck "));
-            frame.render_widget(body, frame.area());
-        })?;
-
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                let quit = matches!(key.code, KeyCode::Char('q'))
-                    || (key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL));
-                if quit {
-                    break;
-                }
-            }
-        }
-    }
-
-    Ok(())
+/// Ambiente inicial tomado del entorno, con defaults sensatos.
+fn initial_env() -> Env {
+    let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
+    let region = std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|_| "us-east-1".to_string());
+    Env::new(profile, region)
 }

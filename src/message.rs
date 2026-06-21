@@ -36,6 +36,17 @@ pub struct LogEventDto {
     pub stream: Option<String>,
 }
 
+/// Ventana de tiempo de los logs del group. Dato plano; `effects` la traduce a
+/// `start_time`/`end_time` (poniendo el reloj para `Last` y para `to: None`). La
+/// vista nunca ve `now`: solo describe el rango.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogWindow {
+    /// Últimos `n` milisegundos (start = now - n, end = now).
+    Last(i64),
+    /// Rango absoluto en epoch millis; `to: None` = ahora.
+    Range { from: i64, to: Option<i64> },
+}
+
 /// Una cola de SQS (datos para la lista).
 #[derive(Clone, Debug)]
 pub struct QueueDto {
@@ -236,14 +247,17 @@ pub enum Message {
         events: Vec<LogEventDto>,
         more: bool,
     },
-    /// Tail de un group (`filter_log_events` sobre todos sus streams). `group`
-    /// confirma el drill actual; `query` ecoa el filtro server-side (guard
-    /// latest-wins, espeja `LogGroupsLoaded`); `more` = hay más en la ventana.
+    /// Logs del group por rango de tiempo (`filter_log_events` sobre todos sus
+    /// streams). `group` confirma el drill actual; `generation` es la generación que la
+    /// originó (la vista descarta respuestas con generation viejo: ventana/patrón/drill
+    /// cambiaron); `next_token` = hay más en la ventana (para `o` cargar más);
+    /// `append` = es continuación de una página previa (la vista la APPENDea).
     LogTailLoaded {
         group: String,
-        query: Option<String>,
         events: Vec<LogEventDto>,
-        more: bool,
+        next_token: Option<String>,
+        append: bool,
+        generation: u64,
     },
     /// Se cargaron las colas del ambiente activo.
     QueuesLoaded(Vec<QueueDto>),

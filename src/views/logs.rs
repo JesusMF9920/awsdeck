@@ -12,8 +12,23 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::View;
 use crate::action::Action;
-use crate::message::{LogEventDto, LogGroupDto, LogStreamDto, Message};
-use crate::util::{fmt_clock_millis, fmt_epoch_millis, fuzzy_score, ranked};
+use crate::message::{LogEventDto, LogGroupDto, LogStreamDto, LogWindow, Message};
+use crate::util::{
+    fmt_clock_millis, fmt_epoch_millis, fuzzy_score, parse_datetime, parse_duration, ranked,
+};
+
+/// Ventanas de tiempo cicladas con `w`/`W` (etiqueta + millis). `:since`/`:from`/`:to`
+/// pueden fijar ventanas fuera de esta lista.
+const WINDOW_PRESETS: [(&str, i64); 6] = [
+    ("15m", 15 * 60_000),
+    ("1h", 60 * 60_000),
+    ("6h", 6 * 60 * 60_000),
+    ("24h", 24 * 60 * 60_000),
+    ("3d", 3 * 24 * 60 * 60_000),
+    ("7d", 7 * 24 * 60 * 60_000),
+];
+/// Preset por defecto al abrir el tail (índice en `WINDOW_PRESETS`): `1h`.
+const DEFAULT_PRESET: usize = 1;
 
 /// Nivel de drill actual.
 enum Level {
@@ -46,6 +61,15 @@ pub struct LogsView {
     last_query: Option<String>,
     /// `true` si el servidor tiene más groups que los traídos (next_token).
     partial: bool,
+    /// Ventana de tiempo activa del tail (logs del group).
+    tail_window: LogWindow,
+    /// Índice del preset activo en `WINDOW_PRESETS` (para ciclar con `w`/`W`).
+    tail_preset: usize,
+    /// `next_token` de la última página del tail (para `o` = cargar más). `None` = no hay más.
+    tail_token: Option<String>,
+    /// Generación de la consulta de tail vigente: sube en cada consulta *fresca*
+    /// (ventana/patrón/drill) y NO en load-more; descarta respuestas con generation viejo.
+    tail_gen: u64,
     /// Selección de la lista visible (índice dentro de la lista filtrada).
     state: ListState,
 }
@@ -61,8 +85,43 @@ impl LogsView {
             loading: false,
             last_query: None,
             partial: false,
+            tail_window: LogWindow::Last(WINDOW_PRESETS[DEFAULT_PRESET].1),
+            tail_preset: DEFAULT_PRESET,
+            tail_token: None,
+            tail_gen: 0,
             state: ListState::default().with_selected(Some(0)),
         }
+    }
+
+    /// Group del nivel actual: el seleccionado en `Groups`, o el del nivel si ya estás
+    /// dentro de uno. `None` solo en `Groups` sin selección.
+    fn current_group(&self) -> Option<String> {
+        match &self.level {
+            Level::Groups => self.selected_group_name(),
+            Level::Streams { group } | Level::Tail { group } => Some(group.clone()),
+            Level::Events { group, .. } => Some(group.clone()),
+        }
+    }
+
+    /// Construye la consulta de tail con la ventana/patrón actuales. Sin `token` es una
+    /// consulta *fresca* → sube `tail_gen` (descarta respuestas viejas en vuelo); con
+    /// `token` es load-more → conserva `generation` para que su respuesta sí se acepte.
+    fn tail_query(&mut self, token: Option<String>) -> Vec<Action> {
+        let Level::Tail { group } = &self.level else {
+            return vec![];
+        };
+        let group = group.clone();
+        if token.is_none() {
+            self.tail_gen = self.tail_gen.wrapping_add(1);
+        }
+        self.loading = true;
+        vec![Action::LoadLogTail {
+            group,
+            pattern: self.last_query.clone(),
+            window: self.tail_window,
+            token,
+            generation: self.tail_gen,
+        }]
     }
 
     // --- Filtrado / selección -------------------------------------------------
@@ -196,27 +255,59 @@ impl LogsView {
         }
     }
 
-    /// `t` desde la raíz: tail del group seleccionado (`filter_log_events` sobre
-    /// todos sus streams). Sibling del drill a streams; `esc` vuelve a groups.
+    /// `t`: logs del group (`filter_log_events` sobre todos sus streams) en la ventana
+    /// por defecto (1h). Resuelve el group del nivel actual (seleccionado en `Groups`).
+    /// `esc` vuelve a groups. `w`/`o`/`:since`/`:from-to` ajustan rango/paginación.
     fn tail(&mut self) -> Vec<Action> {
-        match self.selected_group_name() {
+        self.open_tail(
+            LogWindow::Last(WINDOW_PRESETS[DEFAULT_PRESET].1),
+            DEFAULT_PRESET,
+        )
+    }
+
+    /// Abre (o reabre) el nivel `Tail` del group actual con `window`, resetea filtro y
+    /// dispara una consulta fresca. `preset` mantiene el ciclado de `w` coherente.
+    fn open_tail(&mut self, window: LogWindow, preset: usize) -> Vec<Action> {
+        match self.current_group() {
             Some(group) => {
-                self.level = Level::Tail {
-                    group: group.clone(),
-                };
+                self.level = Level::Tail { group };
                 self.events.clear();
-                self.loading = true;
+                self.tail_window = window;
+                self.tail_preset = preset;
+                self.tail_token = None;
                 self.last_query = None; // el tail arranca sin filtro server-side
                 self.state.select(Some(0));
-                vec![
-                    Action::ClearFilter,
-                    Action::LoadLogTail {
-                        group,
-                        pattern: None,
-                    },
-                ]
+                let mut actions = vec![Action::ClearFilter];
+                actions.extend(self.tail_query(None));
+                actions
             }
             None => vec![],
+        }
+    }
+
+    /// `w`/`W`: cicla la ventana entre presets y re-consulta (solo en `Tail`).
+    fn cycle_window(&mut self, forward: bool) -> Vec<Action> {
+        if !matches!(self.level, Level::Tail { .. }) {
+            return vec![];
+        }
+        let n = WINDOW_PRESETS.len();
+        self.tail_preset = if forward {
+            (self.tail_preset + 1) % n
+        } else {
+            (self.tail_preset + n - 1) % n
+        };
+        self.tail_window = LogWindow::Last(WINDOW_PRESETS[self.tail_preset].1);
+        self.events.clear();
+        self.tail_token = None;
+        self.state.select(Some(0));
+        self.tail_query(None)
+    }
+
+    /// `o`: carga la siguiente página del tail (append) si hay `next_token`.
+    fn load_more(&mut self) -> Vec<Action> {
+        match (&self.level, self.tail_token.clone()) {
+            (Level::Tail { .. }, Some(token)) => self.tail_query(Some(token)),
+            _ => vec![],
         }
     }
 
@@ -255,6 +346,13 @@ impl LogsView {
     }
 
     fn refresh(&mut self) -> Vec<Action> {
+        // El tail recarga la ventana/patrón actuales (consulta fresca, sube generation).
+        if matches!(self.level, Level::Tail { .. }) {
+            self.events.clear();
+            self.tail_token = None;
+            self.state.select(Some(0));
+            return self.tail_query(None);
+        }
         self.loading = true;
         match &self.level {
             // Recargar la página actual (misma query si hay una búsqueda activa).
@@ -268,15 +366,22 @@ impl LogsView {
                 group: group.clone(),
                 stream: stream.clone(),
             }],
-            // El tail recarga con el mismo filtro server-side vigente (si lo hay).
-            Level::Tail { group } => vec![Action::LoadLogTail {
-                group: group.clone(),
-                pattern: self.last_query.clone(),
-            }],
+            Level::Tail { .. } => vec![], // manejado arriba
         }
     }
 
     // --- Render ---------------------------------------------------------------
+
+    /// Etiqueta legible de la ventana del tail (deriva de `tail_window`, no del preset).
+    fn window_label(&self) -> String {
+        match self.tail_window {
+            LogWindow::Last(ms) => fmt_window_duration(ms),
+            LogWindow::Range { from, to } => match to {
+                Some(t) => format!("{}→{}", short_dt(from), short_dt(t)),
+                None => format!("{}→ahora", short_dt(from)),
+            },
+        }
+    }
 
     fn body_title(&self) -> String {
         let (kind, total, shown) = match self.level {
@@ -296,10 +401,16 @@ impl LogsView {
                 self.filtered_event_indices().len(),
             ),
             Level::Tail { .. } => (
-                "tail",
+                "líneas",
                 self.events.len(),
                 self.filtered_event_indices().len(),
             ),
+        };
+        // En el tail, antepone la ventana de tiempo activa.
+        let window = if matches!(self.level, Level::Tail { .. }) {
+            format!("ventana {} · ", self.window_label())
+        } else {
+            String::new()
         };
         let partial = if !self.partial {
             ""
@@ -307,15 +418,15 @@ impl LogsView {
             match self.level {
                 Level::Groups => " · parcial (/ busca server-side)",
                 Level::Events { .. } => " · parcial (más viejas arriba)",
-                Level::Tail { .. } => " · parcial (acota con /)",
+                Level::Tail { .. } => " · parcial · o: cargar más",
                 Level::Streams { .. } => "",
             }
         };
         if self.filter.is_empty() {
-            format!(" {total} {kind}{partial} ")
+            format!(" {window}{total} {kind}{partial} ")
         } else {
             format!(
-                " {shown}/{total} {kind} · filtro: {}{partial} ",
+                " {window}{shown}/{total} {kind} · filtro: {}{partial} ",
                 self.filter
             )
         }
@@ -353,6 +464,9 @@ impl View for LogsView {
         self.loading = true;
         self.last_query = None;
         self.partial = false;
+        self.tail_token = None;
+        self.tail_preset = DEFAULT_PRESET;
+        self.tail_window = LogWindow::Last(WINDOW_PRESETS[DEFAULT_PRESET].1);
         self.state.select(Some(0));
         vec![Action::LoadLogGroups { query: None }]
     }
@@ -378,8 +492,12 @@ impl View for LogsView {
             KeyCode::Enter => self.drill(),
             KeyCode::Esc => self.back(),
             KeyCode::Char('r') => self.refresh(),
-            // Tail del group seleccionado (solo desde la raíz; sibling de streams).
-            KeyCode::Char('t') if matches!(self.level, Level::Groups) => self.tail(),
+            // Logs del group (todos sus streams) por rango de tiempo.
+            KeyCode::Char('t') => self.tail(),
+            // En el tail: `w`/`W` ciclan la ventana, `o` carga más (paginación).
+            KeyCode::Char('w') => self.cycle_window(true),
+            KeyCode::Char('W') => self.cycle_window(false),
+            KeyCode::Char('o') => self.load_more(),
             _ => vec![],
         }
     }
@@ -437,21 +555,32 @@ impl View for LogsView {
             }
             Message::LogTailLoaded {
                 group,
-                query,
                 events,
-                more,
+                next_token,
+                append,
+                generation,
             } => {
-                // Guard "latest wins" (filtro server-side) + correspondencia de group.
-                if query != &self.last_query {
+                // Descarta respuestas de una consulta vieja (ventana/patrón/drill
+                // cambiaron → subió el generation) y de otro group.
+                if *generation != self.tail_gen {
                     return;
                 }
                 if let Level::Tail { group: g } = &self.level
                     && g == group
                 {
-                    self.events = events.clone();
-                    self.partial = *more;
+                    if *append {
+                        self.events.extend(events.iter().cloned());
+                    } else {
+                        self.events = events.clone();
+                    }
+                    self.tail_token = next_token.clone();
+                    self.partial = next_token.is_some();
                     self.loading = false;
-                    self.select_edge(true);
+                    // En carga fresca, salta al fondo (newest abajo); en append conserva
+                    // la posición del usuario.
+                    if !*append {
+                        self.select_edge(true);
+                    }
                 }
             }
             // El App ya muestra el error en la status bar; aquí cortamos el loading.
@@ -478,17 +607,52 @@ impl View for LogsView {
                     query: self.last_query.clone(),
                 }]
             }
-            Level::Tail { group } => {
-                let group = group.clone();
+            Level::Tail { .. } => {
                 self.last_query = (!query.is_empty()).then(|| query.to_string());
-                self.loading = true;
-                vec![Action::LoadLogTail {
-                    group,
-                    pattern: self.last_query.clone(),
-                }]
+                self.events.clear();
+                self.tail_token = None;
+                self.state.select(Some(0));
+                self.tail_query(None) // consulta fresca (sube generation)
             }
             _ => Vec::new(),
         }
+    }
+
+    fn on_command(&mut self, cmd: &str) -> Vec<Action> {
+        // Solo comandos de rango de tiempo; el resto no es nuestro (Vec vacío → el App
+        // lo trata como id de vista). `:since <dur>` / `:from <dt> [to <dt>]` (UTC).
+        let (verb, rest) = match cmd.split_once(char::is_whitespace) {
+            Some((v, r)) => (v, r.trim()),
+            None => (cmd, ""),
+        };
+        let window = match verb {
+            "since" => match parse_duration(rest) {
+                Some(ms) => LogWindow::Last(ms),
+                None => return Vec::new(),
+            },
+            "from" => {
+                let (from_s, to_s) = match rest.split_once(" to ") {
+                    Some((f, t)) => (f.trim(), Some(t.trim())),
+                    None => (rest, None),
+                };
+                let Some(from) = parse_datetime(from_s) else {
+                    return Vec::new();
+                };
+                let to = match to_s {
+                    Some(t) => match parse_datetime(t) {
+                        Some(x) => Some(x),
+                        None => return Vec::new(),
+                    },
+                    None => None,
+                };
+                LogWindow::Range { from, to }
+            }
+            _ => return Vec::new(),
+        };
+        // Ventana custom: la etiqueta sale de la ventana, no del preset; conserva el
+        // preset actual para que `w` siga ciclando desde un índice válido (sin overflow).
+        let preset = self.tail_preset;
+        self.open_tail(window, preset)
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -607,6 +771,25 @@ fn severity_style(msg: &str) -> Style {
     }
 }
 
+/// Millis de ventana → etiqueta corta (`90m`, `6h`, `2d`). Deriva la unidad de la
+/// divisibilidad para que `:since 90m` muestre `90m` y `Last(6h)` muestre `6h`.
+fn fmt_window_duration(ms: i64) -> String {
+    let m = ms / 60_000;
+    if m % (60 * 24) == 0 {
+        format!("{}d", m / (60 * 24))
+    } else if m % 60 == 0 {
+        format!("{}h", m / 60)
+    } else {
+        format!("{m}m")
+    }
+}
+
+/// Epoch millis → `YYYY-MM-DD HH:MM` (UTC, sin segundos), para rótulos de rango.
+fn short_dt(ms: i64) -> String {
+    let s = fmt_epoch_millis(ms);
+    s.get(..16).map(str::to_string).unwrap_or(s)
+}
+
 fn human_bytes(n: i64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = n as f64;
@@ -675,12 +858,14 @@ mod tests {
         }
     }
 
-    fn tail_loaded(group: &str, query: Option<&str>, events: Vec<LogEventDto>) -> Message {
+    /// Respuesta de tail fresca (no-append, sin más páginas) con la `generation` dada.
+    fn tail_loaded(group: &str, generation: u64, events: Vec<LogEventDto>) -> Message {
         Message::LogTailLoaded {
             group: group.into(),
-            query: query.map(str::to_string),
             events,
-            more: false,
+            next_token: None,
+            append: false,
+            generation,
         }
     }
 
@@ -715,9 +900,20 @@ mod tests {
         v.on_message(&loaded(vec![group("/svc")]));
         let actions = v.on_key(key(KeyCode::Char('t')));
         match actions.as_slice() {
-            [Action::ClearFilter, Action::LoadLogTail { group, pattern }] => {
+            [
+                Action::ClearFilter,
+                Action::LoadLogTail {
+                    group,
+                    pattern,
+                    window,
+                    token,
+                    ..
+                },
+            ] => {
                 assert_eq!(group, "/svc");
                 assert!(pattern.is_none(), "el tail arranca sin filtro");
+                assert_eq!(*window, LogWindow::Last(WINDOW_PRESETS[1].1), "default 1h");
+                assert!(token.is_none(), "consulta fresca, sin paginar");
             }
             other => panic!("se esperaba ClearFilter+LoadLogTail, llegó {other:?}"),
         }
@@ -753,8 +949,8 @@ mod tests {
     fn tail_from_wrong_group_ignored() {
         let mut v = LogsView::new();
         v.on_message(&loaded(vec![group("/svc")]));
-        v.on_key(key(KeyCode::Char('t'))); // tail de /svc (last_query = None)
-        v.on_message(&tail_loaded("/otro", None, vec![ev("x", 1)]));
+        v.on_key(key(KeyCode::Char('t'))); // tail de /svc → gen=1
+        v.on_message(&tail_loaded("/otro", 1, vec![ev("x", 1)]));
         assert_eq!(v.visible_len(), 0, "tail de otro group ignorado");
     }
 
@@ -765,9 +961,17 @@ mod tests {
         v.on_key(key(KeyCode::Char('t')));
         let actions = v.search("error");
         match actions.as_slice() {
-            [Action::LoadLogTail { group, pattern }] => {
+            [
+                Action::LoadLogTail {
+                    group,
+                    pattern,
+                    token,
+                    ..
+                },
+            ] => {
                 assert_eq!(group, "/svc");
                 assert_eq!(pattern.as_deref(), Some("error"), "filtro server-side");
+                assert!(token.is_none(), "buscar es consulta fresca, no paginar");
             }
             other => panic!("el tail busca server-side (LoadLogTail), llegó {other:?}"),
         }
@@ -777,19 +981,19 @@ mod tests {
     fn tail_discards_stale_results() {
         let mut v = LogsView::new();
         v.on_message(&loaded(vec![group("/svc")]));
-        v.on_key(key(KeyCode::Char('t')));
-        let _ = v.search("err"); // last_query = Some("err")
+        v.on_key(key(KeyCode::Char('t'))); // gen=1
+        let _ = v.search("err"); // consulta fresca → gen=2
 
-        // Respuesta de un filtro VIEJO ("er") → descartada.
-        v.on_message(&tail_loaded("/svc", Some("er"), vec![ev("viejo", 1)]));
-        assert_eq!(v.visible_len(), 0, "respuesta de filtro viejo descartada");
+        // Respuesta de una generación VIEJA (gen=1) → descartada.
+        v.on_message(&tail_loaded("/svc", 1, vec![ev("viejo", 1)]));
+        assert_eq!(
+            v.visible_len(),
+            0,
+            "respuesta de generación vieja descartada"
+        );
 
-        // Respuesta del filtro VIGENTE ("err") → aceptada.
-        v.on_message(&tail_loaded(
-            "/svc",
-            Some("err"),
-            vec![ev("error nuevo", 1)],
-        ));
+        // Respuesta de la generación VIGENTE (gen=2) → aceptada.
+        v.on_message(&tail_loaded("/svc", 2, vec![ev("error nuevo", 1)]));
         assert_eq!(v.visible_len(), 1);
     }
 
@@ -823,10 +1027,10 @@ mod tests {
     fn filter_narrows_events_local() {
         let mut v = LogsView::new();
         v.on_message(&loaded(vec![group("/svc")]));
-        v.on_key(key(KeyCode::Char('t')));
+        v.on_key(key(KeyCode::Char('t'))); // gen=1
         v.on_message(&tail_loaded(
             "/svc",
-            None,
+            1,
             vec![ev("INFO ok", 1), ev("ERROR boom", 2)],
         ));
         assert_eq!(v.visible_len(), 2);
@@ -869,7 +1073,7 @@ mod tests {
         v.on_key(key(KeyCode::Char('t')));
         v.on_message(&tail_loaded(
             "/svc",
-            None,
+            1,
             vec![LogEventDto {
                 ts: Some(1),
                 message: "INFO a".into(),
@@ -877,12 +1081,124 @@ mod tests {
             }],
         ));
 
-        let mut terminal = Terminal::new(TestBackend::new(70, 8)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
         terminal.draw(|f| v.render(f, f.area())).unwrap();
 
         let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("tail"), "el título muestra (tail)");
+        assert!(
+            text.contains("ventana"),
+            "el título muestra la ventana de tiempo"
+        );
         assert!(text.contains("abc123"), "muestra el sufijo del stream");
+    }
+
+    #[test]
+    fn w_cycles_window_and_bumps_gen() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Char('t'))); // tail 1h, gen=1
+        let actions = v.on_key(key(KeyCode::Char('w'))); // 1h → 6h, gen=2
+        match actions.as_slice() {
+            [
+                Action::LoadLogTail {
+                    window,
+                    token,
+                    generation,
+                    ..
+                },
+            ] => {
+                assert_eq!(*window, LogWindow::Last(WINDOW_PRESETS[2].1), "1h → 6h");
+                assert!(token.is_none());
+                assert_eq!(*generation, 2, "consulta fresca sube el gen");
+            }
+            other => panic!("se esperaba LoadLogTail, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn o_loads_more_with_token_same_gen() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Char('t'))); // gen=1
+        // Una página con next_token → la vista guarda el token para `o`.
+        v.on_message(&Message::LogTailLoaded {
+            group: "/svc".into(),
+            events: vec![ev("a", 1)],
+            next_token: Some("tok".into()),
+            append: false,
+            generation: 1,
+        });
+        let actions = v.on_key(key(KeyCode::Char('o'))); // load-more
+        match actions.as_slice() {
+            [
+                Action::LoadLogTail {
+                    token, generation, ..
+                },
+            ] => {
+                assert_eq!(token.as_deref(), Some("tok"));
+                assert_eq!(*generation, 1, "load-more conserva el gen");
+            }
+            other => panic!("se esperaba LoadLogTail con token, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_extends_buffer() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Char('t'))); // gen=1
+        v.on_message(&tail_loaded("/svc", 1, vec![ev("a", 1), ev("b", 2)]));
+        assert_eq!(v.visible_len(), 2);
+        // Continuación (append) con el mismo gen → extiende, no reemplaza.
+        v.on_message(&Message::LogTailLoaded {
+            group: "/svc".into(),
+            events: vec![ev("c", 3), ev("d", 4)],
+            next_token: None,
+            append: true,
+            generation: 1,
+        });
+        assert_eq!(v.visible_len(), 4, "append extiende el buffer");
+    }
+
+    #[test]
+    fn on_command_since_sets_window() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        // Desde groups, `:since 2d` abre el tail con ventana Last(2d).
+        let actions = v.on_command("since 2d");
+        let ok = actions.iter().any(|a| {
+            matches!(a, Action::LoadLogTail { window, .. } if *window == LogWindow::Last(2 * 86_400_000))
+        });
+        assert!(ok, "since 2d → LoadLogTail Last(2d): {actions:?}");
+        assert!(matches!(v.level, Level::Tail { .. }));
+    }
+
+    #[test]
+    fn on_command_from_to_sets_range() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        let actions = v.on_command("from 2026-06-19 to 2026-06-20");
+        let ok = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::LoadLogTail {
+                    window: LogWindow::Range { to: Some(_), .. },
+                    ..
+                }
+            )
+        });
+        assert!(ok, "from..to → LoadLogTail Range con `to`: {actions:?}");
+    }
+
+    #[test]
+    fn on_command_unknown_or_invalid_returns_empty() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        assert!(v.on_command("blah").is_empty(), "comando ajeno → vacío");
+        assert!(
+            v.on_command("since notaduration").is_empty(),
+            "duración inválida → vacío"
+        );
     }
 
     #[test]

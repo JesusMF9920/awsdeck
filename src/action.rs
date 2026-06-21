@@ -7,6 +7,7 @@
 //! servicio (junto con `message.rs`, `effects.rs`, `aws/` y `main.rs`).
 
 use crate::aws::context::Env;
+use crate::message::LogWindow;
 
 #[derive(Clone, Debug)]
 pub enum Action {
@@ -34,11 +35,15 @@ pub enum Action {
     LoadLogStreams { group: String },
     /// Hacer drill a un stream: sus eventos más recientes (`get_log_events`).
     LoadLogEvents { group: String, stream: String },
-    /// Tail de un group: eventos de todos sus streams (`filter_log_events`).
-    /// `pattern=None` = ventana reciente; `pattern=Some(p)` = filtro server-side.
+    /// Logs de un group por rango de tiempo (`filter_log_events` sobre todos sus
+    /// streams). `pattern` = filtro server-side; `window` = rango; `token=Some` =
+    /// continuar paginando (load-more, append); `generation` = generación (staleness).
     LoadLogTail {
         group: String,
         pattern: Option<String>,
+        window: LogWindow,
+        token: Option<String>,
+        generation: u64,
     },
     /// Pedir la lista de colas SQS del ambiente activo.
     LoadQueues,

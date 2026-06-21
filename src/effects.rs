@@ -16,8 +16,8 @@ use crate::action::Action;
 use crate::aws::context::{AwsContext, Env};
 use crate::message::{
     Envelope, EventBusDto, ExecStatus, ExecutionDetailDto, ExecutionDto, LogEventDto, LogGroupDto,
-    LogStreamDto, MachineType, Message, QueueAttrsDto, QueueDto, QueueMessageDto, RuleDetailDto,
-    RuleDto, RuleState, StateMachineDto, StateSpanDto, TargetDto,
+    LogStreamDto, LogWindow, MachineType, Message, QueueAttrsDto, QueueDto, QueueMessageDto,
+    RuleDetailDto, RuleDto, RuleState, StateMachineDto, StateSpanDto, TargetDto,
 };
 
 /// Fuente de datos.
@@ -67,7 +67,13 @@ impl Effects {
             Action::LoadLogGroups { query } => self.load_log_groups(query, epoch),
             Action::LoadLogStreams { group } => self.load_log_streams(group, epoch),
             Action::LoadLogEvents { group, stream } => self.load_log_events(group, stream, epoch),
-            Action::LoadLogTail { group, pattern } => self.load_log_tail(group, pattern, epoch),
+            Action::LoadLogTail {
+                group,
+                pattern,
+                window,
+                token,
+                generation,
+            } => self.load_log_tail(group, pattern, window, token, generation, epoch),
             Action::LoadQueues => self.load_queues(epoch),
             Action::LoadQueueDetail { queue_url } => self.load_queue_detail(queue_url, epoch),
             Action::PurgeQueue { queue_url } => self.purge_queue(queue_url, epoch),
@@ -187,8 +193,18 @@ impl Effects {
         }
     }
 
-    fn load_log_tail(&self, group: String, pattern: Option<String>, epoch: u64) {
+    fn load_log_tail(
+        &self,
+        group: String,
+        pattern: Option<String>,
+        window: LogWindow,
+        token: Option<String>,
+        generation: u64,
+        epoch: u64,
+    ) {
         let tx = self.tx.clone();
+        // Con token, esta respuesta continúa una página previa → la vista la appendea.
+        let append = token.is_some();
         match &self.backend {
             Backend::Mock(_) => {
                 tokio::spawn(async move {
@@ -196,9 +212,10 @@ impl Effects {
                     let events = mock_log_tail(&group, pattern.as_deref());
                     let msg = Message::LogTailLoaded {
                         group,
-                        query: pattern,
                         events,
-                        more: false,
+                        next_token: None,
+                        append,
+                        generation,
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -206,12 +223,15 @@ impl Effects {
             Backend::Real(ctx) => {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    let msg = match fetch_log_tail(&ctx, &group, pattern.as_deref()).await {
-                        Ok((events, more)) => Message::LogTailLoaded {
+                    let msg = match fetch_log_tail(&ctx, &group, pattern.as_deref(), window, token)
+                        .await
+                    {
+                        Ok((events, next_token)) => Message::LogTailLoaded {
                             group,
-                            query: pattern,
                             events,
-                            more,
+                            next_token,
+                            append,
+                            generation,
                         },
                         Err(e) => Message::Error(format!("filter_log_events: {e}")),
                     };
@@ -595,11 +615,11 @@ const EVENTS_LIMIT: i32 = 200;
 /// **página vacía aunque el stream tenga eventos** (hay que seguir `nextBackwardToken`);
 /// también la usamos para juntar hasta `EVENTS_LIMIT` líneas si la primera página es corta.
 const MAX_EVENT_PAGES: usize = 5;
-/// Ventana del *tail*: `filter_log_events` sin `start_time` devuelve lo más viejo, así
-/// que acotamos a la última hora para "recientes".
-const TAIL_LOOKBACK_MS: i64 = 60 * 60 * 1000;
-/// Tope de eventos del *tail* en una sola página; `more = next_token.is_some()`.
+/// Tope de eventos por página de `filter_log_events`.
 const TAIL_LIMIT: i32 = 1000;
+/// Tope de páginas que `fetch_log_tail` junta por request (auto-paginación). Lo que
+/// quede más allá se reporta vía `next_token` y el usuario lo trae con `o` (load-more).
+const MAX_TAIL_PAGES: usize = 10;
 /// Tope por línea: las líneas de log pueden ser enormes (stack traces, JSON); no
 /// pasamos cientos de KB a la vista. Colapsa saltos de línea para una fila por evento.
 const MAX_LINE: usize = 2048;
@@ -685,34 +705,49 @@ async fn fetch_log_events(
     Ok((collected, more))
 }
 
-/// Tail de un group (`filter_log_events` sobre todos sus streams) en la ventana
-/// reciente. Con `pattern`, filtra server-side (`filter_pattern`). Cada evento trae
-/// su `log_stream_name`. Devuelve `(events, hay_más_en_la_ventana)`.
+/// Logs de un group por rango de tiempo (`filter_log_events` sobre todos sus streams).
+/// Traduce `window` → `start_time`/`end_time` (con `now_millis`), filtra server-side con
+/// `pattern` y auto-pagina (`set_next_token`) hasta `MAX_TAIL_PAGES`. Los eventos vienen
+/// en orden cronológico ascendente (oldest→newest); `next_token` = continuación (la usa
+/// `o` para cargar más). Con `token`, continúa desde ahí. Devuelve `(events, next_token)`.
 async fn fetch_log_tail(
     ctx: &AwsContext,
     group: &str,
     pattern: Option<&str>,
-) -> color_eyre::Result<(Vec<LogEventDto>, bool)> {
-    let out = ctx
-        .logs()
-        .await
-        .filter_log_events()
-        .log_group_name(group)
-        .set_filter_pattern(pattern.map(str::to_string))
-        .start_time(now_millis() - TAIL_LOOKBACK_MS)
-        .limit(TAIL_LIMIT)
-        .send()
-        .await?;
-    let events = out
-        .events()
-        .iter()
-        .map(|e| LogEventDto {
+    window: LogWindow,
+    token: Option<String>,
+) -> color_eyre::Result<(Vec<LogEventDto>, Option<String>)> {
+    let client = ctx.logs().await;
+    let now = now_millis();
+    let (start, end) = match window {
+        LogWindow::Last(n) => (now - n, now),
+        LogWindow::Range { from, to } => (from, to.unwrap_or(now)),
+    };
+
+    let mut next = token;
+    let mut events: Vec<LogEventDto> = Vec::new();
+    for _ in 0..MAX_TAIL_PAGES {
+        let out = client
+            .filter_log_events()
+            .log_group_name(group)
+            .set_filter_pattern(pattern.map(str::to_string))
+            .start_time(start)
+            .end_time(end)
+            .limit(TAIL_LIMIT)
+            .set_next_token(next.clone())
+            .send()
+            .await?;
+        events.extend(out.events().iter().map(|e| LogEventDto {
             ts: e.timestamp(),
             message: clip_message(e.message()),
             stream: e.log_stream_name().map(str::to_string),
-        })
-        .collect();
-    Ok((events, out.next_token().is_some()))
+        }));
+        next = out.next_token().map(str::to_string);
+        if next.is_none() {
+            break;
+        }
+    }
+    Ok((events, next))
 }
 
 async fn fetch_queues(ctx: &AwsContext) -> color_eyre::Result<Vec<QueueDto>> {
@@ -1708,31 +1743,42 @@ mod tests {
         }
     }
 
+    /// Helper: `LoadLogTail` con ventana de 1h y sin token, para los tests del mock.
+    fn load_tail(
+        group: &str,
+        pattern: Option<&str>,
+        token: Option<&str>,
+        generation: u64,
+    ) -> Action {
+        Action::LoadLogTail {
+            group: group.into(),
+            pattern: pattern.map(str::to_string),
+            window: LogWindow::Last(3_600_000),
+            token: token.map(str::to_string),
+            generation,
+        }
+    }
+
     #[tokio::test]
     async fn mock_log_tail_reflects_multiple_streams() {
         let (tx, mut rx) = mpsc::channel(8);
         let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
 
-        fx.dispatch(
-            Action::LoadLogTail {
-                group: "/ecs/checkout-service".into(),
-                pattern: None,
-            },
-            6,
-        );
+        fx.dispatch(load_tail("/ecs/checkout-service", None, None, 1), 6);
 
         let envelope = rx.recv().await.expect("debe llegar un envelope");
         assert_eq!(envelope.epoch, 6);
         match envelope.message {
             Message::LogTailLoaded {
                 group,
-                query,
                 events,
-                more,
+                append,
+                generation,
+                ..
             } => {
                 assert_eq!(group, "/ecs/checkout-service");
-                assert!(query.is_none());
-                assert!(!more);
+                assert!(!append, "carga fresca (sin token)");
+                assert_eq!(generation, 1, "el generation se propaga");
                 assert!(
                     events.iter().all(|e| e.stream.is_some()),
                     "tail trae el stream"
@@ -1751,18 +1797,14 @@ mod tests {
         let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
 
         fx.dispatch(
-            Action::LoadLogTail {
-                group: "/ecs/checkout-service".into(),
-                pattern: Some("error".into()),
-            },
+            load_tail("/ecs/checkout-service", Some("error"), None, 2),
             8,
         );
 
         let envelope = rx.recv().await.expect("debe llegar un envelope");
         assert_eq!(envelope.epoch, 8);
         match envelope.message {
-            Message::LogTailLoaded { query, events, .. } => {
-                assert_eq!(query.as_deref(), Some("error"), "la query se ecoa");
+            Message::LogTailLoaded { events, .. } => {
                 assert!(!events.is_empty());
                 assert!(
                     events
@@ -1770,6 +1812,26 @@ mod tests {
                         .all(|e| e.message.to_lowercase().contains("error")),
                     "el mock filtra por substring como el server"
                 );
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_log_tail_with_token_marks_append() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+
+        // Token presente = continuación de una página previa (load-more).
+        fx.dispatch(load_tail("/ecs/checkout-service", None, Some("tok"), 3), 1);
+
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        match envelope.message {
+            Message::LogTailLoaded {
+                append, generation, ..
+            } => {
+                assert!(append, "con token, la respuesta es append (load-more)");
+                assert_eq!(generation, 3);
             }
             other => panic!("mensaje inesperado: {other:?}"),
         }

@@ -22,7 +22,7 @@ use crate::action::Action;
 use crate::aws::context::{Env, ProfileEntry, list_profiles};
 use crate::effects::Effects;
 use crate::message::{Envelope, Message};
-use crate::ui::{command_bar, header, help, picker};
+use crate::ui::{command_bar, confirm, header, help, picker};
 use crate::views::Registry;
 
 /// Modo de input del `App`: dónde van las teclas.
@@ -82,6 +82,14 @@ impl Picker {
     }
 }
 
+/// Modal de confirmación para una acción mutante (gate prod-safe). Lleva la
+/// `Action` a despachar si el usuario confirma.
+struct Confirm {
+    title: String,
+    body: String,
+    action: Action,
+}
+
 pub struct App {
     env: Env,
     epoch: u64,
@@ -97,6 +105,10 @@ pub struct App {
     status: Option<StatusLine>,
     show_help: bool,
     picker: Option<Picker>,
+    /// Modal de confirmación de una acción mutante (gate prod-safe).
+    confirm: Option<Confirm>,
+    /// Modo escritura: las acciones mutantes solo proceden si está ON.
+    write_mode: bool,
     /// `true` mientras el picker de arranque espera que el usuario elija ambiente;
     /// difiere la carga inicial para no pintar datos del default.
     awaiting_startup_env: bool,
@@ -122,6 +134,8 @@ impl App {
             status: None,
             show_help: false,
             picker: None,
+            confirm: None,
+            write_mode: false,
             awaiting_startup_env: false,
             should_quit: false,
         }
@@ -167,7 +181,11 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) {
         // Cualquier tecla limpia el estado transitorio.
         self.status = None;
-        // Los overlays interceptan primero.
+        // Los overlays interceptan primero; el confirm tiene máxima precedencia.
+        if self.confirm.is_some() {
+            self.on_confirm_key(key);
+            return;
+        }
         if self.picker.is_some() {
             self.on_picker_key(key);
             return;
@@ -240,6 +258,8 @@ impl App {
             Action::Quit => self.should_quit = true,
             Action::ActivateView(id) => self.activate_view(&id),
             Action::SwitchEnv(env) => self.switch_env(env),
+            // Gate prod-safe: las mutantes pasan por modo escritura + confirm.
+            mutating if is_mutating(&mutating) => self.request_confirm(mutating),
             effect => self.effects.dispatch(effect, self.epoch),
         }
     }
@@ -269,6 +289,7 @@ impl App {
         self.epoch += 1;
         self.env = env.clone();
         self.effects.set_env(env);
+        self.write_mode = false; // re-armar la seguridad al cambiar de cuenta
         self.clear_filter();
         let actions = self.on_activate_active();
         self.dispatch_all(actions);
@@ -333,16 +354,60 @@ impl App {
         }
     }
 
+    // --- Gate de mutaciones (modo escritura + confirm) ------------------------
+
+    /// Sin modo escritura, bloquea con error; con modo escritura, abre el confirm.
+    fn request_confirm(&mut self, action: Action) {
+        if !self.write_mode {
+            self.set_error("acción mutante bloqueada: activa modo escritura con :write");
+            return;
+        }
+        let confirm = match &action {
+            Action::PurgeQueue { queue_url } => {
+                let name = queue_url.rsplit('/').next().unwrap_or(queue_url);
+                Confirm {
+                    title: " purgar cola — irreversible ".to_string(),
+                    body: format!("se borrarán TODOS los mensajes de:\n{name}"),
+                    action,
+                }
+            }
+            // `is_mutating` ya filtró; cualquier otra no debería llegar aquí.
+            _ => return,
+        };
+        self.confirm = Some(confirm);
+    }
+
+    fn on_confirm_key(&mut self, key: KeyEvent) {
+        match key.code {
+            // Ya confirmado: va directo a effects (no se re-gatea).
+            KeyCode::Char('y') | KeyCode::Enter => {
+                if let Some(confirm) = self.confirm.take() {
+                    self.effects.dispatch(confirm.action, self.epoch);
+                    self.set_info("acción enviada");
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => self.confirm = None,
+            _ => {}
+        }
+    }
+
     fn on_envelope(&mut self, envelope: Envelope) {
         // EPOCH GUARD: descartar respuestas del ambiente anterior.
         if envelope.epoch != self.epoch {
             return;
         }
-        if let Message::Error(e) = &envelope.message {
-            self.set_error(e.clone());
+        match &envelope.message {
+            Message::Error(e) => self.set_error(e.clone()),
+            Message::QueuePurged { .. } => self.set_info("cola purgada — refrescando…"),
+            _ => {}
         }
         if let Some(view) = self.registry.active_mut() {
             view.on_message(&envelope.message);
+        }
+        // Tras un purge confirmado, refrescar el detalle (los counts no se vacían
+        // al instante del lado del servidor).
+        if let Message::QueuePurged { queue_url } = envelope.message {
+            self.dispatch(Action::LoadQueueDetail { queue_url });
         }
     }
 
@@ -359,8 +424,15 @@ impl App {
         match cmd {
             "" => {}
             "q" | "quit" => self.dispatch(Action::Quit),
+            "w" | "write" => self.toggle_write_mode(),
             id => self.dispatch(Action::ActivateView(id.to_string())),
         }
+    }
+
+    fn toggle_write_mode(&mut self) {
+        self.write_mode = !self.write_mode;
+        let state = if self.write_mode { "ON" } else { "OFF" };
+        self.set_info(format!("modo escritura: {state}"));
     }
 
     fn enter_command_mode(&mut self) {
@@ -424,7 +496,7 @@ impl App {
             .active()
             .map(|v| v.title())
             .unwrap_or_else(|| "—".to_string());
-        header::render(frame, header_area, &self.env, &title);
+        header::render(frame, header_area, &self.env, &title, self.write_mode);
 
         match self.registry.active_mut() {
             Some(view) => view.render(frame, body_area),
@@ -433,8 +505,10 @@ impl App {
 
         command_bar::render(frame, footer_area, self.footer_state());
 
-        // Overlays: el picker tiene precedencia sobre la ayuda.
-        if let Some(p) = &mut self.picker {
+        // Overlays por precedencia: confirm > picker > help.
+        if let Some(c) = &self.confirm {
+            confirm::render(frame, full, &c.title, &c.body);
+        } else if let Some(p) = &mut self.picker {
             picker::render(frame, full, &p.profiles, &mut p.state);
         } else if self.show_help {
             help::render(frame, full);
@@ -464,6 +538,11 @@ impl App {
             },
         }
     }
+}
+
+/// `true` si la acción es mutante y debe pasar por el gate (modo escritura + confirm).
+fn is_mutating(action: &Action) -> bool {
+    matches!(action, Action::PurgeQueue { .. })
 }
 
 /// Cuerpo cuando no hay vista activa (registry vacío): guía al usuario a `:logs`.
@@ -697,5 +776,95 @@ mod tests {
         app.on_envelope(Envelope::new(1, Message::Error("error real".into())));
         let status = app.status.as_ref().expect("el envelope vigente sí pinta");
         assert!(status.error && status.text.contains("error real"));
+    }
+
+    // --- Gate de mutaciones (modo escritura + confirm) ------------------------
+
+    fn test_app_mock() -> App {
+        let (tx, rx) = mpsc::channel(8);
+        let env = Env::new("dev", "us-east-1");
+        let effects = Effects::new_mock(tx, env.clone());
+        App::new(env, Registry::new(), effects, rx)
+    }
+
+    fn purge(url: &str) -> Action {
+        Action::PurgeQueue {
+            queue_url: url.to_string(),
+        }
+    }
+
+    #[test]
+    fn purge_blocked_without_write_mode() {
+        let mut app = test_app();
+        assert!(!app.write_mode);
+        app.dispatch(purge("https://sqs/000/orders"));
+        assert!(app.confirm.is_none(), "sin modo escritura no abre confirm");
+        let status = app.status.as_ref().expect("status de bloqueo");
+        assert!(status.error && status.text.contains("escritura"));
+    }
+
+    #[test]
+    fn purge_with_write_mode_opens_confirm() {
+        let mut app = test_app();
+        app.write_mode = true;
+        app.dispatch(purge("https://sqs/000/orders"));
+        assert!(app.confirm.is_some(), "con modo escritura abre el confirm");
+    }
+
+    #[test]
+    fn confirm_n_cancels_without_dispatch() {
+        let mut app = test_app();
+        app.write_mode = true;
+        app.dispatch(purge("https://sqs/000/orders"));
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(app.confirm.is_none(), "n cancela el confirm");
+    }
+
+    #[test]
+    fn confirm_intercepts_keys_before_normal() {
+        let mut app = test_app();
+        app.write_mode = true;
+        app.dispatch(purge("https://sqs/000/orders"));
+        app.on_key(ch('q')); // 'q' normalmente saldría
+        assert!(
+            !app.should_quit,
+            "el confirm intercepta antes del routing normal"
+        );
+        assert!(app.confirm.is_some());
+    }
+
+    #[tokio::test]
+    async fn confirm_y_dispatches_to_effects() {
+        let mut app = test_app_mock();
+        app.write_mode = true;
+        app.dispatch(purge(
+            "https://sqs.us-east-1.amazonaws.com/000000000000/orders",
+        ));
+        assert!(app.confirm.is_some());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.confirm.is_none(), "y confirma y cierra el modal");
+
+        // El purge (mock) responde QueuePurged por el canal.
+        let envelope = app.rx.recv().await.expect("debe llegar un envelope");
+        assert!(matches!(envelope.message, Message::QueuePurged { .. }));
+    }
+
+    #[test]
+    fn write_command_toggles_mode() {
+        let mut app = test_app();
+        assert!(!app.write_mode);
+        type_command(&mut app, "write");
+        assert!(app.write_mode);
+        type_command(&mut app, "w");
+        assert!(!app.write_mode);
+    }
+
+    #[test]
+    fn switch_env_resets_write_mode() {
+        let mut app = test_app();
+        app.write_mode = true;
+        app.dispatch(Action::SwitchEnv(Env::new("prod", "eu-west-1")));
+        assert!(!app.write_mode, "cambiar de ambiente re-arma la seguridad");
     }
 }

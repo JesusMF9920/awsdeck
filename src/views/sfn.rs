@@ -85,12 +85,20 @@ impl SfnView {
         })
     }
 
-    /// Tamaño de la lista navegable del nivel activo (el timeline no se filtra).
+    /// El timeline también se filtra por nombre de estado (`/` consistente en los
+    /// 3 niveles). Útil en histories largos (Map/Parallel con cientos de estados).
+    fn filtered_history_indices(&self) -> Vec<usize> {
+        ranked(self.history.len(), &self.filter, |i| {
+            fuzzy_score(&self.history[i].name, &self.filter)
+        })
+    }
+
+    /// Tamaño de la lista navegable del nivel activo.
     fn visible_len(&self) -> usize {
         match self.level {
             Level::Machines => self.filtered_machine_indices().len(),
             Level::Executions { .. } => self.filtered_execution_indices().len(),
-            Level::Detail { .. } => self.history.len(),
+            Level::Detail { .. } => self.filtered_history_indices().len(),
         }
     }
 
@@ -332,15 +340,24 @@ impl SfnView {
     }
 
     fn timeline_title(&self) -> String {
-        let n = self.history.len();
-        if self
+        let total = self.history.len();
+        let redrive = if self
             .detail
             .as_ref()
             .is_some_and(|d| d.status.is_redrivable())
         {
-            format!(" timeline · {n} estados · [R] redrive ")
+            " · [R] redrive"
         } else {
-            format!(" timeline · {n} estados ")
+            ""
+        };
+        if self.filter.is_empty() {
+            format!(" timeline · {total} estados{redrive} ")
+        } else {
+            let shown = self.filtered_history_indices().len();
+            format!(
+                " timeline · {shown}/{total} estados · filtro: {}{redrive} ",
+                self.filter
+            )
         }
     }
 
@@ -513,11 +530,13 @@ impl View for SfnView {
                     self.history = history.clone();
                     self.failed_state = failed_state.clone();
                     self.loading = false;
-                    // Saltar al estado que reventó (si lo hay).
+                    // Saltar al estado que reventó (si lo hay), sobre la lista visible
+                    // (filtrada). Tras el drill el filtro está vacío → es la identidad.
+                    let visible = self.filtered_history_indices();
                     let idx = self
                         .failed_state
                         .as_ref()
-                        .and_then(|fs| self.history.iter().position(|s| &s.name == fs));
+                        .and_then(|fs| visible.iter().position(|&i| &self.history[i].name == fs));
                     self.state.select(Some(idx.unwrap_or(0)));
                     self.clamp_selection();
                 }
@@ -581,10 +600,16 @@ impl View for SfnView {
                 frame.render_widget(self.detail_header(), head);
 
                 let block = Block::bordered().title(self.timeline_title());
-                let items: Vec<ListItem> = self.history.iter().map(span_item).collect();
+                let items: Vec<ListItem> = self
+                    .filtered_history_indices()
+                    .into_iter()
+                    .map(|i| span_item(&self.history[i]))
+                    .collect();
                 if items.is_empty() {
                     let msg = if self.loading {
                         "cargando…"
+                    } else if !self.filter.is_empty() {
+                        "(sin coincidencias para el filtro)"
                     } else {
                         "(sin history)"
                     };
@@ -844,6 +869,27 @@ mod tests {
             more: true,
         });
         assert!(v.executions_title().contains("parcial"));
+    }
+
+    #[test]
+    fn filter_narrows_timeline_in_detail() {
+        // El timeline (Validate, ProcessOrder) se filtra por nombre de estado.
+        let mut v = view_in_detail(ExecStatus::Succeeded);
+        assert_eq!(v.visible_len(), 2, "timeline completo sin filtro");
+        v.set_filter("process"); // fuzzy → solo ProcessOrder
+        assert_eq!(v.visible_len(), 1);
+        assert!(v.timeline_title().contains("filtro"));
+        v.set_filter("zzz");
+        assert_eq!(v.visible_len(), 0);
+        v.set_filter(""); // se restaura completo
+        assert_eq!(v.visible_len(), 2);
+    }
+
+    #[test]
+    fn detail_preselects_failed_state_in_visible_list() {
+        // ProcessOrder reventó → preseleccionado (índice 1 del timeline visible).
+        let v = view_in_detail(ExecStatus::Failed);
+        assert_eq!(v.state.selected(), Some(1));
     }
 
     #[test]

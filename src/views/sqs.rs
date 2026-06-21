@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use super::View;
 use crate::action::Action;
 use crate::message::{Message, QueueAttrsDto, QueueDto, QueueMessageDto};
-use crate::util::fmt_epoch_millis;
+use crate::util::{fmt_epoch_millis, fuzzy_score, ranked};
 
 /// Nivel de drill actual.
 enum Level {
@@ -49,27 +49,20 @@ impl SqsView {
     // --- Filtrado / selección -------------------------------------------------
 
     fn filtered_queue_indices(&self) -> Vec<usize> {
-        let f = self.filter.to_lowercase();
-        self.queues
-            .iter()
-            .enumerate()
-            .filter(|(_, q)| f.is_empty() || q.name.to_lowercase().contains(&f))
-            .map(|(i, _)| i)
-            .collect()
+        ranked(self.queues.len(), &self.filter, |i| {
+            fuzzy_score(&self.queues[i].name, &self.filter)
+        })
     }
 
     fn filtered_message_indices(&self) -> Vec<usize> {
-        let f = self.filter.to_lowercase();
-        self.messages
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| {
-                f.is_empty()
-                    || m.id.to_lowercase().contains(&f)
-                    || m.body.to_lowercase().contains(&f)
-            })
-            .map(|(i, _)| i)
-            .collect()
+        // Un mensaje matchea por id o por body; tomamos el mejor score de los dos.
+        ranked(self.messages.len(), &self.filter, |i| {
+            let m = &self.messages[i];
+            fuzzy_score(&m.id, &self.filter)
+                .into_iter()
+                .chain(fuzzy_score(&m.body, &self.filter))
+                .max()
+        })
     }
 
     fn visible_len(&self) -> usize {
@@ -318,6 +311,7 @@ impl View for SqsView {
 
     fn set_filter(&mut self, filter: &str) {
         self.filter = filter.to_string();
+        self.state.select(Some(0)); // top = mejor match (estilo fzf)
         self.clamp_selection();
     }
 

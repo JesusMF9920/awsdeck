@@ -59,6 +59,19 @@ pub fn fuzzy_score(haystack: &str, needle: &str) -> Option<i32> {
     next.is_none().then_some(score)
 }
 
+/// Índices `[0, len)` filtrados y ordenados por `score`. Filtro vacío → todos en
+/// orden original; con filtro → solo los `Some(score)`, ordenados por score desc
+/// (sort estable: empates conservan el orden original). Helper compartido por las
+/// vistas para rankear sus listas con `fuzzy_score`.
+pub fn ranked(len: usize, filter: &str, score: impl Fn(usize) -> Option<i32>) -> Vec<usize> {
+    if filter.is_empty() {
+        return (0..len).collect();
+    }
+    let mut scored: Vec<(i32, usize)> = (0..len).filter_map(|i| score(i).map(|s| (s, i))).collect();
+    scored.sort_by_key(|&(s, _)| std::cmp::Reverse(s)); // score desc, estable
+    scored.into_iter().map(|(_, i)| i).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

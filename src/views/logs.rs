@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use super::View;
 use crate::action::Action;
 use crate::message::{LogGroupDto, LogStreamDto, Message};
-use crate::util::fmt_epoch_millis;
+use crate::util::{fmt_epoch_millis, fuzzy_score, ranked};
 
 /// Nivel de drill actual.
 enum Level {
@@ -46,23 +46,15 @@ impl LogsView {
     // --- Filtrado / selección -------------------------------------------------
 
     fn filtered_group_indices(&self) -> Vec<usize> {
-        let f = self.filter.to_lowercase();
-        self.groups
-            .iter()
-            .enumerate()
-            .filter(|(_, g)| f.is_empty() || g.name.to_lowercase().contains(&f))
-            .map(|(i, _)| i)
-            .collect()
+        ranked(self.groups.len(), &self.filter, |i| {
+            fuzzy_score(&self.groups[i].name, &self.filter)
+        })
     }
 
     fn filtered_stream_indices(&self) -> Vec<usize> {
-        let f = self.filter.to_lowercase();
-        self.streams
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| f.is_empty() || s.name.to_lowercase().contains(&f))
-            .map(|(i, _)| i)
-            .collect()
+        ranked(self.streams.len(), &self.filter, |i| {
+            fuzzy_score(&self.streams[i].name, &self.filter)
+        })
     }
 
     fn visible_len(&self) -> usize {
@@ -254,6 +246,7 @@ impl View for LogsView {
 
     fn set_filter(&mut self, filter: &str) {
         self.filter = filter.to_string();
+        self.state.select(Some(0)); // top = mejor match (estilo fzf)
         self.clamp_selection();
     }
 
@@ -380,6 +373,21 @@ mod tests {
         assert_eq!(v.visible_len(), 2);
         v.set_filter("CHECKOUT"); // case-insensitive
         assert_eq!(v.visible_len(), 1);
+    }
+
+    #[test]
+    fn fuzzy_filter_ranks_best_match_first() {
+        let mut v = LogsView::new();
+        v.on_message(&Message::LogGroupsLoaded(vec![
+            group("/aws/lambda/reordered-thing"),
+            group("/aws/lambda/orders-api"),
+            group("/ecs/checkout"),
+        ]));
+        // "ordapi" no es substring contiguo de ninguno, pero sí subsecuencia de orders-api.
+        v.set_filter("ordapi");
+        assert_eq!(v.visible_len(), 1);
+        let first = v.filtered_group_indices()[0];
+        assert_eq!(v.groups[first].name, "/aws/lambda/orders-api");
     }
 
     #[test]

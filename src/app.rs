@@ -13,16 +13,16 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, ListState, Paragraph};
 use tokio::sync::mpsc;
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
 use crate::action::Action;
-use crate::aws::context::Env;
+use crate::aws::context::{Env, ProfileEntry, list_profiles};
 use crate::effects::Effects;
 use crate::message::{Envelope, Message};
-use crate::ui::{command_bar, header, help};
+use crate::ui::{command_bar, header, help, picker};
 use crate::views::Registry;
 
 /// Modo de input del `App`: dónde van las teclas.
@@ -36,6 +36,43 @@ enum Mode {
 struct StatusLine {
     error: bool,
     text: String,
+}
+
+/// Estado del picker de ambientes (overlay de `ctrl-e`).
+struct Picker {
+    profiles: Vec<ProfileEntry>,
+    state: ListState,
+}
+
+impl Picker {
+    fn new(profiles: Vec<ProfileEntry>) -> Self {
+        let mut state = ListState::default();
+        if !profiles.is_empty() {
+            state.select(Some(0));
+        }
+        Self { profiles, state }
+    }
+
+    fn move_selection(&mut self, delta: i32) {
+        let len = self.profiles.len();
+        if len == 0 {
+            return;
+        }
+        let cur = self.state.selected().unwrap_or(0) as i32;
+        let next = (cur + delta).clamp(0, len as i32 - 1) as usize;
+        self.state.select(Some(next));
+    }
+
+    /// `Env` del profile seleccionado: usa su región declarada o, si no tiene,
+    /// conserva la región actual.
+    fn selected_env(&self, current: &Env) -> Option<Env> {
+        let profile = self.profiles.get(self.state.selected()?)?;
+        let region = profile
+            .region
+            .clone()
+            .unwrap_or_else(|| current.region.clone());
+        Some(Env::new(profile.name.clone(), region))
+    }
 }
 
 pub struct App {
@@ -52,6 +89,7 @@ pub struct App {
     filter: String,
     status: Option<StatusLine>,
     show_help: bool,
+    picker: Option<Picker>,
     should_quit: bool,
 }
 
@@ -73,6 +111,7 @@ impl App {
             filter: String::new(),
             status: None,
             show_help: false,
+            picker: None,
             should_quit: false,
         }
     }
@@ -111,8 +150,13 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
-        // Cualquier tecla limpia el estado transitorio y cierra la ayuda.
+        // Cualquier tecla limpia el estado transitorio.
         self.status = None;
+        // Los overlays interceptan primero.
+        if self.picker.is_some() {
+            self.on_picker_key(key);
+            return;
+        }
         if self.show_help {
             self.show_help = false;
             return;
@@ -131,10 +175,7 @@ impl App {
             KeyCode::Char(':') => self.enter_command_mode(),
             KeyCode::Char('/') => self.enter_filter_mode(),
             KeyCode::Char('?') => self.show_help = true,
-            // ctrl-e: el picker de profiles real llega en el commit "profile picker".
-            KeyCode::Char('e') if ctrl => {
-                self.set_info("picker de profiles: próximo commit (ctrl-e)")
-            }
+            KeyCode::Char('e') if ctrl => self.open_picker(),
             // Resto: lo maneja la vista activa.
             _ => {
                 let actions = match self.registry.active_mut() {
@@ -215,6 +256,42 @@ impl App {
         let actions = self.on_activate_active();
         self.dispatch_all(actions);
         self.set_info(format!("ambiente: {}", self.env));
+    }
+
+    // --- Picker de ambientes (ctrl-e) -----------------------------------------
+
+    fn open_picker(&mut self) {
+        let profiles = list_profiles();
+        if profiles.is_empty() {
+            self.set_error("no se encontraron profiles en ~/.aws/config");
+        } else {
+            self.picker = Some(Picker::new(profiles));
+        }
+    }
+
+    fn on_picker_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.picker = None,
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(p) = self.picker.as_mut() {
+                    p.move_selection(1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(p) = self.picker.as_mut() {
+                    p.move_selection(-1);
+                }
+            }
+            KeyCode::Enter => {
+                // Calcular el Env antes de mutar `self.picker` (evita borrow doble).
+                let env = self.picker.as_ref().and_then(|p| p.selected_env(&self.env));
+                if let Some(env) = env {
+                    self.picker = None;
+                    self.dispatch(Action::SwitchEnv(env));
+                }
+            }
+            _ => {}
+        }
     }
 
     fn on_envelope(&mut self, envelope: Envelope) {
@@ -317,7 +394,10 @@ impl App {
 
         command_bar::render(frame, footer_area, self.footer_state());
 
-        if self.show_help {
+        // Overlays: el picker tiene precedencia sobre la ayuda.
+        if let Some(p) = &mut self.picker {
+            picker::render(frame, full, &p.profiles, &mut p.state);
+        } else if self.show_help {
             help::render(frame, full);
         }
     }
@@ -417,13 +497,45 @@ mod tests {
         assert!(status.text.contains("desconocido"));
     }
 
+    fn profile(name: &str, region: Option<&str>) -> ProfileEntry {
+        ProfileEntry {
+            name: name.to_string(),
+            region: region.map(str::to_string),
+        }
+    }
+
     #[test]
-    fn ctrl_e_shows_picker_placeholder() {
+    fn picker_selected_env_uses_region_or_falls_back() {
+        let mut p = Picker::new(vec![
+            profile("prod", Some("eu-west-1")),
+            profile("dev", None),
+        ]);
+        let current = Env::new("default", "us-east-1");
+        assert_eq!(p.selected_env(&current), Some(Env::new("prod", "eu-west-1")));
+        p.move_selection(1);
+        assert_eq!(p.selected_env(&current), Some(Env::new("dev", "us-east-1")));
+    }
+
+    #[test]
+    fn picker_enter_switches_env_and_bumps_epoch() {
         let mut app = test_app();
-        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
-        let status = app.status.as_ref().expect("debe haber status");
-        assert!(!status.error);
-        assert!(status.text.contains("ctrl-e"));
+        app.picker = Some(Picker::new(vec![profile("prod", Some("eu-west-1"))]));
+        assert_eq!(app.epoch, 0);
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.picker.is_none(), "el picker se cierra al elegir");
+        assert_eq!(app.epoch, 1, "el switch sube el epoch");
+        assert_eq!(app.env, Env::new("prod", "eu-west-1"));
+    }
+
+    #[test]
+    fn picker_esc_closes_without_switching() {
+        let mut app = test_app();
+        app.picker = Some(Picker::new(vec![profile("prod", None)]));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.picker.is_none());
+        assert_eq!(app.epoch, 0, "esc no cambia de ambiente");
     }
 
     #[test]

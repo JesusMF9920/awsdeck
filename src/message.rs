@@ -64,8 +64,14 @@ pub struct QueueMessageDto {
 /// (`message.rs` es frontera permitida para nombrar servicios).
 #[derive(Clone, Debug)]
 pub enum Message {
-    /// Se cargaron los log groups del ambiente activo.
-    LogGroupsLoaded(Vec<LogGroupDto>),
+    /// Se cargó una página de log groups. `query` ecoa la búsqueda que la originó
+    /// (para que la vista descarte respuestas de búsquedas viejas); `more` indica
+    /// que el servidor tiene más resultados (`next_token`).
+    LogGroupsLoaded {
+        groups: Vec<LogGroupDto>,
+        query: Option<String>,
+        more: bool,
+    },
     /// Se cargaron los streams de `group` (se incluye `group` para que la vista
     /// confirme que corresponden al drill actual).
     LogStreamsLoaded {

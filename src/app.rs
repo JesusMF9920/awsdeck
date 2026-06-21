@@ -3,6 +3,8 @@
 //! mensajes). **Agnóstico de servicio:** solo conoce vistas por el registry y
 //! reenvía las `Action` de efecto a `effects` sin inspeccionarlas.
 
+use std::time::Duration;
+
 use color_eyre::eyre::Result;
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
@@ -122,6 +124,8 @@ pub struct App {
     /// `true` mientras el picker de arranque espera que el usuario elija ambiente;
     /// difiere la carga inicial para no pintar datos del default.
     awaiting_startup_env: bool,
+    /// Deadline para disparar la búsqueda server-side (debounce del filtro `/`).
+    search_deadline: Option<tokio::time::Instant>,
     should_quit: bool,
 }
 
@@ -149,6 +153,7 @@ impl App {
             confirm: None,
             write_mode: false,
             awaiting_startup_env: false,
+            search_deadline: None,
             should_quit: false,
         }
     }
@@ -161,6 +166,18 @@ impl App {
         while !self.should_quit {
             terminal.draw(|frame| self.render(frame))?;
 
+            // Debounce del filtro: la búsqueda server-side dispara al vencer el
+            // deadline (o nunca, si no hay uno). Se reconstruye cada iteración, así
+            // que cada tecla "resetea" el temporizador.
+            let deadline = self.search_deadline;
+            let debounce = async {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(debounce);
+
             tokio::select! {
                 maybe_event = events.next() => match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
@@ -171,6 +188,10 @@ impl App {
                     None => break,                          // stream cerrado
                 },
                 Some(envelope) = self.rx.recv() => self.on_envelope(envelope),
+                () = &mut debounce => {
+                    self.search_deadline = None;
+                    self.dispatch_active_search();
+                }
             }
         }
         Ok(())
@@ -293,17 +314,24 @@ impl App {
 
     fn on_filter_key(&mut self, key: KeyEvent) {
         match key.code {
-            // esc limpia el filtro y vuelve a normal.
+            // esc limpia el filtro, recarga la primera página y vuelve a normal.
             KeyCode::Esc => {
                 self.input.reset();
                 self.apply_filter();
+                self.fire_search_now();
                 self.mode = Mode::Normal;
             }
-            // enter confirma: mantiene el filtro aplicado, vuelve a normal.
-            KeyCode::Enter => self.mode = Mode::Normal,
+            // enter dispara la búsqueda de inmediato y vuelve a normal.
+            KeyCode::Enter => {
+                self.fire_search_now();
+                self.mode = Mode::Normal;
+            }
             _ => {
                 self.input.handle_event(&Event::Key(key));
-                self.apply_filter();
+                self.apply_filter(); // fuzzy local instantáneo sobre lo ya cargado
+                // Programar la búsqueda server-side ~280ms tras dejar de escribir.
+                self.search_deadline =
+                    Some(tokio::time::Instant::now() + Duration::from_millis(280));
             }
         }
     }
@@ -524,6 +552,23 @@ impl App {
         if let Some(view) = self.registry.active_mut() {
             view.set_filter("");
         }
+    }
+
+    /// Dispara la búsqueda server-side de inmediato (cancela el debounce).
+    fn fire_search_now(&mut self) {
+        self.search_deadline = None;
+        self.dispatch_active_search();
+    }
+
+    /// Pide a la vista activa su búsqueda server-side con el filtro actual y
+    /// despacha el resultado (vacío para vistas client-side, p. ej. sqs).
+    fn dispatch_active_search(&mut self) {
+        let query = self.filter.clone();
+        let actions = match self.registry.active_mut() {
+            Some(view) => view.search(&query),
+            None => Vec::new(),
+        };
+        self.dispatch_all(actions);
     }
 
     fn set_error(&mut self, text: impl Into<String>) {

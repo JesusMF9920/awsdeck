@@ -62,7 +62,7 @@ impl Effects {
     /// bloquea el render). Las `Action` core las maneja el `App`.
     pub fn dispatch(&self, action: Action, epoch: u64) {
         match action {
-            Action::LoadLogGroups => self.load_log_groups(epoch),
+            Action::LoadLogGroups { query } => self.load_log_groups(query, epoch),
             Action::LoadLogStreams { group } => self.load_log_streams(group, epoch),
             Action::LoadQueues => self.load_queues(epoch),
             Action::LoadQueueDetail { queue_url } => self.load_queue_detail(queue_url, epoch),
@@ -71,7 +71,7 @@ impl Effects {
         }
     }
 
-    fn load_log_groups(&self, epoch: u64) {
+    fn load_log_groups(&self, query: Option<String>, epoch: u64) {
         let tx = self.tx.clone();
         match &self.backend {
             Backend::Mock(env) => {
@@ -80,15 +80,24 @@ impl Effects {
                     // Delay artificial: ejercita el path async y hace observable el
                     // epoch guard (cambiar de ambiente con un request en vuelo).
                     tokio::time::sleep(Duration::from_millis(600)).await;
-                    let msg = Message::LogGroupsLoaded(mock_log_groups(&env));
+                    let groups = mock_log_groups(&env, query.as_deref());
+                    let msg = Message::LogGroupsLoaded {
+                        groups,
+                        query,
+                        more: false,
+                    };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
             }
             Backend::Real(ctx) => {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    let msg = match fetch_log_groups(&ctx).await {
-                        Ok(groups) => Message::LogGroupsLoaded(groups),
+                    let msg = match fetch_log_groups_page(&ctx, query.as_deref()).await {
+                        Ok((groups, more)) => Message::LogGroupsLoaded {
+                            groups,
+                            query,
+                            more,
+                        },
                         Err(e) => Message::Error(format!("describe_log_groups: {e}")),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
@@ -203,20 +212,29 @@ impl Effects {
 
 // --- SDK real -----------------------------------------------------------------
 
-async fn fetch_log_groups(ctx: &AwsContext) -> color_eyre::Result<Vec<LogGroupDto>> {
+/// Una página acotada (≤50) de log groups. Con `pattern`, busca server-side por
+/// substring (`logGroupNamePattern`, case-sensitive — NO lowercasear). Devuelve
+/// `(groups, hay_más)`. Nota: con pattern el SDK no devuelve `storedBytes`.
+async fn fetch_log_groups_page(
+    ctx: &AwsContext,
+    pattern: Option<&str>,
+) -> color_eyre::Result<(Vec<LogGroupDto>, bool)> {
     let client = ctx.logs().await;
-    let mut pages = client.describe_log_groups().into_paginator().items().send();
-
-    let mut groups = Vec::new();
-    while let Some(item) = pages.next().await {
-        let g = item?;
-        groups.push(LogGroupDto {
+    let mut req = client.describe_log_groups().limit(50);
+    if let Some(p) = pattern {
+        req = req.log_group_name_pattern(p);
+    }
+    let out = req.send().await?;
+    let groups = out
+        .log_groups()
+        .iter()
+        .map(|g| LogGroupDto {
             name: g.log_group_name().unwrap_or_default().to_string(),
             stored_bytes: g.stored_bytes(),
             arn: g.arn().map(str::to_string),
-        });
-    }
-    Ok(groups)
+        })
+        .collect();
+    Ok((groups, out.next_token().is_some()))
 }
 
 async fn fetch_log_streams(ctx: &AwsContext, group: &str) -> color_eyre::Result<Vec<LogStreamDto>> {
@@ -353,7 +371,7 @@ fn parse_redrive(policy: Option<&str>) -> (Option<String>, Option<i64>) {
 
 /// Log groups falsos del ambiente. Un par de nombres llevan el `profile` activo
 /// para que un cambio de ambiente sea visible en la lista.
-fn mock_log_groups(env: &Env) -> Vec<LogGroupDto> {
+fn mock_log_groups(env: &Env, query: Option<&str>) -> Vec<LogGroupDto> {
     let names = [
         format!("/aws/lambda/{}-orders-api", env.profile),
         format!("/aws/lambda/{}-payments-worker", env.profile),
@@ -368,6 +386,8 @@ fn mock_log_groups(env: &Env) -> Vec<LogGroupDto> {
     ];
     names
         .into_iter()
+        // Mimetiza el filtro server-side por substring (logGroupNamePattern).
+        .filter(|name| query.is_none_or(|q| name.contains(q)))
         .map(|name| {
             let stored = (name.len() as i64) * 7_919 % 5_000_000;
             let arn = format!(
@@ -464,16 +484,49 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
 
-        fx.dispatch(Action::LoadLogGroups, 7);
+        fx.dispatch(Action::LoadLogGroups { query: None }, 7);
 
         let envelope = rx.recv().await.expect("debe llegar un envelope");
         assert_eq!(envelope.epoch, 7, "el epoch se propaga al resultado");
         match envelope.message {
-            Message::LogGroupsLoaded(groups) => {
+            Message::LogGroupsLoaded {
+                groups,
+                query,
+                more,
+            } => {
+                assert!(query.is_none());
+                assert!(!more);
                 assert!(!groups.is_empty());
                 assert!(
                     groups.iter().any(|g| g.name.contains("dev")),
                     "la data mock refleja el profile activo"
+                );
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_log_groups_search_filters_and_echoes_query() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+
+        fx.dispatch(
+            Action::LoadLogGroups {
+                query: Some("orders".into()),
+            },
+            9,
+        );
+
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        assert_eq!(envelope.epoch, 9);
+        match envelope.message {
+            Message::LogGroupsLoaded { groups, query, .. } => {
+                assert_eq!(query.as_deref(), Some("orders"), "la query se ecoa");
+                assert!(!groups.is_empty());
+                assert!(
+                    groups.iter().all(|g| g.name.contains("orders")),
+                    "el mock filtra por substring como el server"
                 );
             }
             other => panic!("mensaje inesperado: {other:?}"),

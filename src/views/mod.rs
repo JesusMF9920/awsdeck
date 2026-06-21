@@ -40,6 +40,14 @@ pub trait View {
     /// filtra su lista y re-clampa la selección.
     fn set_filter(&mut self, filter: &str);
 
+    /// Búsqueda server-side: el `App` la llama (con debounce) cuando cambia el
+    /// filtro, para vistas que cargan datos acotados (p. ej. logs a escala).
+    /// Default vacío: las vistas client-side no consultan al servidor.
+    fn search(&mut self, query: &str) -> Vec<Action> {
+        let _ = query;
+        Vec::new()
+    }
+
     /// Dibuja la vista dentro de `area`.
     fn render(&mut self, frame: &mut Frame, area: Rect);
 

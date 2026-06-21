@@ -27,6 +27,11 @@ pub struct LogsView {
     streams: Vec<LogStreamDto>,
     filter: String,
     loading: bool,
+    /// Última query server-side enviada (None = primeros 50). Guard "latest wins":
+    /// se descartan respuestas cuya query no coincide.
+    last_query: Option<String>,
+    /// `true` si el servidor tiene más groups que los traídos (next_token).
+    partial: bool,
     /// Selección de la lista visible (índice dentro de la lista filtrada).
     state: ListState,
 }
@@ -39,6 +44,8 @@ impl LogsView {
             streams: Vec::new(),
             filter: String::new(),
             loading: false,
+            last_query: None,
+            partial: false,
             state: ListState::default().with_selected(Some(0)),
         }
     }
@@ -134,7 +141,10 @@ impl LogsView {
     fn refresh(&mut self) -> Vec<Action> {
         self.loading = true;
         match &self.level {
-            Level::Groups => vec![Action::LoadLogGroups],
+            // Recargar la página actual (misma query si hay una búsqueda activa).
+            Level::Groups => vec![Action::LoadLogGroups {
+                query: self.last_query.clone(),
+            }],
             Level::Streams { group } => vec![Action::LoadLogStreams {
                 group: group.clone(),
             }],
@@ -156,10 +166,18 @@ impl LogsView {
                 self.filtered_stream_indices().len(),
             ),
         };
-        if self.filter.is_empty() {
-            format!(" {total} {kind} ")
+        let partial = if self.partial && matches!(self.level, Level::Groups) {
+            " · parcial (/ busca server-side)"
         } else {
-            format!(" {shown}/{total} {kind} · filtro: {} ", self.filter)
+            ""
+        };
+        if self.filter.is_empty() {
+            format!(" {total} {kind}{partial} ")
+        } else {
+            format!(
+                " {shown}/{total} {kind} · filtro: {}{partial} ",
+                self.filter
+            )
         }
     }
 }
@@ -190,8 +208,10 @@ impl View for LogsView {
         self.level = Level::Groups;
         self.streams.clear();
         self.loading = true;
+        self.last_query = None;
+        self.partial = false;
         self.state.select(Some(0));
-        vec![Action::LoadLogGroups]
+        vec![Action::LoadLogGroups { query: None }]
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -224,10 +244,20 @@ impl View for LogsView {
 
     fn on_message(&mut self, message: &Message) {
         match message {
-            Message::LogGroupsLoaded(groups) => {
+            Message::LogGroupsLoaded {
+                groups,
+                query,
+                more,
+            } => {
+                // Guard "latest wins": descartar respuestas de búsquedas viejas.
+                if query != &self.last_query {
+                    return;
+                }
                 self.groups = groups.clone();
+                self.partial = *more;
                 if matches!(self.level, Level::Groups) {
                     self.loading = false;
+                    self.state.select(Some(0)); // mejor match arriba tras la búsqueda
                     self.clamp_selection();
                 }
             }
@@ -252,6 +282,18 @@ impl View for LogsView {
         self.filter = filter.to_string();
         self.state.select(Some(0)); // top = mejor match (estilo fzf)
         self.clamp_selection();
+    }
+
+    fn search(&mut self, query: &str) -> Vec<Action> {
+        // Solo busca server-side en el nivel de groups.
+        if !matches!(self.level, Level::Groups) {
+            return Vec::new();
+        }
+        self.last_query = (!query.is_empty()).then(|| query.to_string());
+        self.loading = true;
+        vec![Action::LoadLogGroups {
+            query: self.last_query.clone(),
+        }]
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -343,6 +385,15 @@ mod tests {
         }
     }
 
+    /// Construye un `LogGroupsLoaded` sin query (página inicial), para los tests.
+    fn loaded(groups: Vec<LogGroupDto>) -> Message {
+        Message::LogGroupsLoaded {
+            groups,
+            query: None,
+            more: false,
+        }
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         use ratatui::crossterm::event::KeyModifiers;
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -352,23 +403,23 @@ mod tests {
     fn activate_requests_log_groups() {
         let mut v = LogsView::new();
         let actions = v.on_activate();
-        assert!(matches!(actions.as_slice(), [Action::LoadLogGroups]));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::LoadLogGroups { query: None }]
+        ));
     }
 
     #[test]
     fn ingests_groups_via_message() {
         let mut v = LogsView::new();
-        v.on_message(&Message::LogGroupsLoaded(vec![
-            group("/aws/lambda/a"),
-            group("/ecs/b"),
-        ]));
+        v.on_message(&loaded(vec![group("/aws/lambda/a"), group("/ecs/b")]));
         assert_eq!(v.visible_len(), 2);
     }
 
     #[test]
     fn filter_narrows_the_list() {
         let mut v = LogsView::new();
-        v.on_message(&Message::LogGroupsLoaded(vec![
+        v.on_message(&loaded(vec![
             group("/aws/lambda/orders"),
             group("/aws/lambda/payments"),
             group("/ecs/checkout"),
@@ -382,7 +433,7 @@ mod tests {
     #[test]
     fn fuzzy_filter_ranks_best_match_first() {
         let mut v = LogsView::new();
-        v.on_message(&Message::LogGroupsLoaded(vec![
+        v.on_message(&loaded(vec![
             group("/aws/lambda/reordered-thing"),
             group("/aws/lambda/orders-api"),
             group("/ecs/checkout"),
@@ -395,9 +446,36 @@ mod tests {
     }
 
     #[test]
+    fn discards_stale_search_results() {
+        let mut v = LogsView::new();
+        // La vista pide la búsqueda "xy".
+        let actions = v.search("xy");
+        assert!(
+            matches!(actions.as_slice(), [Action::LoadLogGroups { query: Some(q) }] if q == "xy")
+        );
+
+        // Llega una respuesta de una búsqueda VIEJA ("x") -> se descarta.
+        v.on_message(&Message::LogGroupsLoaded {
+            groups: vec![group("/vieja")],
+            query: Some("x".into()),
+            more: false,
+        });
+        assert_eq!(v.visible_len(), 0, "respuesta de búsqueda vieja descartada");
+
+        // Llega la respuesta de la búsqueda vigente ("xy") -> se acepta.
+        v.on_message(&Message::LogGroupsLoaded {
+            groups: vec![group("/aws/xy-thing")],
+            query: Some("xy".into()),
+            more: true,
+        });
+        assert_eq!(v.visible_len(), 1);
+        assert!(v.partial, "more=true marca la lista como parcial");
+    }
+
+    #[test]
     fn enter_drills_into_selected_group_streams() {
         let mut v = LogsView::new();
-        v.on_message(&Message::LogGroupsLoaded(vec![
+        v.on_message(&loaded(vec![
             group("/aws/lambda/orders"),
             group("/ecs/checkout"),
         ]));
@@ -434,7 +512,7 @@ mod tests {
     #[test]
     fn streams_from_wrong_group_are_ignored() {
         let mut v = LogsView::new();
-        v.on_message(&Message::LogGroupsLoaded(vec![group("/a")]));
+        v.on_message(&loaded(vec![group("/a")]));
         v.on_key(key(KeyCode::Enter)); // drill a /a
         v.on_message(&Message::LogStreamsLoaded {
             group: "/otro".into(), // group equivocado
@@ -458,7 +536,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut v = LogsView::new();
-        v.on_message(&Message::LogGroupsLoaded(vec![
+        v.on_message(&loaded(vec![
             group("/aws/lambda/orders"),
             group("/ecs/checkout"),
         ]));

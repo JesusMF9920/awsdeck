@@ -19,8 +19,9 @@ pub enum Action {
     SwitchEnv(Env),
 
     // --- Efectos: `App` los reenvía a `effects::dispatch` (específicos de servicio) ---
-    /// Pedir la lista de log groups del ambiente activo.
-    LoadLogGroups,
+    /// Pedir log groups: una página acotada (≤50). `query=None` = primeros 50;
+    /// `query=Some(p)` = búsqueda server-side por substring (`logGroupNamePattern`).
+    LoadLogGroups { query: Option<String> },
     /// Hacer drill: pedir los log streams de un log group.
     LoadLogStreams { group: String },
     /// Pedir la lista de colas SQS del ambiente activo.

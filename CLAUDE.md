@@ -58,7 +58,7 @@ src/
   aws/context.rs   Env + AwsContext/ClientFactory (clients cacheados por ambiente)
   views/
     mod.rs         trait View + Registry genérico (no nombra ningún servicio concreto)
-    logs.rs        CloudWatch log groups -> streams (drill, filtro)
+    logs.rs        CloudWatch log groups -> streams -> eventos; tail del group (drill, filtro)
     sqs.rs         colas -> attributes + peek (drill, purge gated)
     sfn.rs         state machines -> ejecuciones -> detalle/timeline (drill x3, redrive gated)
     events.rs      event buses -> rules -> detalle (patrón + targets) (drill x3, send gated)
@@ -165,13 +165,24 @@ list/describe).
 - **`/` filtra en los 3 niveles de `sfn`**: el timeline de `Detail` también se filtra por nombre
   de estado (`filtered_history_indices`), útil en histories largos (Map/Parallel); la
   preselección del estado fallido se mapea a su posición en la lista visible.
+- **Contenido de los logs (`logs` cierra el ciclo de `cwtail`)**: el `Level` de `logs` crece a 4.
+  **`Events`** (3er nivel): `enter` en un stream → sus líneas más recientes (`get_log_events`, las
+  últimas 200, *newest abajo*); `esc` vuelve a streams (siguen en cache, no recarga). **`Tail`**
+  (tecla `t` sobre un group, *sibling* de streams): `filter_log_events` sobre **todos** los streams
+  del group en la última hora; `esc` vuelve a groups. `/` filtra **local** (substring) en `Events`
+  y **server-side** (`filter_pattern`, reusa `search`/`last_query` latest-wins) en `Tail`; color por
+  severidad (ERROR rojo, WARN amarillo); señal `· parcial`. DTO `LogEventDto` plano (`ts`/`message`/
+  `stream`); `stream: Some` solo en el tail. Lectura pura: **sin gate, sin tocar `app.rs`** (las
+  nuevas `Message` no cambian listados → no re-dispatch). Mock + SDK real; `effects` acota la ventana
+  del tail con `SystemTime` (la vista nunca ve relojes) y recorta líneas (`clip_message`, 2KB).
 
-119 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, fuzzy, menú,
-búsqueda/staleness, drill x3 en `sfn` y `events`, back→menú de dos etapas, navegación en filtro,
-preservación de selección, `ClearFilter` al cambiar de nivel, señal `· parcial`, filtro del
-timeline/targets, guard EXPRESS, `parse_history`, parsers, render con `TestBackend`). `AWSDECK_MOCK=1
-cargo run` lo abre sin credenciales.
+134 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, fuzzy, menú,
+búsqueda/staleness, drill x3 en `sfn`/`events` y eventos/tail de `logs`, back→menú de dos etapas,
+navegación en filtro, preservación de selección, `ClearFilter` al cambiar de nivel, señal `· parcial`,
+filtro del timeline/targets/eventos, guard EXPRESS, `parse_history`, parsers, render con
+`TestBackend`). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
 
-Pendiente: `SendEvent` con payload editable (form multi-campo; v3 envía un evento canned),
-eventos de log (3er nivel en `logs`), input/output por estado en el timeline de `sfn`, `y` (copiar
-ARN), abrir en consola (`o`), config en disco. Backlog de vistas: Lambda, DynamoDB, ECS…
+Pendiente: `SendEvent` con payload editable (form multi-campo; v3 envía un evento canned), tail en
+vivo (`tail -f`) y ver una línea completa expandida en `logs` (hoy es carga puntual + `r`),
+input/output por estado en el timeline de `sfn`, `y` (copiar ARN), abrir en consola (`o`), config en
+disco. Backlog de vistas: Lambda, DynamoDB, ECS…

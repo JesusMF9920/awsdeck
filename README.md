@@ -40,11 +40,12 @@ se muestra en la **status bar** (no crashea).
 |-------|--------|
 | `:` | command bar (saltar de herramienta, p. ej. `:logs`, `:sqs`, `:sfn`, `:events`) |
 | `/` | buscar (fuzzy; en `logs` consulta al servidor; `↑`/`↓` navegan los resultados sin salir) |
-| `enter` | abrir herramienta (menú) / drill al detalle |
+| `enter` | abrir herramienta (menú) / drill al detalle (en `logs`: group → stream → **eventos**) |
 | `esc` | con filtro aplicado lo limpia (1er `esc`); si no, vuelve un nivel (drill back; en la raíz, al menú) |
 | `:menu` · `backspace` | volver al menú principal |
 | `j` / `k` · `↑` / `↓` · `g` / `G` | navegar |
 | `r` | refrescar |
+| `t` | tail del group (`logs`): líneas de **todos** sus streams (`/` filtra server-side) |
 | `p` | purgar cola SQS (gated: modo escritura + confirm) |
 | `R` | redrive ejecución `sfn` fallida (gated: modo escritura + confirm) |
 | `S` | enviar evento de prueba a un bus `events` (gated: modo escritura + confirm) |
@@ -57,7 +58,7 @@ se muestra en la **status bar** (no crashea).
 
 ```bash
 AWSDECK_MOCK=1 cargo run    # ver el TUI con datos, sin tocar AWS
-cargo test                  # 119 tests, sin red
+cargo test                  # 134 tests, sin red
 cargo clippy --all-targets  # lint
 cargo fmt --check           # formato
 ```
@@ -69,7 +70,9 @@ Recorrido rápido (con `AWSDECK_MOCK=1 cargo run`):
 2. En `logs`/`sqs`, `/` **busca fuzzy** (p. ej. `ordapi` encuentra `orders-api`) y dentro del
    filtro `↑`/`↓` navegan los resultados sin tener que salir; `enter` hace **drill** al detalle.
    `esc` es de **dos etapas** (estilo k9s): con un filtro aplicado lo limpia primero; el siguiente
-   `esc` regresa un nivel (y desde la raíz de la vista, al menú).
+   `esc` regresa un nivel (y desde la raíz de la vista, al menú). En `logs`, `enter` en un stream
+   abre sus **líneas** (`get_log_events`, newest abajo, `ERROR` en rojo) y `t` sobre un group hace
+   **tail** de todos sus streams (`/` filtra server-side).
 3. En `sfn`, `enter` entra a una state machine → sus **ejecuciones con status coloreado** y duración;
    `enter` en una FAILED → detalle con input/output, error/cause y el **timeline de estados** (el que
    reventó va resaltado y preseleccionado). En una máquina `[express]` se muestra una nota (sus
@@ -114,7 +117,8 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
 
 ## Roadmap
 
-- **v0** ✅ shell + `logs` (CloudWatch).
+- **v0** ✅ shell + `logs` (CloudWatch): groups → streams → **eventos** (`get_log_events`) +
+  **tail** del group (`filter_log_events`, `t`, filtro server-side).
 - **v1** ✅ `sqs` — colas, attributes, *peek*, `PurgeQueue` (gated por modo escritura + confirm).
 - **v2** ✅ `sfn` — state machines, ejecuciones (status coloreado), timeline de estados con duración,
   `Redrive` (gated).

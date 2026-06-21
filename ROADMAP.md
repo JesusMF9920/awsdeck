@@ -146,6 +146,12 @@ Entrega:
 - [ ] Un switch de ambiente con un request en vuelo no pinta datos del ambiente anterior.
 - [ ] El core (`app`, `effects`, `views/mod`) no referencia ningún servicio concreto salvo por el registry.
 
+**Extensión (cierre del ciclo `cwtail`) — ✅ hecho:** `logs` ya no se queda en streams. 3er nivel
+**`Events`** (`enter` en un stream → sus líneas vía `get_log_events`, newest abajo, color por
+severidad) y **`Tail`** del group (tecla `t` → `filter_log_events` sobre todos sus streams, `/`
+filtra server-side por `filter_pattern`). Carga puntual + `r` (sin polling); `LogEventDto` plano,
+mock + real, sin gate (lectura). Pendiente: tail en vivo (`tail -f`) y expandir una línea completa.
+
 ### v1 — Vista `sqs` — ✅ hecho
 Listar colas del ambiente; ver attributes (mensajes visibles, in-flight, DLQ); *peek* de mensajes (receive sin borrar). Acción mutante `PurgeQueue` detrás de confirm + modo escritura.
 

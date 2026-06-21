@@ -121,7 +121,10 @@ impl SqsView {
                     self.messages.clear();
                     self.loading = true;
                     self.state.select(Some(0));
-                    vec![Action::LoadQueueDetail { queue_url: q.url }]
+                    vec![
+                        Action::ClearFilter,
+                        Action::LoadQueueDetail { queue_url: q.url },
+                    ]
                 }
                 None => vec![],
             },
@@ -137,7 +140,7 @@ impl SqsView {
             self.loading = false;
             self.state.select(Some(0));
             self.clamp_selection();
-            vec![]
+            vec![Action::ClearFilter]
         } else {
             vec![Action::Back]
         }
@@ -474,8 +477,10 @@ mod tests {
         v.on_key(key(KeyCode::Down)); // selecciona payments
         let actions = v.on_key(key(KeyCode::Enter));
         match actions.as_slice() {
-            [Action::LoadQueueDetail { queue_url }] => assert!(queue_url.ends_with("/payments")),
-            other => panic!("se esperaba LoadQueueDetail, llegó {other:?}"),
+            [Action::ClearFilter, Action::LoadQueueDetail { queue_url }] => {
+                assert!(queue_url.ends_with("/payments"))
+            }
+            other => panic!("se esperaba ClearFilter+LoadQueueDetail, llegó {other:?}"),
         }
         assert!(matches!(v.level, Level::Detail { .. }));
 
@@ -520,8 +525,8 @@ mod tests {
         assert!(matches!(v.level, Level::Detail { .. }));
         let actions = v.on_key(key(KeyCode::Esc));
         assert!(
-            actions.is_empty(),
-            "esc en el detalle se consume en la vista"
+            matches!(actions.as_slice(), [Action::ClearFilter]),
+            "esc en el detalle se consume en la vista (limpia el filtro al subir)"
         );
         assert!(matches!(v.level, Level::Queues));
     }

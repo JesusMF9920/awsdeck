@@ -155,10 +155,13 @@ impl SfnView {
                         // EXPRESS no soporta list_executions (van a CloudWatch Logs):
                         // no se pide nada; el render muestra una nota.
                         self.loading = false;
-                        vec![]
+                        vec![Action::ClearFilter]
                     } else {
                         self.loading = true;
-                        vec![Action::LoadExecutions { machine_arn: m.arn }]
+                        vec![
+                            Action::ClearFilter,
+                            Action::LoadExecutions { machine_arn: m.arn },
+                        ]
                     }
                 }
                 None => vec![],
@@ -190,9 +193,12 @@ impl SfnView {
                     self.failed_state = None;
                     self.loading = true;
                     self.state.select(Some(0));
-                    vec![Action::LoadExecutionDetail {
-                        execution_arn: e.arn,
-                    }]
+                    vec![
+                        Action::ClearFilter,
+                        Action::LoadExecutionDetail {
+                            execution_arn: e.arn,
+                        },
+                    ]
                 }
                 None => vec![],
             };
@@ -228,14 +234,14 @@ impl SfnView {
             self.loading = false;
             self.state.select(Some(0));
             self.clamp_selection();
-            return vec![];
+            return vec![Action::ClearFilter];
         }
         if matches!(self.level, Level::Executions { .. }) {
             self.level = Level::Machines;
             self.loading = false;
             self.state.select(Some(0));
             self.clamp_selection();
-            return vec![];
+            return vec![Action::ClearFilter];
         }
         vec![Action::Back]
     }
@@ -849,10 +855,10 @@ mod tests {
         )]));
         let actions = v.on_key(key(KeyCode::Enter));
         match actions.as_slice() {
-            [Action::LoadExecutions { machine_arn }] => {
+            [Action::ClearFilter, Action::LoadExecutions { machine_arn }] => {
                 assert!(machine_arn.ends_with("order-saga"))
             }
-            other => panic!("se esperaba LoadExecutions, llegó {other:?}"),
+            other => panic!("se esperaba ClearFilter+LoadExecutions, llegó {other:?}"),
         }
         assert!(matches!(v.level, Level::Executions { .. }));
     }
@@ -866,8 +872,8 @@ mod tests {
         )]));
         let actions = v.on_key(key(KeyCode::Enter));
         assert!(
-            actions.is_empty(),
-            "EXPRESS no dispara list_executions (evita el error del SDK)"
+            matches!(actions.as_slice(), [Action::ClearFilter]),
+            "EXPRESS no dispara list_executions (evita el error del SDK); solo limpia el filtro"
         );
         assert!(matches!(
             v.level,
@@ -891,16 +897,19 @@ mod tests {
         });
         let actions = v.on_key(key(KeyCode::Enter)); // → Detail
         match actions.as_slice() {
-            [Action::LoadExecutionDetail { execution_arn }] => {
+            [
+                Action::ClearFilter,
+                Action::LoadExecutionDetail { execution_arn },
+            ] => {
                 assert!(execution_arn.ends_with("e1"))
             }
-            other => panic!("se esperaba LoadExecutionDetail, llegó {other:?}"),
+            other => panic!("se esperaba ClearFilter+LoadExecutionDetail, llegó {other:?}"),
         }
         assert!(matches!(v.level, Level::Detail { .. }));
 
-        // esc: Detail → Executions (con la lista cacheada).
+        // esc: Detail → Executions (con la lista cacheada); limpia el filtro al subir.
         let actions = v.on_key(key(KeyCode::Esc));
-        assert!(actions.is_empty());
+        assert!(matches!(actions.as_slice(), [Action::ClearFilter]));
         assert!(matches!(v.level, Level::Executions { .. }));
         assert_eq!(v.visible_len(), 1, "las ejecuciones siguen cacheadas");
     }
@@ -928,8 +937,8 @@ mod tests {
         v.on_key(key(KeyCode::Enter)); // → Executions
         let actions = v.on_key(key(KeyCode::Esc));
         assert!(
-            actions.is_empty(),
-            "esc en executions se consume en la vista"
+            matches!(actions.as_slice(), [Action::ClearFilter]),
+            "esc en executions se consume en la vista (limpia el filtro al subir de nivel)"
         );
         assert!(matches!(v.level, Level::Machines));
     }

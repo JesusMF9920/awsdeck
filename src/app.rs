@@ -362,6 +362,15 @@ impl App {
             Action::ActivateView(id) => self.activate_view(&id),
             // `esc` en la raíz de una vista: volver al menú principal.
             Action::Back => self.go_home(),
+            // La vista cambió de nivel de drill: el filtro del nivel anterior no
+            // debe arrastrarse. `fire_search_now` recarga la página sin filtro en
+            // vistas server-side (logs, guardado por nivel); en client-side es no-op.
+            Action::ClearFilter => {
+                if !self.filter.is_empty() {
+                    self.clear_filter();
+                    self.fire_search_now();
+                }
+            }
             Action::SwitchEnv(env) => self.switch_env(env),
             // Gate prod-safe: las mutantes pasan por modo escritura + confirm.
             mutating if is_mutating(&mutating) => self.request_confirm(mutating),
@@ -836,6 +845,53 @@ mod tests {
         let status = app.status.as_ref().expect("debe haber status");
         assert!(status.error);
         assert!(status.text.contains("desconocido"));
+    }
+
+    /// Vista que simula un cambio de nivel: cualquier tecla emite `ClearFilter`
+    /// (como hacen las vistas reales al drillear/back).
+    struct DrillingView;
+    impl View for DrillingView {
+        fn id(&self) -> &'static str {
+            "logs"
+        }
+        fn title(&self) -> String {
+            "logs".to_string()
+        }
+        fn on_activate(&mut self) -> Vec<Action> {
+            Vec::new()
+        }
+        fn on_key(&mut self, _key: KeyEvent) -> Vec<Action> {
+            vec![Action::ClearFilter]
+        }
+        fn on_message(&mut self, _message: &Message) {}
+        fn set_filter(&mut self, _filter: &str) {}
+        fn render(&mut self, _frame: &mut Frame, _area: Rect) {}
+    }
+
+    #[test]
+    fn clear_filter_action_empties_filter() {
+        let mut app = test_app();
+        app.filter = "order".to_string();
+        app.dispatch(Action::ClearFilter);
+        assert!(app.filter.is_empty(), "ClearFilter vacía el filtro del App");
+    }
+
+    #[test]
+    fn drill_within_view_clears_app_filter() {
+        let (tx, rx) = mpsc::channel(8);
+        let env = Env::new("default", "us-east-1");
+        let effects = Effects::new_mock(tx, env.clone());
+        let mut registry = Registry::new();
+        registry.register(Box::new(DrillingView));
+        let mut app = App::new(env, registry, effects, rx);
+        type_command(&mut app, "logs"); // activa la vista
+        app.filter = "order".to_string();
+        // Tecla normal que la vista convierte en cambio de nivel (emite ClearFilter).
+        app.on_key(ch('x'));
+        assert!(
+            app.filter.is_empty(),
+            "drillear limpia el filtro heredado del nivel anterior"
+        );
     }
 
     fn profile(name: &str, region: Option<&str>) -> ProfileEntry {

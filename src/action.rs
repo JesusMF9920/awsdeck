@@ -19,6 +19,10 @@ pub enum Action {
     /// despojar (está en su raíz); el `App` la interpreta como "volver al menú".
     /// La vista nunca nombra al menú: solo dice "atrás".
     Back,
+    /// Limpiar el filtro activo. La vista la emite al cambiar de nivel de drill
+    /// (entrar a un hijo o subir a un padre), para que el filtro de un nivel no se
+    /// arrastre al siguiente (estilo k9s). El `App` —dueño del filtro— la ejecuta.
+    ClearFilter,
     /// Cambiar de ambiente: sube el epoch, reconstruye el `AwsContext` y refresca.
     SwitchEnv(Env),
 

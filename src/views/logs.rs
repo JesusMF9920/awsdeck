@@ -136,7 +136,9 @@ impl LogsView {
                     self.streams.clear();
                     self.loading = true;
                     self.state.select(Some(0));
-                    vec![Action::LoadLogStreams { group }]
+                    // ClearFilter evita que el filtro de groups (server-side) se
+                    // arrastre a los streams (client-side, otro dominio).
+                    vec![Action::ClearFilter, Action::LoadLogStreams { group }]
                 }
                 None => vec![],
             },
@@ -150,10 +152,18 @@ impl LogsView {
     fn back(&mut self) -> Vec<Action> {
         if matches!(self.level, Level::Streams { .. }) {
             self.level = Level::Groups;
-            self.loading = false; // los groups siguen en cache
             self.state.select(Some(0));
             self.clamp_selection();
-            vec![]
+            // Si veníamos de una búsqueda server-side, los groups en cache están
+            // acotados a esa query; como el filtro ya se limpió al drillear,
+            // recargamos la página completa. Sin búsqueda previa, siguen en cache.
+            if self.last_query.take().is_some() {
+                self.loading = true;
+                vec![Action::LoadLogGroups { query: None }]
+            } else {
+                self.loading = false;
+                vec![]
+            }
         } else {
             vec![Action::Back]
         }
@@ -502,8 +512,10 @@ mod tests {
         v.on_key(key(KeyCode::Down)); // selecciona el segundo
         let actions = v.on_key(key(KeyCode::Enter));
         match actions.as_slice() {
-            [Action::LoadLogStreams { group }] => assert_eq!(group, "/ecs/checkout"),
-            other => panic!("se esperaba LoadLogStreams, llegó {other:?}"),
+            [Action::ClearFilter, Action::LoadLogStreams { group }] => {
+                assert_eq!(group, "/ecs/checkout")
+            }
+            other => panic!("se esperaba ClearFilter+LoadLogStreams, llegó {other:?}"),
         }
         assert!(matches!(v.level, Level::Streams { .. }));
 

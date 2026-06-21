@@ -76,7 +76,11 @@ impl Effects {
             Action::RedriveExecution { execution_arn } => {
                 self.redrive_execution(execution_arn, epoch)
             }
-            Action::Quit | Action::ActivateView(_) | Action::Back | Action::SwitchEnv(_) => {}
+            Action::Quit
+            | Action::ActivateView(_)
+            | Action::Back
+            | Action::ClearFilter
+            | Action::SwitchEnv(_) => {}
         }
     }
 

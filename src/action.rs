@@ -32,8 +32,16 @@ pub enum Action {
     LoadQueues,
     /// Hacer drill a una cola: attributes + peek de mensajes.
     LoadQueueDetail { queue_url: String },
+    /// Pedir las state machines de Step Functions del ambiente activo.
+    LoadStateMachines,
+    /// Hacer drill a una máquina: sus ejecuciones (más recientes primero).
+    LoadExecutions { machine_arn: String },
+    /// Hacer drill a una ejecución: describe + history (timeline de estados).
+    LoadExecutionDetail { execution_arn: String },
 
     // --- Mutantes: gated por el `App` (modo escritura + confirm) antes de effects ---
     /// Purgar una cola: borra TODOS sus mensajes. Irreversible.
     PurgeQueue { queue_url: String },
+    /// Redrive de una ejecución fallida: la relanza desde el último estado fallido.
+    RedriveExecution { execution_arn: String },
 }

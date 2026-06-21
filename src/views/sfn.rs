@@ -1,0 +1,1031 @@
+//! Vista `sfn`: Step Functions. Primer drill de 3 niveles: state machines →
+//! ejecuciones (status coloreado) → detalle (input/output, error/cause y timeline
+//! de estados con duración, resaltando el que reventó). Pura y síncrona; NUNCA
+//! importa `aws-sdk-*` (recibe DTOs planos vía `on_message`).
+//!
+//! `R` en el detalle emite la intención `RedriveExecution`; la vista NO sabe de
+//! modo escritura ni confirm: ese gate vive en el `App` (reusa el de `PurgeQueue`).
+
+use ratatui::Frame;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+
+use super::View;
+use crate::action::Action;
+use crate::message::{
+    ExecStatus, ExecutionDetailDto, ExecutionDto, MachineType, Message, StateMachineDto,
+    StateSpanDto,
+};
+use crate::util::{fmt_epoch_millis, fuzzy_score, ranked};
+
+/// Nivel de drill actual. Cada nivel carga los identificadores que `back()`
+/// necesita para reconstruir el padre y que `on_message` usa como guard.
+enum Level {
+    Machines,
+    Executions {
+        machine_arn: String,
+        machine_name: String,
+        machine_type: MachineType,
+    },
+    Detail {
+        machine_arn: String,
+        machine_name: String,
+        machine_type: MachineType,
+        execution_arn: String,
+    },
+}
+
+pub struct SfnView {
+    level: Level,
+    machines: Vec<StateMachineDto>,
+    executions: Vec<ExecutionDto>,
+    detail: Option<ExecutionDetailDto>,
+    history: Vec<StateSpanDto>,
+    failed_state: Option<String>,
+    filter: String,
+    loading: bool,
+    state: ListState,
+}
+
+impl SfnView {
+    pub fn new() -> Self {
+        Self {
+            level: Level::Machines,
+            machines: Vec::new(),
+            executions: Vec::new(),
+            detail: None,
+            history: Vec::new(),
+            failed_state: None,
+            filter: String::new(),
+            loading: false,
+            state: ListState::default().with_selected(Some(0)),
+        }
+    }
+
+    // --- Filtrado / selección -------------------------------------------------
+
+    fn filtered_machine_indices(&self) -> Vec<usize> {
+        ranked(self.machines.len(), &self.filter, |i| {
+            fuzzy_score(&self.machines[i].name, &self.filter)
+        })
+    }
+
+    fn filtered_execution_indices(&self) -> Vec<usize> {
+        ranked(self.executions.len(), &self.filter, |i| {
+            fuzzy_score(&self.executions[i].name, &self.filter)
+        })
+    }
+
+    /// Tamaño de la lista navegable del nivel activo (el timeline no se filtra).
+    fn visible_len(&self) -> usize {
+        match self.level {
+            Level::Machines => self.filtered_machine_indices().len(),
+            Level::Executions { .. } => self.filtered_execution_indices().len(),
+            Level::Detail { .. } => self.history.len(),
+        }
+    }
+
+    fn move_selection(&mut self, delta: i32) {
+        let len = self.visible_len();
+        if len == 0 {
+            self.state.select(None);
+            return;
+        }
+        let cur = self.state.selected().unwrap_or(0) as i32;
+        let next = (cur + delta).clamp(0, len as i32 - 1) as usize;
+        self.state.select(Some(next));
+    }
+
+    fn select_edge(&mut self, last: bool) {
+        let len = self.visible_len();
+        if len == 0 {
+            self.state.select(None);
+        } else {
+            self.state.select(Some(if last { len - 1 } else { 0 }));
+        }
+    }
+
+    fn clamp_selection(&mut self) {
+        let len = self.visible_len();
+        match self.state.selected() {
+            _ if len == 0 => self.state.select(None),
+            Some(i) if i >= len => self.state.select(Some(len - 1)),
+            None => self.state.select(Some(0)),
+            Some(_) => {}
+        }
+    }
+
+    fn selected_machine(&self) -> Option<StateMachineDto> {
+        let sel = self.state.selected()?;
+        let idx = *self.filtered_machine_indices().get(sel)?;
+        Some(self.machines[idx].clone())
+    }
+
+    fn selected_execution(&self) -> Option<ExecutionDto> {
+        let sel = self.state.selected()?;
+        let idx = *self.filtered_execution_indices().get(sel)?;
+        Some(self.executions[idx].clone())
+    }
+
+    // --- Navegación -----------------------------------------------------------
+
+    fn drill(&mut self) -> Vec<Action> {
+        if matches!(self.level, Level::Machines) {
+            return match self.selected_machine() {
+                Some(m) => {
+                    let express = m.machine_type == MachineType::Express;
+                    self.level = Level::Executions {
+                        machine_arn: m.arn.clone(),
+                        machine_name: m.name.clone(),
+                        machine_type: m.machine_type,
+                    };
+                    self.executions.clear();
+                    self.state.select(Some(0));
+                    if express {
+                        // EXPRESS no soporta list_executions (van a CloudWatch Logs):
+                        // no se pide nada; el render muestra una nota.
+                        self.loading = false;
+                        vec![]
+                    } else {
+                        self.loading = true;
+                        vec![Action::LoadExecutions { machine_arn: m.arn }]
+                    }
+                }
+                None => vec![],
+            };
+        }
+
+        // Executions → Detail (clona el contexto del nivel antes de mutarlo).
+        let ctx = if let Level::Executions {
+            machine_arn,
+            machine_name,
+            machine_type,
+        } = &self.level
+        {
+            Some((machine_arn.clone(), machine_name.clone(), *machine_type))
+        } else {
+            None
+        };
+        if let Some((machine_arn, machine_name, machine_type)) = ctx {
+            return match self.selected_execution() {
+                Some(e) => {
+                    self.level = Level::Detail {
+                        machine_arn,
+                        machine_name,
+                        machine_type,
+                        execution_arn: e.arn.clone(),
+                    };
+                    self.detail = None;
+                    self.history.clear();
+                    self.failed_state = None;
+                    self.loading = true;
+                    self.state.select(Some(0));
+                    vec![Action::LoadExecutionDetail {
+                        execution_arn: e.arn,
+                    }]
+                }
+                None => vec![],
+            };
+        }
+
+        vec![] // Detail: enter no hace nada (v2 es solo-lectura del timeline)
+    }
+
+    /// `esc`: despoja un nivel; en la raíz (machines) emite `Back` (→ menú).
+    fn back(&mut self) -> Vec<Action> {
+        // Detail → Executions (reconstruido con lo que Detail carga; la lista de
+        // ejecuciones sigue cacheada, así que no se recarga).
+        let ctx = if let Level::Detail {
+            machine_arn,
+            machine_name,
+            machine_type,
+            ..
+        } = &self.level
+        {
+            Some((machine_arn.clone(), machine_name.clone(), *machine_type))
+        } else {
+            None
+        };
+        if let Some((machine_arn, machine_name, machine_type)) = ctx {
+            self.level = Level::Executions {
+                machine_arn,
+                machine_name,
+                machine_type,
+            };
+            self.detail = None;
+            self.history.clear();
+            self.failed_state = None;
+            self.loading = false;
+            self.state.select(Some(0));
+            self.clamp_selection();
+            return vec![];
+        }
+        if matches!(self.level, Level::Executions { .. }) {
+            self.level = Level::Machines;
+            self.loading = false;
+            self.state.select(Some(0));
+            self.clamp_selection();
+            return vec![];
+        }
+        vec![Action::Back]
+    }
+
+    fn refresh(&mut self) -> Vec<Action> {
+        let actions = match &self.level {
+            Level::Machines => vec![Action::LoadStateMachines],
+            Level::Executions {
+                machine_arn,
+                machine_type,
+                ..
+            } => {
+                if *machine_type == MachineType::Express {
+                    vec![]
+                } else {
+                    vec![Action::LoadExecutions {
+                        machine_arn: machine_arn.clone(),
+                    }]
+                }
+            }
+            Level::Detail { execution_arn, .. } => vec![Action::LoadExecutionDetail {
+                execution_arn: execution_arn.clone(),
+            }],
+        };
+        self.loading = !actions.is_empty();
+        actions
+    }
+
+    /// `R` en el detalle: emite la intención de redrive SOLO si la ejecución es
+    /// redrivable (FAILED/TIMED_OUT/ABORTED). El App la gatea (modo escritura +
+    /// confirm). En ejecuciones sanas/en curso no ofrece nada.
+    fn redrive_intent(&self) -> Vec<Action> {
+        if let Level::Detail { execution_arn, .. } = &self.level
+            && self
+                .detail
+                .as_ref()
+                .is_some_and(|d| d.status.is_redrivable())
+        {
+            return vec![Action::RedriveExecution {
+                execution_arn: execution_arn.clone(),
+            }];
+        }
+        vec![]
+    }
+
+    // --- Render ---------------------------------------------------------------
+
+    fn machines_title(&self) -> String {
+        let total = self.machines.len();
+        let shown = self.filtered_machine_indices().len();
+        if self.filter.is_empty() {
+            format!(" {total} state machines ")
+        } else {
+            format!(" {shown}/{total} state machines · filtro: {} ", self.filter)
+        }
+    }
+
+    fn executions_title(&self) -> String {
+        let name = match &self.level {
+            Level::Executions { machine_name, .. } | Level::Detail { machine_name, .. } => {
+                machine_name.as_str()
+            }
+            Level::Machines => "",
+        };
+        let total = self.executions.len();
+        let shown = self.filtered_execution_indices().len();
+        if self.filter.is_empty() {
+            format!(" {name} · {total} ejecuciones ")
+        } else {
+            format!(" {name} · {shown}/{total} · filtro: {} ", self.filter)
+        }
+    }
+
+    fn timeline_title(&self) -> String {
+        let n = self.history.len();
+        if self
+            .detail
+            .as_ref()
+            .is_some_and(|d| d.status.is_redrivable())
+        {
+            format!(" timeline · {n} estados · [R] redrive ")
+        } else {
+            format!(" timeline · {n} estados ")
+        }
+    }
+
+    fn detail_header(&self) -> Paragraph<'static> {
+        let block = Block::bordered().title(" ejecución ");
+        let Some(d) = &self.detail else {
+            let msg = if self.loading { "cargando…" } else { "—" };
+            return Paragraph::new(msg).block(block);
+        };
+        let started = d
+            .start_ts
+            .map(fmt_epoch_millis)
+            .unwrap_or_else(|| "—".to_string());
+        let dur = duration_label(d.start_ts, d.stop_ts);
+        let redrive = d
+            .redrive_count
+            .filter(|&n| n > 0)
+            .map(|n| format!("   redrive {n}"))
+            .unwrap_or_default();
+
+        let mut lines = vec![Line::from(vec![
+            Span::styled(format!("{:<9}", "status"), Style::new().dark_gray()),
+            Span::styled(d.status.label(), Style::new().fg(status_color(d.status))),
+            Span::raw(format!("   inicio {started}   duración {dur}{redrive}")),
+        ])];
+        if let Some(e) = &d.error {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:<9}", "error"), Style::new().dark_gray()),
+                Span::styled(oneline(e, 80), Style::new().fg(Color::Red)),
+            ]));
+        }
+        if let Some(c) = &d.cause {
+            lines.push(row("cause", oneline(c, 80)));
+        }
+        if let Some(i) = &d.input {
+            lines.push(row("input", oneline(i, 80)));
+        }
+        if let Some(o) = &d.output {
+            lines.push(row("output", oneline(o, 80)));
+        }
+        Paragraph::new(lines).block(block)
+    }
+
+    fn render_list(&mut self, frame: &mut Frame, area: Rect, block: Block, items: Vec<ListItem>) {
+        if items.is_empty() {
+            let msg = if self.loading {
+                "cargando…"
+            } else if self.filter.is_empty() {
+                "(sin resultados)"
+            } else {
+                "(sin coincidencias para el filtro)"
+            };
+            frame.render_widget(Paragraph::new(msg).block(block), area);
+            return;
+        }
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(Style::new().reversed())
+            .highlight_symbol("› ");
+        frame.render_stateful_widget(list, area, &mut self.state);
+    }
+}
+
+impl Default for SfnView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl View for SfnView {
+    fn id(&self) -> &'static str {
+        "sfn"
+    }
+
+    fn description(&self) -> &'static str {
+        "Step Functions: ejecuciones, timeline, redrive"
+    }
+
+    fn title(&self) -> String {
+        match &self.level {
+            Level::Machines => "sfn".to_string(),
+            Level::Executions { machine_name, .. } => format!("sfn / {machine_name}"),
+            Level::Detail {
+                machine_name,
+                execution_arn,
+                ..
+            } => format!("sfn / {machine_name} / {}", short_exec(execution_arn)),
+        }
+    }
+
+    fn on_activate(&mut self) -> Vec<Action> {
+        self.level = Level::Machines;
+        self.executions.clear();
+        self.detail = None;
+        self.history.clear();
+        self.failed_state = None;
+        self.loading = true;
+        self.state.select(Some(0));
+        vec![Action::LoadStateMachines]
+    }
+
+    fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.move_selection(1);
+                vec![]
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.move_selection(-1);
+                vec![]
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.select_edge(false);
+                vec![]
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                self.select_edge(true);
+                vec![]
+            }
+            KeyCode::Enter => self.drill(),
+            KeyCode::Esc => self.back(),
+            KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('R') => self.redrive_intent(),
+            _ => vec![],
+        }
+    }
+
+    fn on_message(&mut self, message: &Message) {
+        match message {
+            Message::StateMachinesLoaded(machines) => {
+                self.machines = machines.clone();
+                if matches!(self.level, Level::Machines) {
+                    self.loading = false;
+                    self.clamp_selection();
+                }
+            }
+            Message::ExecutionsLoaded {
+                machine_arn,
+                executions,
+            } => {
+                if let Level::Executions {
+                    machine_arn: current,
+                    ..
+                } = &self.level
+                    && current == machine_arn
+                {
+                    self.executions = executions.clone();
+                    self.loading = false;
+                    self.clamp_selection();
+                }
+            }
+            Message::ExecutionDetailLoaded {
+                execution_arn,
+                detail,
+                history,
+                failed_state,
+            } => {
+                if let Level::Detail {
+                    execution_arn: current,
+                    ..
+                } = &self.level
+                    && current == execution_arn
+                {
+                    self.detail = Some(detail.clone());
+                    self.history = history.clone();
+                    self.failed_state = failed_state.clone();
+                    self.loading = false;
+                    // Saltar al estado que reventó (si lo hay).
+                    let idx = self
+                        .failed_state
+                        .as_ref()
+                        .and_then(|fs| self.history.iter().position(|s| &s.name == fs));
+                    self.state.select(Some(idx.unwrap_or(0)));
+                    self.clamp_selection();
+                }
+            }
+            Message::ExecutionRedriven { execution_arn } => {
+                // El App muestra info y re-dispara LoadExecutionDetail; aquí
+                // marcamos recarga.
+                if let Level::Detail {
+                    execution_arn: current,
+                    ..
+                } = &self.level
+                    && current == execution_arn
+                {
+                    self.loading = true;
+                }
+            }
+            Message::Error(_) => self.loading = false,
+            // Mensajes de otras vistas: se ignoran.
+            _ => {}
+        }
+    }
+
+    fn set_filter(&mut self, filter: &str) {
+        self.filter = filter.to_string();
+        self.state.select(Some(0)); // top = mejor match (estilo fzf)
+        self.clamp_selection();
+    }
+
+    fn render(&mut self, frame: &mut Frame, area: Rect) {
+        match &self.level {
+            Level::Machines => {
+                let block = Block::bordered().title(self.machines_title());
+                let items: Vec<ListItem> = self
+                    .filtered_machine_indices()
+                    .into_iter()
+                    .map(|i| machine_item(&self.machines[i]))
+                    .collect();
+                self.render_list(frame, area, block, items);
+            }
+            Level::Executions {
+                machine_type: MachineType::Express,
+                ..
+            } => {
+                let block = Block::bordered().title(self.executions_title());
+                let note = "EXPRESS: las ejecuciones no se listan vía API \
+                    (van a CloudWatch Logs). Úsalas desde la vista logs.";
+                frame.render_widget(Paragraph::new(note).block(block), area);
+            }
+            Level::Executions { .. } => {
+                let block = Block::bordered().title(self.executions_title());
+                let items: Vec<ListItem> = self
+                    .filtered_execution_indices()
+                    .into_iter()
+                    .map(|i| execution_item(&self.executions[i]))
+                    .collect();
+                self.render_list(frame, area, block, items);
+            }
+            Level::Detail { .. } => {
+                let [head, timeline] =
+                    Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).areas(area);
+                frame.render_widget(self.detail_header(), head);
+
+                let block = Block::bordered().title(self.timeline_title());
+                let items: Vec<ListItem> = self.history.iter().map(span_item).collect();
+                if items.is_empty() {
+                    let msg = if self.loading {
+                        "cargando…"
+                    } else {
+                        "(sin history)"
+                    };
+                    frame.render_widget(Paragraph::new(msg).block(block), timeline);
+                    return;
+                }
+                let list = List::new(items)
+                    .block(block)
+                    .highlight_style(Style::new().reversed())
+                    .highlight_symbol("› ");
+                frame.render_stateful_widget(list, timeline, &mut self.state);
+            }
+        }
+    }
+}
+
+// --- Construcción de filas y helpers ------------------------------------------
+
+fn status_color(s: ExecStatus) -> Color {
+    match s {
+        ExecStatus::Succeeded => Color::Green,
+        ExecStatus::Failed | ExecStatus::TimedOut | ExecStatus::Aborted => Color::Red,
+        ExecStatus::Running => Color::Yellow,
+        ExecStatus::PendingRedrive => Color::Cyan,
+    }
+}
+
+/// Duración legible de milisegundos: `"3.4s"`, `"2m 5s"`, `"1h 12m"`.
+fn fmt_dur(ms: i64) -> String {
+    if ms < 0 {
+        return "—".to_string();
+    }
+    let secs = ms / 1000;
+    if secs < 60 {
+        format!("{}.{}s", secs, (ms % 1000) / 100)
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+fn duration_label(start: Option<i64>, stop: Option<i64>) -> String {
+    match (start, stop) {
+        (Some(a), Some(b)) => fmt_dur(b - a),
+        (Some(_), None) => "en curso".to_string(),
+        _ => "—".to_string(),
+    }
+}
+
+fn short_exec(arn: &str) -> &str {
+    arn.rsplit(':').next().unwrap_or(arn)
+}
+
+/// Colapsa un payload multilínea a una sola línea truncada (para previews).
+fn oneline(s: &str, max: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > max {
+        format!("{}…", flat.chars().take(max).collect::<String>())
+    } else {
+        flat
+    }
+}
+
+fn row(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<9}"), Style::new().dark_gray()),
+        Span::raw(value),
+    ])
+}
+
+fn machine_item(m: &StateMachineDto) -> ListItem<'static> {
+    let badge = match m.machine_type {
+        MachineType::Express => "[express]",
+        MachineType::Standard => "[standard]",
+    };
+    let created = m
+        .created_ts
+        .map(fmt_epoch_millis)
+        .unwrap_or_else(|| "—".to_string());
+    ListItem::new(Line::from(vec![
+        Span::raw(m.name.clone()),
+        Span::raw("  "),
+        Span::styled(badge, Style::new().dark_gray()),
+        Span::raw("  "),
+        Span::styled(created, Style::new().dark_gray()),
+    ]))
+}
+
+fn execution_item(e: &ExecutionDto) -> ListItem<'static> {
+    let when = e
+        .start_ts
+        .map(fmt_epoch_millis)
+        .unwrap_or_else(|| "—".to_string());
+    let dur = duration_label(e.start_ts, e.stop_ts);
+    ListItem::new(Line::from(vec![
+        Span::styled(
+            format!("{:<15}", e.status.label()),
+            Style::new().fg(status_color(e.status)),
+        ),
+        Span::raw(e.name.clone()),
+        Span::raw("  "),
+        Span::styled(format!("{when}  {dur}"), Style::new().dark_gray()),
+    ]))
+}
+
+fn span_item(s: &StateSpanDto) -> ListItem<'static> {
+    let dur = match (s.entered_ts, s.exited_ts) {
+        (Some(a), Some(b)) => fmt_dur(b - a),
+        _ => "—".to_string(),
+    };
+    let (marker, name_style) = if s.failed {
+        ("✗ ", Style::new().fg(Color::Red).bold())
+    } else {
+        ("  ", Style::new())
+    };
+    ListItem::new(Line::from(vec![
+        Span::styled(format!("{marker}{}", s.name), name_style),
+        Span::raw("  "),
+        Span::styled(dur, Style::new().dark_gray()),
+    ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn machine(name: &str, machine_type: MachineType) -> StateMachineDto {
+        StateMachineDto {
+            arn: format!("arn:aws:states:us-east-1:000:stateMachine:{name}"),
+            name: name.to_string(),
+            machine_type,
+            created_ts: Some(1_700_000_000_000),
+        }
+    }
+
+    fn exec(name: &str, status: ExecStatus) -> ExecutionDto {
+        ExecutionDto {
+            arn: format!("arn:aws:states:us-east-1:000:execution:m1:{name}"),
+            name: name.to_string(),
+            status,
+            start_ts: Some(1_700_000_000_000),
+            stop_ts: Some(1_700_000_045_000),
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        use ratatui::crossterm::event::KeyModifiers;
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Lleva la vista a `Detail` con un detalle del status dado.
+    fn view_in_detail(status: ExecStatus) -> SfnView {
+        let mut v = SfnView::new();
+        v.on_message(&Message::StateMachinesLoaded(vec![machine(
+            "m1",
+            MachineType::Standard,
+        )]));
+        v.on_key(key(KeyCode::Enter)); // → Executions
+        let machine_arn = "arn:aws:states:us-east-1:000:stateMachine:m1".to_string();
+        v.on_message(&Message::ExecutionsLoaded {
+            machine_arn,
+            executions: vec![exec("e1", status)],
+        });
+        v.on_key(key(KeyCode::Enter)); // → Detail
+        let execution_arn = exec("e1", status).arn;
+        v.on_message(&Message::ExecutionDetailLoaded {
+            execution_arn,
+            detail: ExecutionDetailDto {
+                status,
+                start_ts: Some(1_700_000_000_000),
+                stop_ts: Some(1_700_000_012_000),
+                input: Some("{\"a\":1}".into()),
+                output: None,
+                error: status.is_redrivable().then(|| "States.TaskFailed".into()),
+                cause: status.is_redrivable().then(|| "boom".into()),
+                redrive_count: Some(0),
+            },
+            history: vec![
+                StateSpanDto {
+                    name: "Validate".into(),
+                    entered_ts: Some(0),
+                    exited_ts: Some(2_000),
+                    failed: false,
+                },
+                StateSpanDto {
+                    name: "ProcessOrder".into(),
+                    entered_ts: Some(2_000),
+                    exited_ts: None,
+                    failed: status.is_redrivable(),
+                },
+            ],
+            failed_state: status.is_redrivable().then(|| "ProcessOrder".into()),
+        });
+        v
+    }
+
+    #[test]
+    fn activate_requests_state_machines() {
+        let mut v = SfnView::new();
+        assert!(matches!(
+            v.on_activate().as_slice(),
+            [Action::LoadStateMachines]
+        ));
+    }
+
+    #[test]
+    fn ingests_machines_via_message() {
+        let mut v = SfnView::new();
+        v.on_message(&Message::StateMachinesLoaded(vec![
+            machine("a", MachineType::Standard),
+            machine("b", MachineType::Express),
+        ]));
+        assert_eq!(v.visible_len(), 2);
+    }
+
+    #[test]
+    fn filter_narrows_machine_list() {
+        let mut v = SfnView::new();
+        v.on_message(&Message::StateMachinesLoaded(vec![
+            machine("order-saga", MachineType::Standard),
+            machine("payment-flow", MachineType::Standard),
+            machine("ingest-fast", MachineType::Express),
+        ]));
+        v.set_filter("ORDER"); // case-insensitive
+        assert_eq!(v.visible_len(), 1);
+        // fuzzy: subsecuencia no contigua
+        v.set_filter("pyflow");
+        assert_eq!(v.visible_len(), 1);
+    }
+
+    #[test]
+    fn enter_drills_into_standard_machine_executions() {
+        let mut v = SfnView::new();
+        v.on_message(&Message::StateMachinesLoaded(vec![machine(
+            "order-saga",
+            MachineType::Standard,
+        )]));
+        let actions = v.on_key(key(KeyCode::Enter));
+        match actions.as_slice() {
+            [Action::LoadExecutions { machine_arn }] => {
+                assert!(machine_arn.ends_with("order-saga"))
+            }
+            other => panic!("se esperaba LoadExecutions, llegó {other:?}"),
+        }
+        assert!(matches!(v.level, Level::Executions { .. }));
+    }
+
+    #[test]
+    fn express_machine_does_not_request_executions() {
+        let mut v = SfnView::new();
+        v.on_message(&Message::StateMachinesLoaded(vec![machine(
+            "ingest-fast",
+            MachineType::Express,
+        )]));
+        let actions = v.on_key(key(KeyCode::Enter));
+        assert!(
+            actions.is_empty(),
+            "EXPRESS no dispara list_executions (evita el error del SDK)"
+        );
+        assert!(matches!(
+            v.level,
+            Level::Executions {
+                machine_type: MachineType::Express,
+                ..
+            }
+        ));
+        assert!(!v.loading, "no queda en loading: no hay request en vuelo");
+    }
+
+    #[test]
+    fn enter_drills_into_execution_detail_and_back() {
+        let mut v = SfnView::new();
+        v.on_message(&Message::StateMachinesLoaded(vec![machine(
+            "m1",
+            MachineType::Standard,
+        )]));
+        v.on_key(key(KeyCode::Enter)); // → Executions
+        v.on_message(&Message::ExecutionsLoaded {
+            machine_arn: "arn:aws:states:us-east-1:000:stateMachine:m1".into(),
+            executions: vec![exec("e1", ExecStatus::Succeeded)],
+        });
+        let actions = v.on_key(key(KeyCode::Enter)); // → Detail
+        match actions.as_slice() {
+            [Action::LoadExecutionDetail { execution_arn }] => {
+                assert!(execution_arn.ends_with("e1"))
+            }
+            other => panic!("se esperaba LoadExecutionDetail, llegó {other:?}"),
+        }
+        assert!(matches!(v.level, Level::Detail { .. }));
+
+        // esc: Detail → Executions (con la lista cacheada).
+        let actions = v.on_key(key(KeyCode::Esc));
+        assert!(actions.is_empty());
+        assert!(matches!(v.level, Level::Executions { .. }));
+        assert_eq!(v.visible_len(), 1, "las ejecuciones siguen cacheadas");
+    }
+
+    #[test]
+    fn esc_at_root_emits_back() {
+        let mut v = SfnView::new();
+        v.on_message(&Message::StateMachinesLoaded(vec![machine(
+            "m1",
+            MachineType::Standard,
+        )]));
+        let actions = v.on_key(key(KeyCode::Esc));
+        assert!(matches!(actions.as_slice(), [Action::Back]));
+        assert!(matches!(v.level, Level::Machines));
+    }
+
+    #[test]
+    fn esc_at_root_empty_list_emits_back() {
+        let mut v = SfnView::new();
+        let actions = v.on_key(key(KeyCode::Esc));
+        assert!(matches!(actions.as_slice(), [Action::Back]));
+    }
+
+    #[test]
+    fn esc_in_executions_pops_without_back() {
+        let mut v = SfnView::new();
+        v.on_message(&Message::StateMachinesLoaded(vec![machine(
+            "m1",
+            MachineType::Standard,
+        )]));
+        v.on_key(key(KeyCode::Enter)); // → Executions
+        let actions = v.on_key(key(KeyCode::Esc));
+        assert!(
+            actions.is_empty(),
+            "esc en executions se consume en la vista"
+        );
+        assert!(matches!(v.level, Level::Machines));
+    }
+
+    #[test]
+    fn executions_from_wrong_machine_are_ignored() {
+        let mut v = SfnView::new();
+        v.on_message(&Message::StateMachinesLoaded(vec![machine(
+            "m1",
+            MachineType::Standard,
+        )]));
+        v.on_key(key(KeyCode::Enter)); // drill m1 → Executions
+        v.on_message(&Message::ExecutionsLoaded {
+            machine_arn: "arn:aws:states:us-east-1:000:stateMachine:OTRA".into(),
+            executions: vec![exec("x", ExecStatus::Succeeded)],
+        });
+        assert_eq!(
+            v.visible_len(),
+            0,
+            "no se aceptan ejecuciones de otra máquina"
+        );
+    }
+
+    #[test]
+    fn detail_from_wrong_execution_is_ignored() {
+        let mut v = SfnView::new();
+        v.on_message(&Message::StateMachinesLoaded(vec![machine(
+            "m1",
+            MachineType::Standard,
+        )]));
+        v.on_key(key(KeyCode::Enter));
+        v.on_message(&Message::ExecutionsLoaded {
+            machine_arn: "arn:aws:states:us-east-1:000:stateMachine:m1".into(),
+            executions: vec![exec("e1", ExecStatus::Succeeded)],
+        });
+        v.on_key(key(KeyCode::Enter)); // → Detail de e1
+        v.on_message(&Message::ExecutionDetailLoaded {
+            execution_arn: "arn:…:OTRA".into(),
+            detail: ExecutionDetailDto {
+                status: ExecStatus::Succeeded,
+                start_ts: None,
+                stop_ts: None,
+                input: None,
+                output: None,
+                error: None,
+                cause: None,
+                redrive_count: None,
+            },
+            history: vec![],
+            failed_state: None,
+        });
+        assert!(
+            v.detail.is_none(),
+            "no se acepta el detalle de otra ejecución"
+        );
+    }
+
+    #[test]
+    fn redrive_emits_intent_only_when_redrivable() {
+        // FAILED → R emite RedriveExecution.
+        let mut v = view_in_detail(ExecStatus::Failed);
+        match v.on_key(key(KeyCode::Char('R'))).as_slice() {
+            [Action::RedriveExecution { execution_arn }] => assert!(execution_arn.ends_with("e1")),
+            other => panic!("se esperaba RedriveExecution, llegó {other:?}"),
+        }
+        // El estado fallido quedó preseleccionado ("saltar al que reventó").
+        assert_eq!(v.state.selected(), Some(1));
+
+        // SUCCEEDED → R no ofrece nada.
+        let mut ok = view_in_detail(ExecStatus::Succeeded);
+        assert!(ok.on_key(key(KeyCode::Char('R'))).is_empty());
+        // RUNNING tampoco es redrivable.
+        let mut run = view_in_detail(ExecStatus::Running);
+        assert!(run.on_key(key(KeyCode::Char('R'))).is_empty());
+    }
+
+    #[test]
+    fn arrow_on_empty_filter_is_safe() {
+        let mut v = SfnView::new();
+        v.on_message(&Message::StateMachinesLoaded(vec![machine(
+            "m1",
+            MachineType::Standard,
+        )]));
+        v.set_filter("zzz"); // 0 coincidencias
+        assert_eq!(v.visible_len(), 0);
+        v.on_key(key(KeyCode::Down));
+        assert_eq!(v.state.selected(), None);
+    }
+
+    #[test]
+    fn status_color_maps_terminal_states() {
+        assert_eq!(status_color(ExecStatus::Succeeded), Color::Green);
+        assert_eq!(status_color(ExecStatus::Failed), Color::Red);
+        assert_eq!(status_color(ExecStatus::Aborted), Color::Red);
+        assert_eq!(status_color(ExecStatus::Running), Color::Yellow);
+        assert_eq!(status_color(ExecStatus::PendingRedrive), Color::Cyan);
+    }
+
+    #[test]
+    fn fmt_dur_formats_durations() {
+        assert_eq!(fmt_dur(3_400), "3.4s");
+        assert_eq!(fmt_dur(125_000), "2m 5s");
+        assert_eq!(duration_label(Some(0), None), "en curso");
+        assert_eq!(duration_label(None, None), "—");
+    }
+
+    #[test]
+    fn render_machines_without_panicking() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut v = SfnView::new();
+        v.on_message(&Message::StateMachinesLoaded(vec![
+            machine("order-saga", MachineType::Standard),
+            machine("ingest-fast", MachineType::Express),
+        ]));
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal.draw(|f| v.render(f, f.area())).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("order-saga"));
+        assert!(text.contains("express"), "badge de tipo visible");
+    }
+
+    #[test]
+    fn render_detail_without_panicking() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut v = view_in_detail(ExecStatus::Failed);
+        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
+        terminal.draw(|f| v.render(f, f.area())).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("ejecución"));
+        assert!(text.contains("timeline"));
+        assert!(text.contains("ProcessOrder"), "el estado fallido aparece");
+    }
+
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+}

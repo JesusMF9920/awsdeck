@@ -10,6 +10,7 @@ use crate::action::Action;
 use crate::message::Message;
 
 pub mod logs;
+pub mod sfn;
 pub mod sqs;
 
 /// Contrato que implementa cada vista. **Síncrono y object-safe** (`Box<dyn View>`):

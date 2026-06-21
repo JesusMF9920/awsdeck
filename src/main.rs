@@ -23,6 +23,7 @@ use crate::effects::Effects;
 use crate::tui::Tui;
 use crate::views::Registry;
 use crate::views::logs::LogsView;
+use crate::views::sfn::SfnView;
 use crate::views::sqs::SqsView;
 
 #[tokio::main]
@@ -43,6 +44,7 @@ async fn main() -> Result<()> {
     let mut registry = Registry::new();
     registry.register(Box::new(LogsView::new()));
     registry.register(Box::new(SqsView::new()));
+    registry.register(Box::new(SfnView::new()));
 
     let mut app = App::new(env, registry, effects, rx);
 

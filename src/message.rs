@@ -60,6 +60,92 @@ pub struct QueueMessageDto {
     pub receive_count: Option<i64>,
 }
 
+// --- Step Functions (v2) ------------------------------------------------------
+
+/// Tipo de state machine. Enum propio plano (no el del SDK, que es
+/// `#[non_exhaustive]`): la vista nunca importa `aws-sdk-*`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MachineType {
+    Standard,
+    Express,
+}
+
+/// Estado de una ejecución. Enum propio plano (ver `MachineType`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecStatus {
+    Running,
+    Succeeded,
+    Failed,
+    TimedOut,
+    Aborted,
+    /// Encolada para redrive; ni "rojo terminal" ni redrivable.
+    PendingRedrive,
+}
+
+impl ExecStatus {
+    /// Solo las ejecuciones terminadas en fallo se pueden redrivar.
+    pub fn is_redrivable(self) -> bool {
+        matches!(self, Self::Failed | Self::TimedOut | Self::Aborted)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "RUNNING",
+            Self::Succeeded => "SUCCEEDED",
+            Self::Failed => "FAILED",
+            Self::TimedOut => "TIMED_OUT",
+            Self::Aborted => "ABORTED",
+            Self::PendingRedrive => "PENDING_REDRIVE",
+        }
+    }
+}
+
+/// Una state machine (datos para la lista).
+#[derive(Clone, Debug)]
+pub struct StateMachineDto {
+    pub arn: String,
+    pub name: String,
+    pub machine_type: MachineType,
+    pub created_ts: Option<i64>,
+}
+
+/// Una ejecución de una state machine (datos para la lista).
+#[derive(Clone, Debug)]
+pub struct ExecutionDto {
+    pub arn: String,
+    pub name: String,
+    pub status: ExecStatus,
+    pub start_ts: Option<i64>,
+    /// `None` = aún corriendo (duración "en curso").
+    pub stop_ts: Option<i64>,
+}
+
+/// Detalle de una ejecución (de `describe_execution`). `input`/`output` ya vienen
+/// pretty-printeados y truncados desde `effects`.
+#[derive(Clone, Debug)]
+pub struct ExecutionDetailDto {
+    pub status: ExecStatus,
+    pub start_ts: Option<i64>,
+    pub stop_ts: Option<i64>,
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub cause: Option<String>,
+    pub redrive_count: Option<i64>,
+}
+
+/// Un estado del timeline de ejecución, ya emparejado (entered/exited) por
+/// `effects::parse_history`. La duración la calcula la vista al render.
+#[derive(Clone, Debug)]
+pub struct StateSpanDto {
+    pub name: String,
+    pub entered_ts: Option<i64>,
+    /// `None` = abierto sin salir (terminó en fallo o aún corriendo).
+    pub exited_ts: Option<i64>,
+    /// `true` si este estado fue el que reventó.
+    pub failed: bool,
+}
+
 /// Resultado de una operación async. Específico de servicio a propósito
 /// (`message.rs` es frontera permitida para nombrar servicios).
 #[derive(Clone, Debug)]
@@ -89,6 +175,27 @@ pub enum Message {
     },
     /// Se purgó una cola (acción mutante confirmada).
     QueuePurged { queue_url: String },
+
+    // --- Step Functions (v2) ---
+    /// Se cargaron las state machines del ambiente activo.
+    StateMachinesLoaded(Vec<StateMachineDto>),
+    /// Ejecuciones de una máquina (`machine_arn` para confirmar el drill actual).
+    ExecutionsLoaded {
+        machine_arn: String,
+        executions: Vec<ExecutionDto>,
+    },
+    /// Detalle de una ejecución (`describe_execution` + history ya parseado).
+    /// `execution_arn` permite a la vista confirmar el drill actual; `failed_state`
+    /// es el estado que reventó (si lo hay), para saltar/resaltar.
+    ExecutionDetailLoaded {
+        execution_arn: String,
+        detail: ExecutionDetailDto,
+        history: Vec<StateSpanDto>,
+        failed_state: Option<String>,
+    },
+    /// Se relanzó una ejecución vía redrive (acción mutante confirmada).
+    ExecutionRedriven { execution_arn: String },
+
     /// Algo falló: se muestra en la status bar, nunca hace panic.
     Error(String),
 }

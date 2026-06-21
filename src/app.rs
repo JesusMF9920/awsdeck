@@ -478,6 +478,14 @@ impl App {
                     action,
                 }
             }
+            Action::RedriveExecution { execution_arn } => {
+                let name = execution_arn.rsplit(':').next().unwrap_or(execution_arn);
+                Confirm {
+                    title: " redrive ejecución ".to_string(),
+                    body: format!("se relanzará desde el último estado fallido:\n{name}"),
+                    action,
+                }
+            }
             // `is_mutating` ya filtró; cualquier otra no debería llegar aquí.
             _ => return,
         };
@@ -506,15 +514,22 @@ impl App {
         match &envelope.message {
             Message::Error(e) => self.set_error(e.clone()),
             Message::QueuePurged { .. } => self.set_info("cola purgada — refrescando…"),
+            Message::ExecutionRedriven { .. } => self.set_info("redrive enviado — refrescando…"),
             _ => {}
         }
         if let Some(view) = self.registry.active_mut() {
             view.on_message(&envelope.message);
         }
-        // Tras un purge confirmado, refrescar el detalle (los counts no se vacían
-        // al instante del lado del servidor).
-        if let Message::QueuePurged { queue_url } = envelope.message {
-            self.dispatch(Action::LoadQueueDetail { queue_url });
+        // Tras una mutación confirmada, refrescar el detalle (el estado del lado del
+        // servidor no se actualiza al instante).
+        match envelope.message {
+            Message::QueuePurged { queue_url } => {
+                self.dispatch(Action::LoadQueueDetail { queue_url })
+            }
+            Message::ExecutionRedriven { execution_arn } => {
+                self.dispatch(Action::LoadExecutionDetail { execution_arn })
+            }
+            _ => {}
         }
     }
 
@@ -699,7 +714,10 @@ impl App {
 
 /// `true` si la acción es mutante y debe pasar por el gate (modo escritura + confirm).
 fn is_mutating(action: &Action) -> bool {
-    matches!(action, Action::PurgeQueue { .. })
+    matches!(
+        action,
+        Action::PurgeQueue { .. } | Action::RedriveExecution { .. }
+    )
 }
 
 /// Cuerpo cuando no hay vista activa (registry vacío): guía al usuario a `:logs`.
@@ -1119,5 +1137,67 @@ mod tests {
         app.write_mode = true;
         app.dispatch(Action::SwitchEnv(Env::new("prod", "eu-west-1")));
         assert!(!app.write_mode, "cambiar de ambiente re-arma la seguridad");
+    }
+
+    // --- Gate de redrive (sfn) reusa el mismo gate genérico -------------------
+
+    fn redrive(arn: &str) -> Action {
+        Action::RedriveExecution {
+            execution_arn: arn.to_string(),
+        }
+    }
+
+    #[test]
+    fn redrive_blocked_without_write_mode() {
+        let mut app = test_app();
+        app.dispatch(redrive("arn:…:execution:m1:exec-fail"));
+        assert!(app.confirm.is_none(), "sin modo escritura no abre confirm");
+        let status = app.status.as_ref().expect("status de bloqueo");
+        assert!(status.error && status.text.contains("escritura"));
+    }
+
+    #[test]
+    fn redrive_with_write_mode_opens_confirm() {
+        let mut app = test_app();
+        app.write_mode = true;
+        app.dispatch(redrive("arn:…:execution:m1:exec-fail"));
+        assert!(app.confirm.is_some(), "con modo escritura abre el confirm");
+    }
+
+    #[tokio::test]
+    async fn confirm_y_dispatches_redrive_to_effects() {
+        let mut app = test_app_mock();
+        app.write_mode = true;
+        app.dispatch(redrive(
+            "arn:aws:states:us-east-1:000:execution:m1:exec-fail",
+        ));
+        assert!(app.confirm.is_some());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.confirm.is_none(), "y confirma y cierra el modal");
+
+        let envelope = app.rx.recv().await.expect("debe llegar un envelope");
+        assert!(matches!(
+            envelope.message,
+            Message::ExecutionRedriven { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn redriven_envelope_triggers_detail_reload() {
+        let mut app = test_app_mock();
+        let arn = "arn:aws:states:us-east-1:000:execution:m1:exec-fail".to_string();
+        app.on_envelope(Envelope::new(
+            0,
+            Message::ExecutionRedriven {
+                execution_arn: arn.clone(),
+            },
+        ));
+        // El App re-dispara LoadExecutionDetail (mock) → llega su respuesta.
+        let envelope = app.rx.recv().await.expect("debe llegar un envelope");
+        assert!(matches!(
+            envelope.message,
+            Message::ExecutionDetailLoaded { execution_arn, .. } if execution_arn == arn
+        ));
     }
 }

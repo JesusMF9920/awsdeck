@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_cloudwatchlogs::Client as LogsClient;
+use aws_sdk_sfn::Client as SfnClient;
 use aws_sdk_sqs::Client as SqsClient;
 use tokio::sync::OnceCell;
 
@@ -44,6 +45,7 @@ pub struct AwsContext {
     config: OnceCell<SdkConfig>,
     logs: OnceCell<LogsClient>,
     sqs: OnceCell<SqsClient>,
+    sfn: OnceCell<SfnClient>,
 }
 
 impl AwsContext {
@@ -53,6 +55,7 @@ impl AwsContext {
             config: OnceCell::new(),
             logs: OnceCell::new(),
             sqs: OnceCell::new(),
+            sfn: OnceCell::new(),
         }
     }
 
@@ -82,6 +85,13 @@ impl AwsContext {
     pub async fn sqs(&self) -> &SqsClient {
         self.sqs
             .get_or_init(|| async { SqsClient::new(self.config().await) })
+            .await
+    }
+
+    /// Cliente de Step Functions, cacheado de forma perezosa.
+    pub async fn sfn(&self) -> &SfnClient {
+        self.sfn
+            .get_or_init(|| async { SfnClient::new(self.config().await) })
             .await
     }
 }

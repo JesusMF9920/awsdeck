@@ -614,14 +614,20 @@ async fn fetch_execution_detail(
         redrive_count: d.redrive_count().map(i64::from),
     };
 
+    // `reverse_order(true)` trae los eventos más recientes primero: garantiza que
+    // el evento de fallo (que ocurre al FINAL del timeline) entre en la primera
+    // página aunque el history supere los 1000 eventos. Lo revertimos a orden
+    // cronológico para `parse_history` (que empareja entered→exited en orden).
     let hist = client
         .get_execution_history()
         .execution_arn(execution_arn)
         .max_results(1000)
-        .reverse_order(false)
+        .reverse_order(true)
         .send()
         .await?;
-    let (history, failed_state) = parse_history(hist.events());
+    let mut events = hist.events().to_vec();
+    events.reverse();
+    let (history, failed_state) = parse_history(&events);
 
     Ok((detail, history, failed_state))
 }
@@ -636,23 +642,28 @@ async fn redrive_execution_real(ctx: &AwsContext, execution_arn: &str) -> color_
     Ok(())
 }
 
-/// Empareja eventos `StateEntered`/`StateExited` (por nombre) en spans con duración
-/// y marca el estado que reventó. Pura → testeable sin red. "Último entered gana"
-/// si un estado se reentra (Map/Parallel/loops): aproximación aceptable.
+/// Empareja eventos `StateEntered`/`StateExited` (en orden cronológico) en spans con
+/// duración y marca el estado que reventó. Pura → testeable sin red.
+///
+/// - **Pila por nombre** (`open[name]` es una pila LIFO de índices): tolera estados
+///   homónimos abiertos a la vez (ramas Parallel / Map con concurrencia) sin huérfanos.
+/// - **Salir limpia el fallo**: un estado que falló pero luego emitió `StateExited`
+///   se recuperó (Retry/Catch) → se desmarca; solo queda `failed` el que no salió.
+/// - **Fallo por tipo de evento** (`*Failed`/`*TimedOut`/`*Aborted`): cubre todos los
+///   modos terminales (incluye TIMED_OUT y ABORTED, no solo `*Failed`).
 fn parse_history(
     events: &[aws_sdk_sfn::types::HistoryEvent],
 ) -> (Vec<StateSpanDto>, Option<String>) {
     use std::collections::HashMap;
 
     let mut spans: Vec<StateSpanDto> = Vec::new();
-    let mut open: HashMap<String, usize> = HashMap::new();
-    let mut failed_state: Option<String> = None;
+    let mut open: HashMap<String, Vec<usize>> = HashMap::new();
 
     for ev in events {
         let ts = dt_millis(ev.timestamp());
         if let Some(d) = ev.state_entered_event_details() {
             let name = d.name().to_string();
-            open.insert(name.clone(), spans.len());
+            open.entry(name.clone()).or_default().push(spans.len());
             spans.push(StateSpanDto {
                 name,
                 entered_ts: ts,
@@ -660,30 +671,33 @@ fn parse_history(
                 failed: false,
             });
         } else if let Some(d) = ev.state_exited_event_details() {
-            if let Some(&idx) = open.get(d.name()) {
+            // Cierra el span homónimo más reciente (LIFO); salir = se recuperó.
+            if let Some(idx) = open.get_mut(d.name()).and_then(Vec::pop) {
                 spans[idx].exited_ts = ts;
+                spans[idx].failed = false;
             }
         } else if is_failure_event(ev) {
-            // El estado que reventó es el último span abierto (sin exited) sin marcar.
-            if let Some(span) = spans
-                .iter_mut()
-                .rev()
-                .find(|s| s.exited_ts.is_none() && !s.failed)
-            {
-                span.failed = true;
-                failed_state = Some(span.name.clone());
+            // El estado que reventó es el span abierto más reciente (innermost).
+            if let Some(&idx) = open.values().flatten().max() {
+                spans[idx].failed = true;
             }
         }
     }
 
+    let failed_state = spans
+        .iter()
+        .rev()
+        .find(|s| s.failed)
+        .map(|s| s.name.clone());
     (spans, failed_state)
 }
 
+/// `true` para eventos terminales de fallo/timeout/abort. Detecta por el nombre del
+/// tipo (`*Failed`/`*TimedOut`/`*Aborted`) para cubrir TODOS los modos del SDK
+/// —incluidos los nuevos— sin enumerar cada `*_event_details`.
 fn is_failure_event(ev: &aws_sdk_sfn::types::HistoryEvent) -> bool {
-    ev.execution_failed_event_details().is_some()
-        || ev.task_failed_event_details().is_some()
-        || ev.lambda_function_failed_event_details().is_some()
-        || ev.activity_failed_event_details().is_some()
+    let t = ev.r#type().as_str();
+    t.contains("Failed") || t.contains("TimedOut") || t.contains("Aborted")
 }
 
 // --- Mock (tests / sin red) ---------------------------------------------------
@@ -1221,73 +1235,128 @@ mod tests {
         );
     }
 
+    // Constructores de `HistoryEvent` para los tests de `parse_history`.
+    fn ev_entered(id: i64, ts: i64, name: &str) -> aws_sdk_sfn::types::HistoryEvent {
+        use aws_sdk_sfn::primitives::DateTime;
+        use aws_sdk_sfn::types::{HistoryEvent, HistoryEventType as T, StateEnteredEventDetails};
+        HistoryEvent::builder()
+            .id(id)
+            .timestamp(DateTime::from_millis(ts))
+            .r#type(T::TaskStateEntered)
+            .state_entered_event_details(
+                StateEnteredEventDetails::builder()
+                    .name(name)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap()
+    }
+    fn ev_exited(id: i64, ts: i64, name: &str) -> aws_sdk_sfn::types::HistoryEvent {
+        use aws_sdk_sfn::primitives::DateTime;
+        use aws_sdk_sfn::types::{HistoryEvent, HistoryEventType as T, StateExitedEventDetails};
+        HistoryEvent::builder()
+            .id(id)
+            .timestamp(DateTime::from_millis(ts))
+            .r#type(T::TaskStateExited)
+            .state_exited_event_details(
+                StateExitedEventDetails::builder()
+                    .name(name)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap()
+    }
+    /// Evento de fallo/timeout/abort por tipo (sin detalles de estado): `is_failure_event`
+    /// lo detecta por el nombre del tipo.
+    fn ev_typed(
+        id: i64,
+        ts: i64,
+        ty: aws_sdk_sfn::types::HistoryEventType,
+    ) -> aws_sdk_sfn::types::HistoryEvent {
+        use aws_sdk_sfn::primitives::DateTime;
+        aws_sdk_sfn::types::HistoryEvent::builder()
+            .id(id)
+            .timestamp(DateTime::from_millis(ts))
+            .r#type(ty)
+            .build()
+            .unwrap()
+    }
+
     #[test]
     fn parse_history_pairs_states_and_marks_failure() {
-        use aws_sdk_sfn::primitives::DateTime;
-        use aws_sdk_sfn::types::{
-            ExecutionFailedEventDetails, HistoryEvent, HistoryEventType as T,
-            StateEnteredEventDetails, StateExitedEventDetails,
-        };
-
-        let entered = |id, ts, name: &str| {
-            HistoryEvent::builder()
-                .id(id)
-                .timestamp(DateTime::from_millis(ts))
-                .r#type(T::TaskStateEntered)
-                .state_entered_event_details(
-                    StateEnteredEventDetails::builder()
-                        .name(name)
-                        .build()
-                        .unwrap(),
-                )
-                .build()
-                .unwrap()
-        };
-        let exited = |id, ts, name: &str| {
-            HistoryEvent::builder()
-                .id(id)
-                .timestamp(DateTime::from_millis(ts))
-                .r#type(T::TaskStateExited)
-                .state_exited_event_details(
-                    StateExitedEventDetails::builder()
-                        .name(name)
-                        .build()
-                        .unwrap(),
-                )
-                .build()
-                .unwrap()
-        };
-        let failed = |id, ts| {
-            HistoryEvent::builder()
-                .id(id)
-                .timestamp(DateTime::from_millis(ts))
-                .r#type(T::ExecutionFailed)
-                .execution_failed_event_details(
-                    ExecutionFailedEventDetails::builder()
-                        .error("States.TaskFailed")
-                        .cause("boom")
-                        .build(),
-                )
-                .build()
-                .unwrap()
-        };
-
+        use aws_sdk_sfn::types::HistoryEventType as T;
         let events = vec![
-            entered(1, 1_000, "A"),
-            exited(2, 1_500, "A"),
-            entered(3, 1_500, "B"),
-            failed(4, 1_800),
+            ev_entered(1, 1_000, "A"),
+            ev_exited(2, 1_500, "A"),
+            ev_entered(3, 1_500, "B"),
+            ev_typed(4, 1_800, T::ExecutionFailed),
         ];
         let (spans, failed_state) = parse_history(&events);
 
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].name, "A");
-        assert_eq!(spans[0].entered_ts, Some(1_000));
         assert_eq!(spans[0].exited_ts, Some(1_500));
         assert!(!spans[0].failed);
         assert_eq!(spans[1].name, "B");
         assert_eq!(spans[1].exited_ts, None);
         assert!(spans[1].failed, "el estado abierto al fallar se marca");
         assert_eq!(failed_state.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn parse_history_detects_timeout_and_abort() {
+        use aws_sdk_sfn::types::HistoryEventType as T;
+        // TaskTimedOut (no es *Failed) debe marcar el estado abierto igual.
+        let events = vec![ev_entered(1, 0, "Wait"), ev_typed(2, 500, T::TaskTimedOut)];
+        let (spans, failed_state) = parse_history(&events);
+        assert!(spans[0].failed, "TIMED_OUT marca el estado abierto");
+        assert_eq!(failed_state.as_deref(), Some("Wait"));
+
+        // ExecutionAborted también.
+        let events = vec![
+            ev_entered(1, 0, "Work"),
+            ev_typed(2, 500, T::ExecutionAborted),
+        ];
+        let (spans, _) = parse_history(&events);
+        assert!(spans[0].failed, "ABORTED marca el estado abierto");
+    }
+
+    #[test]
+    fn parse_history_clears_failure_on_retry_recovery() {
+        use aws_sdk_sfn::types::HistoryEventType as T;
+        // Charge falla (Task) pero reintenta y SALE bien → no debe quedar marcado.
+        let events = vec![
+            ev_entered(1, 0, "Charge"),
+            ev_typed(2, 100, T::TaskFailed),
+            ev_exited(3, 300, "Charge"),
+            ev_entered(4, 300, "Done"),
+            ev_exited(5, 400, "Done"),
+        ];
+        let (spans, failed_state) = parse_history(&events);
+        assert!(
+            !spans.iter().any(|s| s.failed),
+            "un estado que falló-reintentó-y-salió no queda marcado"
+        );
+        assert_eq!(failed_state, None);
+        assert_eq!(spans[0].exited_ts, Some(300));
+    }
+
+    #[test]
+    fn parse_history_handles_concurrent_homonyms() {
+        // Dos "Worker" abiertos a la vez (Parallel): ambos deben cerrarse (sin huérfanos).
+        let events = vec![
+            ev_entered(1, 0, "Worker"),
+            ev_entered(2, 0, "Worker"),
+            ev_exited(3, 100, "Worker"),
+            ev_exited(4, 200, "Worker"),
+        ];
+        let (spans, _) = parse_history(&events);
+        assert_eq!(spans.len(), 2);
+        assert!(
+            spans.iter().all(|s| s.exited_ts.is_some()),
+            "ningún span homónimo queda huérfano (pila LIFO)"
+        );
     }
 }

@@ -589,9 +589,12 @@ async fn fetch_log_streams(ctx: &AwsContext, group: &str) -> color_eyre::Result<
 }
 
 /// Tope de líneas por carga. `get_log_events` con `start_from_head(false)` trae las
-/// más recientes; `more = len == EVENTS_LIMIT` (heurístico: sus tokens vienen aun sin
-/// más, así que no sirven para `more`).
+/// más recientes.
 const EVENTS_LIMIT: i32 = 200;
+/// Tope de páginas a seguir hacia atrás en `get_log_events`. La API puede devolver una
+/// **página vacía aunque el stream tenga eventos** (hay que seguir `nextBackwardToken`);
+/// también la usamos para juntar hasta `EVENTS_LIMIT` líneas si la primera página es corta.
+const MAX_EVENT_PAGES: usize = 5;
 /// Ventana del *tail*: `filter_log_events` sin `start_time` devuelve lo más viejo, así
 /// que acotamos a la última hora para "recientes".
 const TAIL_LOOKBACK_MS: i64 = 60 * 60 * 1000;
@@ -622,34 +625,64 @@ fn clip_message(raw: Option<&str>) -> String {
     format!("{}…", &one_line[..end])
 }
 
-/// Eventos recientes de un stream (`get_log_events`, las últimas `EVENTS_LIMIT`).
-/// Devuelve `(events, hay_más_viejas)`; orden cronológico ascendente (newest abajo).
+/// Eventos recientes de un stream (`get_log_events`, hasta `EVENTS_LIMIT`). Orden
+/// cronológico ascendente (newest abajo); devuelve `(events, hay_más_viejas)`.
+///
+/// Con `start_from_head(false)` la primera página son los eventos más recientes, y
+/// `nextBackwardToken` retrocede en el tiempo. Pero la API **puede devolver una página
+/// vacía aunque el stream tenga eventos** (documentado): por eso seguimos el token
+/// hacia atrás hasta juntar algo / llenar `EVENTS_LIMIT` / agotar (el token deja de
+/// cambiar) / topar `MAX_EVENT_PAGES`. Cada página es más vieja → se antepone.
 async fn fetch_log_events(
     ctx: &AwsContext,
     group: &str,
     stream: &str,
 ) -> color_eyre::Result<(Vec<LogEventDto>, bool)> {
-    let out = ctx
-        .logs()
-        .await
-        .get_log_events()
-        .log_group_name(group)
-        .log_stream_name(stream)
-        .limit(EVENTS_LIMIT)
-        .start_from_head(false)
-        .send()
-        .await?;
-    let events: Vec<LogEventDto> = out
-        .events()
-        .iter()
-        .map(|e| LogEventDto {
-            ts: e.timestamp(),
-            message: clip_message(e.message()),
-            stream: None,
-        })
-        .collect();
-    let more = events.len() as i32 == EVENTS_LIMIT;
-    Ok((events, more))
+    let client = ctx.logs().await;
+    let mut token: Option<String> = None;
+    let mut collected: Vec<LogEventDto> = Vec::new();
+
+    for _ in 0..MAX_EVENT_PAGES {
+        let out = client
+            .get_log_events()
+            .log_group_name(group)
+            .log_stream_name(stream)
+            .limit(EVENTS_LIMIT)
+            .start_from_head(false)
+            .set_next_token(token.clone())
+            .send()
+            .await?;
+        let page: Vec<LogEventDto> = out
+            .events()
+            .iter()
+            .map(|e| LogEventDto {
+                ts: e.timestamp(),
+                message: clip_message(e.message()),
+                stream: None,
+            })
+            .collect();
+        let next = out.next_backward_token().map(str::to_string);
+        // Token que no cambia (o ausente) = no hay más eventos hacia atrás.
+        let exhausted = next.is_none() || next == token;
+
+        // La página recién traída es más vieja que lo ya juntado → va delante.
+        if !page.is_empty() {
+            let mut newer = std::mem::replace(&mut collected, page);
+            collected.append(&mut newer);
+        }
+        token = next;
+
+        if collected.len() as i32 >= EVENTS_LIMIT || exhausted {
+            let more = collected.len() as i32 >= EVENTS_LIMIT && !exhausted;
+            collected.truncate(EVENTS_LIMIT as usize);
+            return Ok((collected, more));
+        }
+    }
+
+    // Topamos el cap de páginas con algo juntado: probablemente hay más hacia atrás.
+    let more = !collected.is_empty();
+    collected.truncate(EVENTS_LIMIT as usize);
+    Ok((collected, more))
 }
 
 /// Tail de un group (`filter_log_events` sobre todos sus streams) en la ventana

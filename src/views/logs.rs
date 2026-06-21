@@ -515,10 +515,17 @@ impl View for LogsView {
         if items.is_empty() {
             let msg = if self.loading {
                 "cargando…"
-            } else if self.filter.is_empty() {
-                "(sin resultados)"
-            } else {
+            } else if !self.filter.is_empty() {
                 "(sin coincidencias para el filtro)"
+            } else {
+                // Mensaje por nivel: deja claro que un stream/tail vacío no es un bug.
+                match self.level {
+                    Level::Events { .. } => "(este stream no tiene eventos)",
+                    Level::Tail { .. } => {
+                        "(sin eventos en la última hora — prueba otro group o `r`)"
+                    }
+                    _ => "(sin resultados)",
+                }
             };
             frame.render_widget(Paragraph::new(msg).block(block), area);
             return;

@@ -41,7 +41,10 @@ pub fn render(frame: &mut Frame, area: Rect, footer: Footer<'_>) {
             } else {
                 Style::new().green()
             };
-            frame.render_widget(Paragraph::new(Span::styled(format!(" {text}"), style)), area);
+            frame.render_widget(
+                Paragraph::new(Span::styled(format!(" {text}"), style)),
+                area,
+            );
         }
         Footer::Hints { filter } => {
             let line = if filter.is_empty() {

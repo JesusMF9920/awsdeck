@@ -242,7 +242,9 @@ impl App {
             self.dispatch_all(actions);
         } else {
             let available = self.registry.ids().join(", ");
-            self.set_error(format!("comando desconocido: {id} (disponibles: {available})"));
+            self.set_error(format!(
+                "comando desconocido: {id} (disponibles: {available})"
+            ));
         }
     }
 
@@ -511,7 +513,10 @@ mod tests {
             profile("dev", None),
         ]);
         let current = Env::new("default", "us-east-1");
-        assert_eq!(p.selected_env(&current), Some(Env::new("prod", "eu-west-1")));
+        assert_eq!(
+            p.selected_env(&current),
+            Some(Env::new("prod", "eu-west-1"))
+        );
         p.move_selection(1);
         assert_eq!(p.selected_env(&current), Some(Env::new("dev", "us-east-1")));
     }
@@ -555,7 +560,10 @@ mod tests {
 
         // Respuesta con epoch viejo (0): se descarta, no pinta nada.
         app.on_envelope(Envelope::new(0, Message::Error("cuenta anterior".into())));
-        assert!(app.status.is_none(), "el envelope stale no debe pintar nada");
+        assert!(
+            app.status.is_none(),
+            "el envelope stale no debe pintar nada"
+        );
 
         // Respuesta con el epoch vigente (1): sí se muestra.
         app.on_envelope(Envelope::new(1, Message::Error("error real".into())));

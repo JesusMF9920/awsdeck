@@ -15,6 +15,10 @@ pub enum Action {
     Quit,
     /// Activar la vista con este `id` (p. ej. desde `:logs`).
     ActivateView(String),
+    /// Volver un nivel. La vista la emite cuando `esc` ya no tiene drill que
+    /// despojar (está en su raíz); el `App` la interpreta como "volver al menú".
+    /// La vista nunca nombra al menú: solo dice "atrás".
+    Back,
     /// Cambiar de ambiente: sube el epoch, reconstruye el `AwsContext` y refresca.
     SwitchEnv(Env),
 

@@ -30,6 +30,14 @@ pub trait View {
 
     /// Reacciona a una tecla (en modo normal) y devuelve acciones a despachar.
     /// La navegación interna (drill/back, mover selección) se resuelve aquí.
+    ///
+    /// **Contrato de `esc` (navegación uniforme, principio #4):** al recibir
+    /// `KeyCode::Esc` la vista debe despojar un nivel de drill si lo hay; y en su
+    /// nivel raíz, donde `esc` ya no tiene nada que despojar, **debe emitir
+    /// [`Action::Back`]** para que el `App` vuelva al menú principal. Una vista que
+    /// lo omita deja `esc` muerto en su raíz (no vuelve al menú). El `App` no puede
+    /// forzarlo —`on_key` devuelve un `Vec<Action>` opaco—, así que es responsabilidad
+    /// de cada vista. Ver `logs::LogsView::back` / `sqs::SqsView::back` como referencia.
     fn on_key(&mut self, key: KeyEvent) -> Vec<Action>;
 
     /// Ingiere un resultado async. La vista ignora los `Message` que no le

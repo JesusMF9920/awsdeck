@@ -129,12 +129,17 @@ impl SqsView {
         }
     }
 
-    fn back(&mut self) {
+    /// `esc`: despoja un nivel de drill. En la raíz (queues) no hay nada que
+    /// despojar → emite `Back` para que el `App` vuelva al menú.
+    fn back(&mut self) -> Vec<Action> {
         if matches!(self.level, Level::Detail { .. }) {
             self.level = Level::Queues;
             self.loading = false;
             self.state.select(Some(0));
             self.clamp_selection();
+            vec![]
+        } else {
+            vec![Action::Back]
         }
     }
 
@@ -263,10 +268,7 @@ impl View for SqsView {
                 vec![]
             }
             KeyCode::Enter => self.drill(),
-            KeyCode::Esc => {
-                self.back();
-                vec![]
-            }
+            KeyCode::Esc => self.back(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('p') => self.purge_intent(),
             _ => vec![],
@@ -495,6 +497,41 @@ mod tests {
         v.on_key(key(KeyCode::Esc));
         assert!(matches!(v.level, Level::Queues));
         assert_eq!(v.visible_len(), 2);
+    }
+
+    #[test]
+    fn esc_at_root_emits_back() {
+        let mut v = SqsView::new();
+        v.on_message(&Message::QueuesLoaded(vec![queue("orders")]));
+        // En la raíz (queues) no hay drill que despojar: esc pide volver al menú.
+        let actions = v.on_key(key(KeyCode::Esc));
+        assert!(matches!(actions.as_slice(), [Action::Back]));
+        assert!(
+            matches!(v.level, Level::Queues),
+            "esc en raíz no cambia nivel"
+        );
+    }
+
+    #[test]
+    fn esc_in_detail_pops_to_queues_without_back() {
+        let mut v = SqsView::new();
+        v.on_message(&Message::QueuesLoaded(vec![queue("orders")]));
+        v.on_key(key(KeyCode::Enter)); // drill al detalle
+        assert!(matches!(v.level, Level::Detail { .. }));
+        let actions = v.on_key(key(KeyCode::Esc));
+        assert!(
+            actions.is_empty(),
+            "esc en el detalle se consume en la vista"
+        );
+        assert!(matches!(v.level, Level::Queues));
+    }
+
+    #[test]
+    fn esc_at_root_empty_list_emits_back() {
+        // El caso más común del bug original: vista recién activada (sin data) + esc.
+        let mut v = SqsView::new();
+        let actions = v.on_key(key(KeyCode::Esc));
+        assert!(matches!(actions.as_slice(), [Action::Back]));
     }
 
     #[test]

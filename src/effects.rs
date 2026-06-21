@@ -67,7 +67,7 @@ impl Effects {
             Action::LoadQueues => self.load_queues(epoch),
             Action::LoadQueueDetail { queue_url } => self.load_queue_detail(queue_url, epoch),
             Action::PurgeQueue { queue_url } => self.purge_queue(queue_url, epoch),
-            Action::Quit | Action::ActivateView(_) | Action::SwitchEnv(_) => {}
+            Action::Quit | Action::ActivateView(_) | Action::Back | Action::SwitchEnv(_) => {}
         }
     }
 

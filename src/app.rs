@@ -326,6 +326,16 @@ impl App {
                 self.fire_search_now();
                 self.mode = Mode::Normal;
             }
+            // Flechas: navegar los resultados sin salir del filtro (estilo fzf).
+            // Se reenvían a la vista (mueve su selección sobre la lista filtrada);
+            // no tocan el input de texto ni reprograman la búsqueda server-side.
+            KeyCode::Up | KeyCode::Down => {
+                let actions = match self.registry.active_mut() {
+                    Some(view) => view.on_key(key),
+                    None => Vec::new(),
+                };
+                self.dispatch_all(actions);
+            }
             _ => {
                 self.input.handle_event(&Event::Key(key));
                 self.apply_filter(); // fuzzy local instantáneo sobre lo ya cargado
@@ -342,6 +352,8 @@ impl App {
         match action {
             Action::Quit => self.should_quit = true,
             Action::ActivateView(id) => self.activate_view(&id),
+            // `esc` en la raíz de una vista: volver al menú principal.
+            Action::Back => self.go_home(),
             Action::SwitchEnv(env) => self.switch_env(env),
             // Gate prod-safe: las mutantes pasan por modo escritura + confirm.
             mutating if is_mutating(&mutating) => self.request_confirm(mutating),
@@ -721,10 +733,12 @@ mod tests {
         App::new(env, Registry::new(), effects, rx)
     }
 
-    /// Vista falsa que cuenta cuántas veces se activó (carga). Devuelve `vec![]`
-    /// para no disparar efectos (que necesitarían un runtime de tokio).
+    /// Vista falsa que cuenta cuántas veces se activó (carga) y cuántas teclas
+    /// recibió en `on_key`. Devuelve `vec![]` para no disparar efectos (que
+    /// necesitarían un runtime de tokio).
     struct CountingView {
         activations: Rc<Cell<u32>>,
+        keys: Rc<Cell<u32>>,
     }
 
     impl View for CountingView {
@@ -739,6 +753,7 @@ mod tests {
             Vec::new()
         }
         fn on_key(&mut self, _key: KeyEvent) -> Vec<Action> {
+            self.keys.set(self.keys.get() + 1);
             Vec::new()
         }
         fn on_message(&mut self, _message: &Message) {}
@@ -746,18 +761,20 @@ mod tests {
         fn render(&mut self, _frame: &mut Frame, _area: Rect) {}
     }
 
-    /// `App` con una `CountingView` registrada; devuelve también el contador de
-    /// activaciones para verificar que la carga se disparó.
-    fn app_with_counting_view() -> (App, Rc<Cell<u32>>) {
-        let counter = Rc::new(Cell::new(0));
+    /// `App` con una `CountingView` registrada; devuelve los contadores de
+    /// activaciones y de teclas recibidas por la vista.
+    fn app_with_counting_view() -> (App, Rc<Cell<u32>>, Rc<Cell<u32>>) {
+        let activations = Rc::new(Cell::new(0));
+        let keys = Rc::new(Cell::new(0));
         let (tx, rx) = mpsc::channel(8);
         let env = Env::new("default", "us-east-1");
         let effects = Effects::new_mock(tx, env.clone());
         let mut registry = Registry::new();
         registry.register(Box::new(CountingView {
-            activations: counter.clone(),
+            activations: activations.clone(),
+            keys: keys.clone(),
         }));
-        (App::new(env, registry, effects, rx), counter)
+        (App::new(env, registry, effects, rx), activations, keys)
     }
 
     fn ch(c: char) -> KeyEvent {
@@ -856,7 +873,7 @@ mod tests {
 
     #[test]
     fn startup_picker_esc_lands_on_menu() {
-        let (mut app, activations) = app_with_counting_view();
+        let (mut app, activations, _keys) = app_with_counting_view();
         app.picker = Some(Picker::new(vec![profile("dev", None)]));
         app.awaiting_startup_env = true;
 
@@ -871,7 +888,7 @@ mod tests {
 
     #[test]
     fn startup_picker_enter_switches_env_lands_on_menu() {
-        let (mut app, activations) = app_with_counting_view();
+        let (mut app, activations, _keys) = app_with_counting_view();
         app.picker = Some(Picker::new(vec![profile("prod", Some("eu-west-1"))]));
         app.awaiting_startup_env = true;
 
@@ -896,7 +913,7 @@ mod tests {
 
     #[test]
     fn menu_enter_activates_selected_view() {
-        let (mut app, activations) = app_with_counting_view();
+        let (mut app, activations, _keys) = app_with_counting_view();
         assert!(matches!(app.screen, Screen::Menu));
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(app.screen, Screen::View));
@@ -905,11 +922,50 @@ mod tests {
 
     #[test]
     fn menu_command_returns_home() {
-        let (mut app, _) = app_with_counting_view();
+        let (mut app, _activations, _keys) = app_with_counting_view();
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // entra a la vista
         assert!(matches!(app.screen, Screen::View));
         type_command(&mut app, "menu");
         assert!(matches!(app.screen, Screen::Menu));
+    }
+
+    #[test]
+    fn back_action_returns_to_menu() {
+        let (mut app, _activations, _keys) = app_with_counting_view();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // entra a la vista
+        assert!(matches!(app.screen, Screen::View));
+        // La vista, en su raíz, emite Back al recibir esc; el App vuelve al menú.
+        app.dispatch(Action::Back);
+        assert!(matches!(app.screen, Screen::Menu), "Back vuelve al menú");
+    }
+
+    #[test]
+    fn filter_mode_arrows_navigate_view_without_leaving() {
+        let (mut app, _activations, keys) = app_with_counting_view();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // entra a la vista
+        app.on_key(ch('/')); // abre el filtro
+        assert!(matches!(app.mode, Mode::Filter));
+        let before = keys.get();
+
+        // Flecha abajo: navega la lista; NO sale del filtro ni edita el texto.
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        assert!(
+            matches!(app.mode, Mode::Filter),
+            "navegar no sale del filtro"
+        );
+        assert_eq!(keys.get(), before + 1, "la flecha llega a la vista activa");
+        // Las otras dos garantías del fix: la flecha no reprograma el debounce de
+        // la búsqueda server-side ni edita el texto del filtro.
+        assert!(
+            app.search_deadline.is_none(),
+            "la flecha no reprograma la búsqueda server-side"
+        );
+        assert_eq!(
+            app.input.value(),
+            "",
+            "la flecha no edita el texto del filtro"
+        );
     }
 
     #[test]

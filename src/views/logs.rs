@@ -129,12 +129,17 @@ impl LogsView {
         }
     }
 
-    fn back(&mut self) {
+    /// `esc`: despoja un nivel de drill. En la raíz (groups) no hay nada que
+    /// despojar → emite `Back` para que el `App` vuelva al menú.
+    fn back(&mut self) -> Vec<Action> {
         if matches!(self.level, Level::Streams { .. }) {
             self.level = Level::Groups;
             self.loading = false; // los groups siguen en cache
             self.state.select(Some(0));
             self.clamp_selection();
+            vec![]
+        } else {
+            vec![Action::Back]
         }
     }
 
@@ -233,10 +238,7 @@ impl View for LogsView {
                 vec![]
             }
             KeyCode::Enter => self.drill(),
-            KeyCode::Esc => {
-                self.back();
-                vec![]
-            }
+            KeyCode::Esc => self.back(),
             KeyCode::Char('r') => self.refresh(),
             _ => vec![],
         }
@@ -507,6 +509,51 @@ mod tests {
         v.on_key(key(KeyCode::Esc));
         assert!(matches!(v.level, Level::Groups));
         assert_eq!(v.visible_len(), 2);
+    }
+
+    #[test]
+    fn esc_at_root_emits_back() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/a"), group("/b")]));
+        // En la raíz (groups) no hay drill que despojar: esc pide volver al menú.
+        let actions = v.on_key(key(KeyCode::Esc));
+        assert!(matches!(actions.as_slice(), [Action::Back]));
+        assert!(
+            matches!(v.level, Level::Groups),
+            "esc en raíz no cambia nivel"
+        );
+    }
+
+    #[test]
+    fn esc_in_streams_pops_to_groups_without_back() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/a")]));
+        v.on_key(key(KeyCode::Enter)); // drill a streams
+        assert!(matches!(v.level, Level::Streams { .. }));
+        // esc despoja un nivel (no emite Back: aún hay a dónde volver dentro de la vista).
+        let actions = v.on_key(key(KeyCode::Esc));
+        assert!(actions.is_empty(), "esc en streams se consume en la vista");
+        assert!(matches!(v.level, Level::Groups));
+    }
+
+    #[test]
+    fn esc_at_root_empty_list_emits_back() {
+        // El caso más común del bug original: vista recién activada (sin data) + esc.
+        let mut v = LogsView::new();
+        let actions = v.on_key(key(KeyCode::Esc));
+        assert!(matches!(actions.as_slice(), [Action::Back]));
+    }
+
+    #[test]
+    fn arrow_on_empty_filter_is_safe() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/a")]));
+        v.set_filter("zzz"); // 0 coincidencias
+        assert_eq!(v.visible_len(), 0);
+        // Navegar sobre una lista filtrada vacía (ruta de las flechas en filtro) no
+        // debe panickear: move_selection cae en len==0 → select(None).
+        v.on_key(key(KeyCode::Down));
+        assert_eq!(v.state.selected(), None);
     }
 
     #[test]

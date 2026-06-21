@@ -71,12 +71,14 @@ concretas se cablean en `main.rs`; `effects.rs` es la frontera deliberada con el
 ## Keybindings (iguales en todas las vistas)
 
 `:` command bar · `/` filtro (con `↑/↓` navegas los resultados sin salir) · `enter` drill ·
-`esc` back (un nivel; desde la raíz de la vista, al menú) · `r` refresh ·
-`ctrl-e` cambiar ambiente · `?` ayuda · `q` salir. (`y` copiar ARN/URL — más adelante.)
+`esc` back de dos etapas (con filtro lo limpia; si no, un nivel; desde la raíz, al menú) ·
+`r` refresh · `ctrl-e` cambiar ambiente · `?` ayuda · `q` salir. (`y` copiar ARN/URL — más adelante.)
 
-`esc` es navegación uniforme: despoja un nivel de drill y, en la raíz, la vista emite
-`Action::Back` (intención core agnóstica) que el `App` mapea a "volver al menú". La vista
-nunca nombra al menú.
+`esc` es navegación uniforme de **dos etapas** (estilo k9s): el `App` lo intercepta en
+`on_normal_key` y, si hay filtro aplicado, lo limpia y se queda en la vista (1a etapa, la vista
+no ve ese esc); si no hay filtro, lo reenvía a la vista, que despoja un nivel de drill y, en la
+raíz, emite `Action::Back` (intención core agnóstica) que el `App` mapea a "volver al menú". La
+vista nunca nombra al menú.
 
 ## Stack
 
@@ -110,6 +112,9 @@ es reusable para v2/v3. `switch_env` resetea el modo escritura.
   local y, al parar, consulta al server. `last_query` descarta respuestas viejas (latest wins).
 - **`esc` vuelve al menú** desde la raíz de una vista (antes era no-op): la vista emite
   `Action::Back` y el `App` hace `go_home()`. Drill back interno sigue consumiéndose en la vista.
+- **`esc` de dos etapas (estilo k9s)**: el `App` intercepta `esc` en `on_normal_key`; con filtro
+  aplicado lo limpia (`clear_filter` + `fire_search_now`, recarga sin filtro en logs) y se queda
+  en la vista; sin filtro lo reenvía a la vista (drill back / `Action::Back` → menú).
 - **Navegar dentro del filtro**: en `Mode::Filter`, `↑/↓` se reenvían a la vista activa (mueven
   su selección sobre la lista ya filtrada) sin salir del filtro ni editar el texto (estilo fzf);
   el resto de teclas siguen editando el `tui-input`.
@@ -119,9 +124,9 @@ es reusable para v2/v3. `switch_env` resetea el modo escritura.
   cuando no navegaste y respeta tu posición (flechas en filtro) cuando sí; cae al tope si el item
   desapareció. Aplica también al `r` refresh. (SQS ya solo hacía `clamp_selection`.)
 
-61 tests sin red (routing, epoch guard, gate de mutaciones, fuzzy, menú, búsqueda/staleness,
-drill, back→menú, navegación en filtro, preservación de selección, parsers, render con
-`TestBackend`). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
+62 tests sin red (routing, epoch guard, gate de mutaciones, fuzzy, menú, búsqueda/staleness,
+drill, back→menú de dos etapas, navegación en filtro, preservación de selección, parsers, render
+con `TestBackend`). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
 
 Pendiente: v2 `sfn`, v3 `events` (no iniciadas), eventos de log (3er nivel en `logs`), `y`
 (copiar ARN), abrir en consola (`o`), config en disco.

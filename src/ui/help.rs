@@ -11,7 +11,7 @@ const KEYS: &[(&str, &str)] = &[
     (":", "command bar (p. ej. :logs, :sqs)"),
     ("/", "buscar (fuzzy; ↑/↓ navega sin salir)"),
     ("enter", "abrir herramienta / drill al detalle"),
-    ("esc", "volver un nivel (en la raíz, al menú)"),
+    ("esc", "con filtro: lo limpia; si no, volver (raíz → menú)"),
     (":menu / bksp", "volver al menú principal"),
     ("r", "refresh"),
     ("p", "purgar cola SQS — gated por modo escritura"),
@@ -22,7 +22,7 @@ const KEYS: &[(&str, &str)] = &[
 ];
 
 pub fn render(frame: &mut Frame, area: Rect) {
-    let popup = super::popup_area(area, 62, KEYS.len() as u16 + 3);
+    let popup = super::popup_area(area, 66, KEYS.len() as u16 + 3);
     frame.render_widget(Clear, popup);
 
     let lines: Vec<Line> = KEYS

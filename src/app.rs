@@ -287,7 +287,15 @@ impl App {
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('e') if ctrl => self.open_picker(),
             KeyCode::Backspace => self.go_home(),
-            // Resto: lo maneja la vista activa.
+            // Primera etapa (estilo k9s): `esc` con filtro aplicado lo limpia y se
+            // queda en la vista; un segundo `esc` (ya sin filtro) deja que la vista
+            // suba de nivel y, desde la raíz, vuelva al menú. La vista no ve este esc.
+            KeyCode::Esc if !self.filter.is_empty() => {
+                self.clear_filter();
+                self.fire_search_now(); // recargar sin filtro (server-side en logs)
+                self.set_info("filtro limpiado");
+            }
+            // Resto (incl. `esc` sin filtro): lo maneja la vista activa.
             _ => {
                 let actions = match self.registry.active_mut() {
                     Some(view) => view.on_key(key),
@@ -966,6 +974,33 @@ mod tests {
             "",
             "la flecha no edita el texto del filtro"
         );
+    }
+
+    #[test]
+    fn esc_two_stage_clears_filter_first_then_forwards_to_view() {
+        let (mut app, _activations, keys) = app_with_counting_view();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // entra a la vista
+        // Aplica un filtro vía el flujo real (/, teclear, enter → vuelve a Normal).
+        app.on_key(ch('/'));
+        app.on_key(ch('x'));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.filter, "x");
+        let keys_before = keys.get();
+
+        // 1a etapa: esc con filtro lo limpia y se queda en la vista, SIN reenviar
+        // la tecla a la vista.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.filter, "", "el primer esc limpia el filtro");
+        assert!(matches!(app.screen, Screen::View), "y se queda en la vista");
+        assert_eq!(
+            keys.get(),
+            keys_before,
+            "la 1a etapa no reenvía esc a la vista"
+        );
+
+        // 2a etapa: esc sin filtro se reenvía a la vista (que haría back/menú).
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(keys.get(), keys_before + 1, "el segundo esc va a la vista");
     }
 
     #[test]

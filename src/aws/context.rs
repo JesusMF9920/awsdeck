@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_cloudwatchlogs::Client as LogsClient;
+use aws_sdk_sqs::Client as SqsClient;
 use tokio::sync::OnceCell;
 
 /// El ambiente activo: identidad de la cuenta/region contra la que trabajamos.
@@ -42,6 +43,7 @@ pub struct AwsContext {
     env: Env,
     config: OnceCell<SdkConfig>,
     logs: OnceCell<LogsClient>,
+    sqs: OnceCell<SqsClient>,
 }
 
 impl AwsContext {
@@ -50,6 +52,7 @@ impl AwsContext {
             env,
             config: OnceCell::new(),
             logs: OnceCell::new(),
+            sqs: OnceCell::new(),
         }
     }
 
@@ -72,6 +75,13 @@ impl AwsContext {
     pub async fn logs(&self) -> &LogsClient {
         self.logs
             .get_or_init(|| async { LogsClient::new(self.config().await) })
+            .await
+    }
+
+    /// Cliente de SQS, cacheado de forma perezosa.
+    pub async fn sqs(&self) -> &SqsClient {
+        self.sqs
+            .get_or_init(|| async { SqsClient::new(self.config().await) })
             .await
     }
 }

@@ -2,7 +2,7 @@
 //! hace `tokio::spawn` de una task contra el client correcto y manda un `Message`
 //! de vuelta por el canal mpsc, etiquetado con el `epoch` del `Env` que lo lanzó.
 //!
-//! `Backend::Real` usa `aws-sdk-cloudwatchlogs` (vía `AwsContext`); `Backend::Mock`
+//! `Backend::Real` usa los `aws-sdk-*` (vía `AwsContext`); `Backend::Mock`
 //! sirve para tests y desarrollo sin red. Como los `Message`/DTOs son los mismos,
 //! ni las vistas ni `app.rs` distinguen entre uno y otro. Cualquier fallo del SDK
 //! se reporta como `Message::Error` (lo pinta la status bar, nunca hace panic).
@@ -132,8 +132,16 @@ impl Effects {
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
             }
-            // El backend real de SQS llega en "feat(sqs): backend real".
-            Backend::Real(_) => spawn_sqs_pending(tx, epoch),
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match fetch_queues(&ctx).await {
+                        Ok(queues) => Message::QueuesLoaded(queues),
+                        Err(e) => Message::Error(format!("list_queues: {e}")),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
         }
     }
 
@@ -152,7 +160,20 @@ impl Effects {
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
             }
-            Backend::Real(_) => spawn_sqs_pending(tx, epoch),
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match fetch_queue_detail(&ctx, &queue_url).await {
+                        Ok((attrs, messages)) => Message::QueueDetailLoaded {
+                            queue_url,
+                            attrs,
+                            messages,
+                        },
+                        Err(e) => Message::Error(format!("queue detail: {e}")),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
         }
     }
 
@@ -166,19 +187,18 @@ impl Effects {
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
             }
-            Backend::Real(_) => spawn_sqs_pending(tx, epoch),
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match purge_queue_real(&ctx, &queue_url).await {
+                        Ok(()) => Message::QueuePurged { queue_url },
+                        Err(e) => Message::Error(format!("purge_queue: {e}")),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
         }
     }
-}
-
-/// Stub temporal: el backend real de SQS llega en un commit posterior; por ahora
-/// responde con un error informativo para que el real no quede colgado en "cargando".
-fn spawn_sqs_pending(tx: mpsc::Sender<Envelope>, epoch: u64) {
-    tokio::spawn(async move {
-        let msg =
-            Message::Error("vista sqs contra AWS real: pendiente — usa AWSDECK_MOCK=1".into());
-        let _ = tx.send(Envelope::new(epoch, msg)).await;
-    });
 }
 
 // --- SDK real -----------------------------------------------------------------
@@ -221,6 +241,112 @@ async fn fetch_log_streams(ctx: &AwsContext, group: &str) -> color_eyre::Result<
         });
     }
     Ok(streams)
+}
+
+async fn fetch_queues(ctx: &AwsContext) -> color_eyre::Result<Vec<QueueDto>> {
+    let client = ctx.sqs().await;
+    let mut pages = client.list_queues().into_paginator().items().send();
+
+    let mut queues = Vec::new();
+    while let Some(item) = pages.next().await {
+        let url = item?;
+        let name = url.rsplit('/').next().unwrap_or(&url).to_string();
+        let is_fifo = name.ends_with(".fifo");
+        queues.push(QueueDto { name, url, is_fifo });
+    }
+    Ok(queues)
+}
+
+async fn fetch_queue_detail(
+    ctx: &AwsContext,
+    queue_url: &str,
+) -> color_eyre::Result<(QueueAttrsDto, Vec<QueueMessageDto>)> {
+    use aws_sdk_sqs::types::{MessageSystemAttributeName, QueueAttributeName};
+
+    let client = ctx.sqs().await;
+
+    // Attributes.
+    let out = client
+        .get_queue_attributes()
+        .queue_url(queue_url)
+        .attribute_names(QueueAttributeName::All)
+        .send()
+        .await?;
+    let map = out.attributes();
+    let get = |k: &QueueAttributeName| map.and_then(|m| m.get(k)).map(String::as_str);
+    let int = |k: &QueueAttributeName| get(k).and_then(|s| s.parse::<i64>().ok());
+
+    let (dlq_target_arn, max_receive_count) =
+        parse_redrive(get(&QueueAttributeName::RedrivePolicy));
+    let attrs = QueueAttrsDto {
+        visible: int(&QueueAttributeName::ApproximateNumberOfMessages),
+        in_flight: int(&QueueAttributeName::ApproximateNumberOfMessagesNotVisible),
+        delayed: int(&QueueAttributeName::ApproximateNumberOfMessagesDelayed),
+        arn: get(&QueueAttributeName::QueueArn).map(str::to_string),
+        dlq_target_arn,
+        max_receive_count,
+    };
+
+    // Peek: receive con visibility_timeout(0) (best-effort; incrementa receive_count).
+    let recv = client
+        .receive_message()
+        .queue_url(queue_url)
+        .max_number_of_messages(10)
+        .visibility_timeout(0)
+        .message_system_attribute_names(MessageSystemAttributeName::SentTimestamp)
+        .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
+        .send()
+        .await?;
+
+    let messages = recv
+        .messages()
+        .iter()
+        .map(|m| {
+            let sys = |k: &MessageSystemAttributeName| {
+                m.attributes()
+                    .and_then(|a| a.get(k))
+                    .and_then(|s| s.parse::<i64>().ok())
+            };
+            QueueMessageDto {
+                id: m.message_id().unwrap_or("—").to_string(),
+                body: m.body().unwrap_or_default().to_string(),
+                sent_ts: sys(&MessageSystemAttributeName::SentTimestamp),
+                receive_count: sys(&MessageSystemAttributeName::ApproximateReceiveCount),
+            }
+        })
+        .collect();
+
+    Ok((attrs, messages))
+}
+
+async fn purge_queue_real(ctx: &AwsContext, queue_url: &str) -> color_eyre::Result<()> {
+    ctx.sqs()
+        .await
+        .purge_queue()
+        .queue_url(queue_url)
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// Extrae `(deadLetterTargetArn, maxReceiveCount)` del JSON de `RedrivePolicy`.
+/// `maxReceiveCount` puede venir como número o como string según la cuenta.
+fn parse_redrive(policy: Option<&str>) -> (Option<String>, Option<i64>) {
+    let Some(p) = policy else {
+        return (None, None);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(p) else {
+        return (None, None);
+    };
+    let arn = v
+        .get("deadLetterTargetArn")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+    let max = v.get("maxReceiveCount").and_then(|x| {
+        x.as_i64()
+            .or_else(|| x.as_str().and_then(|s| s.parse::<i64>().ok()))
+    });
+    (arn, max)
 }
 
 // --- Mock (tests / sin red) ---------------------------------------------------
@@ -437,5 +563,18 @@ mod tests {
         let envelope = rx.recv().await.expect("debe llegar un envelope");
         assert_eq!(envelope.epoch, 1);
         assert!(matches!(envelope.message, Message::QueuePurged { queue_url } if queue_url == url));
+    }
+
+    #[test]
+    fn parse_redrive_extracts_dlq_and_count() {
+        let policy = r#"{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000:orders-dlq","maxReceiveCount":"5"}"#;
+        let (arn, max) = parse_redrive(Some(policy));
+        assert_eq!(arn.as_deref(), Some("arn:aws:sqs:us-east-1:000:orders-dlq"));
+        assert_eq!(max, Some(5));
+
+        assert_eq!(parse_redrive(None), (None, None));
+        // maxReceiveCount como número (no string).
+        let (_, max_num) = parse_redrive(Some(r#"{"maxReceiveCount":3}"#));
+        assert_eq!(max_num, Some(3));
     }
 }

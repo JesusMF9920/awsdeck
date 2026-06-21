@@ -61,6 +61,7 @@ src/
     logs.rs        CloudWatch log groups -> streams (drill, filtro)
     sqs.rs         colas -> attributes + peek (drill, purge gated)
     sfn.rs         state machines -> ejecuciones -> detalle/timeline (drill x3, redrive gated)
+    events.rs      event buses -> rules -> detalle (patrón + targets) (drill x3, send gated)
   ui/
     header.rs      indicador de ambiente (profile · region) + breadcrumbs
     command_bar.rs `:` comandos y `/` filtro (tui-input)
@@ -75,8 +76,8 @@ concretas se cablean en `main.rs`; `effects.rs` es la frontera deliberada con el
 `:` command bar · `/` filtro (con `↑/↓` navegas los resultados sin salir) · `enter` drill ·
 `esc` back de dos etapas (con filtro lo limpia; si no, un nivel; desde la raíz, al menú) ·
 `r` refresh · `ctrl-e` cambiar ambiente · `?` ayuda · `q` salir. Acciones mutantes gated por
-modo escritura (`:write`) + confirm: `p` purgar cola (`sqs`), `R` redrive ejecución (`sfn`).
-(`y` copiar ARN/URL — más adelante.)
+modo escritura (`:write`) + confirm: `p` purgar cola (`sqs`), `R` redrive ejecución (`sfn`),
+`S` enviar evento de prueba a un bus (`events`). (`y` copiar ARN/URL — más adelante.)
 
 `esc` es navegación uniforme de **dos etapas** (estilo k9s): el `App` lo intercepta en
 `on_normal_key` y, si hay filtro aplicado, lo limpia y se queda en la vista (1a etapa, la vista
@@ -87,15 +88,17 @@ vista nunca nombra al menú.
 ## Stack
 
 tokio · ratatui + crossterm (feature `event-stream`) · color-eyre · tui-input · serde_json ·
-aws-config + aws-sdk-cloudwatchlogs / aws-sdk-sqs / aws-sdk-sfn. **Sin `async-trait`.**
+aws-config + aws-sdk-cloudwatchlogs / aws-sdk-sqs / aws-sdk-sfn / aws-sdk-eventbridge. **Sin
+`async-trait`.**
 
 ## Estado
 
-**v0 + v1 + v2 completos.** Shell + vistas `logs` (`aws-sdk-cloudwatchlogs`), `sqs`
-(`aws-sdk-sqs`) y `sfn` (`aws-sdk-sfn`) contra el SDK real, con `Backend::Mock` (`AWSDECK_MOCK=1`)
-para tests/demo offline. Header con `profile · region`, command bar (`:logs`/`:sqs`/`:sfn`),
-filtro (`/`), drill/back, picker de profiles (`ctrl-e`) con epoch guard, selección de ambiente al
-iniciar si no hay `AWS_PROFILE` (`start_with_env_picker`), ayuda (`?`), status bar de errores.
+**v0 + v1 + v2 + v3 completos.** Shell + vistas `logs` (`aws-sdk-cloudwatchlogs`), `sqs`
+(`aws-sdk-sqs`), `sfn` (`aws-sdk-sfn`) y `events` (`aws-sdk-eventbridge`) contra el SDK real, con
+`Backend::Mock` (`AWSDECK_MOCK=1`) para tests/demo offline. Header con `profile · region`, command
+bar (`:logs`/`:sqs`/`:sfn`/`:events`), filtro (`/`), drill/back, picker de profiles (`ctrl-e`) con
+epoch guard, selección de ambiente al iniciar si no hay `AWS_PROFILE` (`start_with_env_picker`),
+ayuda (`?`), status bar de errores.
 
 **v1 `sqs`:** lista colas (badge `[fifo]`), drill a attributes (visible/in-flight/delayed/DLQ)
 + *peek* de mensajes (receive sin borrar, best-effort). Primera acción mutante **`PurgeQueue`**
@@ -113,6 +116,17 @@ empareja StateEntered/StateExited por nombre, pura/testeada), resaltando y prese
 estado que reventó. **`RedriveExecution`** (`R`) reusa el mismo gate prod-safe; la vista solo la
 ofrece si `ExecStatus::is_redrivable()`. DTOs con enums propios planos (`MachineType`/`ExecStatus`,
 no los `#[non_exhaustive]` del SDK); `DateTime → millis` vía `.to_millis().ok()` en effects.
+
+**v3 `events`:** segunda vista de **3 niveles** (`Level::{Buses,Rules,Detail}`), espeja `sfn`. L1
+`list_event_buses` (paginado). L2 `list_rules` con badge de estado (`[enabled]`/`[disabled]`
+coloreado) + descripción. L3 combina `describe_rule` + `list_targets_by_rule` en un Message: render
+partido **meta / patrón / targets** — el `event_pattern` (pretty, truncado) queda inspeccionable y
+los **targets** son la lista navegable/filtrable. `/` filtra en los 3 niveles (buses/rules/targets);
+`ClearFilter` al cambiar de nivel; señal `· parcial`. **`SendEvent`** (`S` sobre el bus) publica un
+evento de prueba **canned** (`source=awsdeck.manual`) reusando el gate prod-safe; en éxito muestra
+"evento enviado", y un `put_events` con `failed_entry_count>0` se traduce a error en la status bar.
+`RuleState` enum propio plano (`_ => Enabled`); sin timestamps (EventBridge no los expone en
+list/describe).
 
 **Pulido (UX a escala):**
 - **Menú principal** como pantalla de inicio (`Screen::{Menu,View}` en `App`): lista las
@@ -152,11 +166,12 @@ no los `#[non_exhaustive]` del SDK); `DateTime → millis` vía `.to_millis().ok
   de estado (`filtered_history_indices`), útil en histories largos (Map/Parallel); la
   preselección del estado fallido se mapea a su posición en la lista visible.
 
-97 tests sin red (routing, epoch guard, gate de mutaciones —purge y redrive—, fuzzy, menú,
-búsqueda/staleness, drill x3, back→menú de dos etapas, navegación en filtro, preservación de
-selección, `ClearFilter` al cambiar de nivel, señal `· parcial`, filtro del timeline, guard
-EXPRESS, `parse_history`, parsers, render con `TestBackend`). `AWSDECK_MOCK=1 cargo run` lo abre
-sin credenciales.
+119 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, fuzzy, menú,
+búsqueda/staleness, drill x3 en `sfn` y `events`, back→menú de dos etapas, navegación en filtro,
+preservación de selección, `ClearFilter` al cambiar de nivel, señal `· parcial`, filtro del
+timeline/targets, guard EXPRESS, `parse_history`, parsers, render con `TestBackend`). `AWSDECK_MOCK=1
+cargo run` lo abre sin credenciales.
 
-Pendiente: v3 `events` (no iniciada), eventos de log (3er nivel en `logs`), input/output por
-estado en el timeline de `sfn`, `y` (copiar ARN), abrir en consola (`o`), config en disco.
+Pendiente: `SendEvent` con payload editable (form multi-campo; v3 envía un evento canned),
+eventos de log (3er nivel en `logs`), input/output por estado en el timeline de `sfn`, `y` (copiar
+ARN), abrir en consola (`o`), config en disco. Backlog de vistas: Lambda, DynamoDB, ECS…

@@ -156,8 +156,10 @@ Listar ejecuciones por state machine con status coloreado; drill al timeline de 
 
 Entregado: 3 niveles (state machines → ejecuciones → detalle). L1 `list_state_machines` (badge tipo + fecha). L2 `list_executions` con status coloreado (verde/rojo/amarillo/cyan) + inicio + duración; guard EXPRESS (no soporta list_executions → muestra nota, no llama al SDK). L3 `describe_execution` + `get_execution_history`: input/output (pretty, truncado), error/cause y timeline de estados con duración, resaltando/saltando al estado que reventó (`parse_history` empareja StateEntered/StateExited). `RedriveExecution` (`R`) gated por el mismo gate prod-safe de v1 (modo escritura + confirm), solo en ejecuciones redrivables. Mock (`AWSDECK_MOCK=1`) y SDK real (`aws-sdk-sfn`).
 
-### v3 — Vista `events` (EventBridge)
+### v3 — Vista `events` (EventBridge) — ✅ hecho
 Listar event buses, rules y targets; inspeccionar el patrón de cada rule; `SendEvent` de prueba (gated) para disparar un evento contra un bus.
+
+Entregado: 3 niveles (event buses → rules → detalle). L1 `list_event_buses` (paginado). L2 `list_rules` con estado coloreado (`[enabled]`/`[disabled]`) + descripción; guard de bus en `on_message`. L3 `describe_rule` + `list_targets_by_rule` combinados en un Message: render partido **meta / patrón / targets** con el `event_pattern` (pretty, truncado) inspeccionable y los targets como lista navegable/filtrable. `/` filtra en los 3 niveles; `ClearFilter` al cambiar de nivel; señal `· parcial`. `SendEvent` (`S` sobre el bus) publica un evento de prueba canned (`source=awsdeck.manual`) gated por el mismo gate prod-safe de v1/v2 (modo escritura + confirm); `put_events` con `failed_entry_count>0` → error a la status bar. Mock (`AWSDECK_MOCK=1`) y SDK real (`aws-sdk-eventbridge`).
 
 ---
 

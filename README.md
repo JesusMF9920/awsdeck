@@ -5,8 +5,9 @@ para saltar entre los servicios de AWS que uso a diario —CloudWatch Logs hoy; 
 Functions y EventBridge en camino— con la misma navegación, los mismos keybindings y el
 ambiente (cuenta + región) siempre visible y cambiable al instante.
 
-> Estado: **v0 + v1 + v2** — el shell extensible + las vistas `logs` (CloudWatch), `sqs` (colas, peek,
-> purge gated) y `sfn` (Step Functions: ejecuciones, timeline, redrive gated).
+> Estado: **v0 + v1 + v2 + v3** — el shell extensible + las vistas `logs` (CloudWatch), `sqs` (colas,
+> peek, purge gated), `sfn` (Step Functions: ejecuciones, timeline, redrive gated) y `events`
+> (EventBridge: buses, rules, patrón + targets, send gated).
 > Diseño completo en [`ROADMAP.md`](ROADMAP.md); notas de arquitectura en [`CLAUDE.md`](CLAUDE.md).
 
 ## Requisitos
@@ -37,7 +38,7 @@ se muestra en la **status bar** (no crashea).
 
 | Tecla | Acción |
 |-------|--------|
-| `:` | command bar (saltar de herramienta, p. ej. `:logs`, `:sqs`) |
+| `:` | command bar (saltar de herramienta, p. ej. `:logs`, `:sqs`, `:sfn`, `:events`) |
 | `/` | buscar (fuzzy; en `logs` consulta al servidor; `↑`/`↓` navegan los resultados sin salir) |
 | `enter` | abrir herramienta (menú) / drill al detalle |
 | `esc` | con filtro aplicado lo limpia (1er `esc`); si no, vuelve un nivel (drill back; en la raíz, al menú) |
@@ -46,6 +47,7 @@ se muestra en la **status bar** (no crashea).
 | `r` | refrescar |
 | `p` | purgar cola SQS (gated: modo escritura + confirm) |
 | `R` | redrive ejecución `sfn` fallida (gated: modo escritura + confirm) |
+| `S` | enviar evento de prueba a un bus `events` (gated: modo escritura + confirm) |
 | `:write` | alternar modo escritura (habilita acciones mutantes) |
 | `ctrl-e` | cambiar de ambiente (picker de profiles) |
 | `?` | ayuda |
@@ -55,7 +57,7 @@ se muestra en la **status bar** (no crashea).
 
 ```bash
 AWSDECK_MOCK=1 cargo run    # ver el TUI con datos, sin tocar AWS
-cargo test                  # 97 tests, sin red
+cargo test                  # 119 tests, sin red
 cargo clippy --all-targets  # lint
 cargo fmt --check           # formato
 ```
@@ -73,8 +75,12 @@ Recorrido rápido (con `AWSDECK_MOCK=1 cargo run`):
    reventó va resaltado y preseleccionado). En una máquina `[express]` se muestra una nota (sus
    ejecuciones viven en CloudWatch Logs). Con `:write`, `R` hace **redrive** de una ejecución fallida
    (confirm modal).
-4. `ctrl-e` abre el picker; elige otro profile → el ambiente y la lista cambian.
-5. `?` muestra la ayuda; `q` sale y la terminal queda limpia.
+4. En `events`, `enter` entra a un event bus → sus **rules** con estado `[enabled]`/`[disabled]`;
+   `enter` en una rule → detalle partido **meta / patrón / targets** (el `event_pattern` queda visible
+   y los targets se filtran con `/`). Con `:write`, `S` sobre un bus **envía un evento de prueba**
+   (confirm modal).
+5. `ctrl-e` abre el picker; elige otro profile → el ambiente y la lista cambian.
+6. `?` muestra la ayuda; `q` sale y la terminal queda limpia.
 
 **Epoch guard:** al cambiar de ambiente con un request en vuelo, nunca se pintan datos de la
 cuenta anterior (probado en `app::tests::epoch_guard_discards_stale_and_accepts_fresh`).
@@ -112,11 +118,13 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
 - **v1** ✅ `sqs` — colas, attributes, *peek*, `PurgeQueue` (gated por modo escritura + confirm).
 - **v2** ✅ `sfn` — state machines, ejecuciones (status coloreado), timeline de estados con duración,
   `Redrive` (gated).
-- **v3** `events` — buses, rules, `SendEvent` (gated).
+- **v3** ✅ `events` — event buses, rules (estado coloreado), detalle con patrón + targets,
+  `SendEvent` (gated).
 
-Backlog: copiar ARN (`y`), abrir en consola (`o`), config en disco, más vistas (Lambda, DynamoDB, ECS…).
+Backlog: `SendEvent` con payload editable, copiar ARN (`y`), abrir en consola (`o`), config en disco,
+más vistas (Lambda, DynamoDB, ECS…).
 
 ## Stack
 
 `tokio` · `ratatui` + `crossterm` · `color-eyre` · `tui-input` · `aws-config` +
-`aws-sdk-cloudwatchlogs` / `aws-sdk-sqs` / `aws-sdk-sfn` · `serde_json`.
+`aws-sdk-cloudwatchlogs` / `aws-sdk-sqs` / `aws-sdk-sfn` / `aws-sdk-eventbridge` · `serde_json`.

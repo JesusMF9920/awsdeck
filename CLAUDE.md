@@ -31,7 +31,9 @@ Action → effects.dispatch → tokio::spawn(llamada SDK) → Message (etiquetad
 Message → mpsc → App.handle_message → (¿epoch vigente?) → View activa.on_message → render
 ```
 
-- **`View`** — trait síncrono y object-safe. No conoce el SDK ni async.
+- **`View`** — trait síncrono y object-safe. No conoce el SDK ni async. Hooks agnósticos
+  para extender sin tocar el core: `on_command` (comandos `:` no-core) y `hints` (pistas de
+  teclado contextuales que el footer anuncia).
 - **`Action`** (`action.rs`) — intenciones (load/refresh, drill, switch-env, …). Puede tener
   variantes específicas de servicio.
 - **`Message`** (`message.rs`) — resultados async (`LogGroupsLoaded`, `LogStreamsLoaded`,
@@ -77,7 +79,9 @@ concretas se cablean en `main.rs`; `effects.rs` es la frontera deliberada con el
 `esc` back de dos etapas (con filtro lo limpia; si no, un nivel; desde la raíz, al menú) ·
 `r` refresh · `ctrl-e` cambiar ambiente · `?` ayuda · `q` salir. Acciones mutantes gated por
 modo escritura (`:write`) + confirm: `p` purgar cola (`sqs`), `R` redrive ejecución (`sfn`),
-`S` enviar evento de prueba a un bus (`events`). (`y` copiar ARN/URL — más adelante.)
+`S` enviar evento de prueba a un bus (`events`). (`y` copiar ARN/URL — más adelante.) Las
+teclas propias de cada vista se **anuncian** en el footer según el contexto (`View::hints`):
+no hay que memorizar la tabla ni abrir `?`.
 
 `esc` es navegación uniforme de **dos etapas** (estilo k9s): el `App` lo intercepta en
 `on_normal_key` y, si hay filtro aplicado, lo limpia y se queda en la vista (1a etapa, la vista
@@ -184,12 +188,23 @@ list/describe).
     por severidad (ERROR rojo, WARN amarillo); señal `· parcial`. Lectura pura: **sin gate** (las
     nuevas `Message` no cambian listados → no re-dispatch). `util::parse_duration`/`parse_datetime`
     (UTC, sin crate de fechas). Mock + SDK real.
+- **Descubribilidad de teclas por vista (`View::hints`)**: hook agnóstico del trait — cada vista
+  declara sus teclas contextuales como pares `(tecla, qué hace)` según su estado (nivel de drill,
+  panel abierto). El `App` se las pide a la vista activa y el footer (`Footer::Hints`) las pinta
+  **antes** de los hints globales (lo no-obvio primero; si la fila se desborda, ratatui recorta los
+  globales por la derecha, que igual están en `?`). El core nunca las interpreta; con `view` vacío
+  el footer queda byte-idéntico al global de siempre. `logs` anuncia `t logs por tiempo` en
+  groups/streams (reforzado en el `body_title`: `· t: todos los streams por tiempo`), `w`/`o`/`:since`
+  en el tail y `esc` en el detalle de línea; `sqs`/`sfn`/`events` anuncian sus teclas gated
+  (`p`/`R`/`S`, `R` solo si la ejecución es redrivable). Hace **descubrible** el tail por tiempo de
+  `logs` (antes solo vivía en `?` con texto críptico, ya reescrito).
 
-149 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, fuzzy, menú,
+157 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, fuzzy, menú,
 búsqueda/staleness, drill x3 en `sfn`/`events` y eventos/tail de `logs`, back→menú de dos etapas,
 navegación en filtro, preservación de selección, `ClearFilter` al cambiar de nivel, señal `· parcial`,
 rango de tiempo del tail —`w`/`o`/`:since`/`:from-to`, staleness por gen, append—, expandir línea
-(JSON pretty), parsers de fecha/duración, guard EXPRESS, `parse_history`, render con `TestBackend`).
+(JSON pretty), parsers de fecha/duración, guard EXPRESS, `parse_history`, hints contextuales por
+vista (`View::hints`) + render del footer con/sin contexto, render con `TestBackend`).
 `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
 
 Pendiente: `SendEvent` con payload editable (form multi-campo; v3 envía un evento canned), tail en

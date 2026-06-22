@@ -57,7 +57,9 @@ ya vive ahí, y meter el siguiente cuesta un PR pequeño.
 - **`View` (contrato de plugin).** Trait síncrono y object-safe. Cada vista declara su `id`
   (alias de comando, p. ej. `"logs"`), su título para el header, qué `Action`s emitir al
   activarse, cómo reacciona a teclas (devolviendo `Action`s), cómo ingiere un `Message` y
-  cómo se dibuja. Nada de SDK, nada de async aquí.
+  cómo se dibuja. Nada de SDK, nada de async aquí. Hooks agnósticos para extenderse sin tocar
+  el core: `on_command` (comandos `:` propios) y `hints` (pistas de teclado contextuales que el
+  footer anuncia según el estado de la vista).
 - **`Action` (intenciones).** Lo que el usuario/vista quiere que pase, normalmente async:
   `Refresh`, `Drill(id)`, `SwitchEnv(env)`, y las mutantes `PurgeQueue`, `Redrive`, `SendEvent`.
 - **`Message` (resultados).** Lo que regresa del mundo async: `LogGroupsLoaded`, `QueuesLoaded`,
@@ -154,7 +156,8 @@ todos sus streams). El **rango** se elige con presets (`w`/`W`: 15m…7d) o por 
 (auto + `o` para cargar más) con staleness por `generation`. `/` filtra server-side (`filter_pattern`).
 **Expandir una línea**: `enter` sobre un evento abre el mensaje completo (wrap + scroll, JSON pretty;
 `esc` cierra). `LogWindow` plano (el reloj solo en `effects`); mock + real, sin gate (lectura).
-Pendiente: tail en vivo (`tail -f`).
+El tail y su selector de tiempo se **anuncian** en el footer y en el título del group (vía el hook
+agnóstico `View::hints`) para que no queden escondidos. Pendiente: tail en vivo (`tail -f`).
 
 ### v1 — Vista `sqs` — ✅ hecho
 Listar colas del ambiente; ver attributes (mensajes visibles, in-flight, DLQ); *peek* de mensajes (receive sin borrar). Acción mutante `PurgeQueue` detrás de confirm + modo escritura.

@@ -57,11 +57,15 @@ se muestra en la **status bar** (no crashea).
 | `?` | ayuda |
 | `q` | salir |
 
+> Las teclas específicas de cada vista (`t`/`w`/`o` en `logs`, `p`/`R`/`S` gated) se **anuncian
+> solas** en el footer según dónde estés, y `logs` además recuerda `t` en el título del group:
+> no hace falta memorizar esta tabla ni abrir `?`.
+
 ## Cómo probar los cambios
 
 ```bash
 AWSDECK_MOCK=1 cargo run    # ver el TUI con datos, sin tocar AWS
-cargo test                  # 149 tests, sin red
+cargo test                  # 157 tests, sin red
 cargo clippy --all-targets  # lint
 cargo fmt --check           # formato
 ```

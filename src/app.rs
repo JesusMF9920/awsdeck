@@ -733,9 +733,20 @@ impl App {
                     error: status.error,
                     text: &status.text,
                 },
-                None => command_bar::Footer::Hints {
-                    filter: &self.filter,
-                },
+                None => {
+                    // Pistas contextuales de la vista activa (solo en una vista, no
+                    // en el menú). El core no las interpreta: las reenvía al footer.
+                    let view = match self.screen {
+                        Screen::View => {
+                            self.registry.active().map(|v| v.hints()).unwrap_or_default()
+                        }
+                        Screen::Menu => Vec::new(),
+                    };
+                    command_bar::Footer::Hints {
+                        filter: &self.filter,
+                        view,
+                    }
+                }
             },
         }
     }

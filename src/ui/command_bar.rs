@@ -18,8 +18,13 @@ pub enum Footer<'a> {
     },
     /// Mensaje de estado (info o error).
     Status { error: bool, text: &'a str },
-    /// Modo normal: hints de teclado, o el filtro aplicado si lo hay.
-    Hints { filter: &'a str },
+    /// Modo normal: hints de teclado, o el filtro aplicado si lo hay. `view` son las
+    /// pistas contextuales de la vista activa (`View::hints`), que se pintan ANTES de
+    /// los hints globales. Vacío = footer idéntico al global de siempre.
+    Hints {
+        filter: &'a str,
+        view: Vec<(&'static str, &'static str)>,
+    },
 }
 
 pub fn render(frame: &mut Frame, area: Rect, footer: Footer<'_>) {
@@ -46,10 +51,27 @@ pub fn render(frame: &mut Frame, area: Rect, footer: Footer<'_>) {
                 area,
             );
         }
-        Footer::Hints { filter } => {
-            let line = if filter.is_empty() {
+        Footer::Hints { filter, view } => {
+            let line = if !filter.is_empty() {
                 Line::from(vec![
-                    key(" :"),
+                    label(" filtro: "),
+                    Span::styled(filter.to_string(), Style::new().yellow().bold()),
+                    label("   (/ editar · esc limpiar)"),
+                ])
+            } else {
+                // Pistas contextuales de la vista (si las hay) y luego las globales.
+                // Van primero porque son lo no-obvio; si la fila se desborda, ratatui
+                // recorta por la derecha (las globales, que además están en `?`).
+                let mut spans = vec![Span::raw(" ")];
+                for &(k, desc) in &view {
+                    spans.push(key(k));
+                    spans.push(label(&format!("{desc}  ")));
+                }
+                if !view.is_empty() {
+                    spans.push(label("· "));
+                }
+                spans.extend([
+                    key(":"),
                     label("cmd  "),
                     key("/"),
                     label("filtro  "),
@@ -65,13 +87,8 @@ pub fn render(frame: &mut Frame, area: Rect, footer: Footer<'_>) {
                     label("ayuda  "),
                     key("q"),
                     label("salir"),
-                ])
-            } else {
-                Line::from(vec![
-                    label(" filtro: "),
-                    Span::styled(filter.to_string(), Style::new().yellow().bold()),
-                    label("   (/ editar · esc limpiar)"),
-                ])
+                ]);
+                Line::from(spans)
             };
             frame.render_widget(Paragraph::new(line), area);
         }
@@ -86,4 +103,55 @@ fn key(k: &str) -> Span<'static> {
 /// Span tenue para el texto descriptivo.
 fn label(text: &str) -> Span<'static> {
     Span::styled(text.to_string(), Style::new().dark_gray())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn footer_line(footer: Footer, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal.draw(|f| render(f, f.area(), footer)).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect()
+    }
+
+    #[test]
+    fn hints_pinta_contexto_antes_de_globales() {
+        let line = footer_line(
+            Footer::Hints {
+                filter: "",
+                view: vec![("t", "logs por tiempo")],
+            },
+            120,
+        );
+        assert!(
+            line.contains("logs por tiempo"),
+            "muestra el hint contextual: {line:?}"
+        );
+        assert!(line.contains("cmd"), "y los globales: {line:?}");
+        assert!(
+            line.find("logs por tiempo") < line.find("cmd"),
+            "los contextuales van antes que los globales: {line:?}"
+        );
+    }
+
+    #[test]
+    fn hints_sin_contexto_son_solo_globales() {
+        // view vacío = footer global de siempre (cero regresión).
+        let line = footer_line(
+            Footer::Hints {
+                filter: "",
+                view: vec![],
+            },
+            120,
+        );
+        assert!(line.contains("cmd") && line.contains("salir"));
+        assert!(
+            !line.contains("logs por tiempo"),
+            "sin view no hay contextuales: {line:?}"
+        );
+    }
 }

@@ -436,6 +436,21 @@ impl View for SfnView {
         "Step Functions: ejecuciones, timeline, redrive"
     }
 
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        // `R` solo se ofrece sobre una ejecución redrivable (FAILED/TIMED_OUT/ABORTED),
+        // igual que `redrive_intent`. Gated por modo escritura + confirm en el App.
+        if matches!(self.level, Level::Detail { .. })
+            && self
+                .detail
+                .as_ref()
+                .is_some_and(|d| d.status.is_redrivable())
+        {
+            vec![("R", "redrive")]
+        } else {
+            vec![]
+        }
+    }
+
     fn title(&self) -> String {
         match &self.level {
             Level::Machines => "sfn".to_string(),
@@ -1036,6 +1051,17 @@ mod tests {
             v.detail.is_none(),
             "no se acepta el detalle de otra ejecución"
         );
+    }
+
+    #[test]
+    fn hints_offer_redrive_only_when_redrivable() {
+        let failed = view_in_detail(ExecStatus::Failed);
+        assert!(
+            failed.hints().iter().any(|(k, _)| *k == "R"),
+            "una ejecución fallida anuncia redrive"
+        );
+        let ok = view_in_detail(ExecStatus::Succeeded);
+        assert!(ok.hints().is_empty(), "una ejecución sana no anuncia redrive");
     }
 
     #[test]

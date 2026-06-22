@@ -236,6 +236,14 @@ impl View for SqsView {
         "Colas SQS: attributes, peek, purge"
     }
 
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        match self.level {
+            // En el detalle de una cola, `p` purga (gated por modo escritura + confirm).
+            Level::Detail { .. } => vec![("p", "purgar")],
+            Level::Queues => vec![],
+        }
+    }
+
     fn title(&self) -> String {
         match &self.level {
             Level::Queues => "sqs".to_string(),
@@ -555,6 +563,18 @@ mod tests {
             }],
         });
         assert_eq!(v.visible_len(), 0, "no se acepta detalle de otra cola");
+    }
+
+    #[test]
+    fn hints_offer_purge_only_in_detail() {
+        let mut v = SqsView::new();
+        v.on_message(&Message::QueuesLoaded(vec![queue("orders")]));
+        assert!(v.hints().is_empty(), "en la lista no hay acción gated");
+        v.on_key(key(KeyCode::Enter)); // → Detail
+        assert!(
+            v.hints().iter().any(|(k, _)| *k == "p"),
+            "el detalle de la cola anuncia purgar"
+        );
     }
 
     #[test]

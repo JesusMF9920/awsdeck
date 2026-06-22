@@ -353,6 +353,14 @@ impl View for EventsView {
         "EventBridge: buses, rules, patrón y send"
     }
 
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        match self.level {
+            // `S` envía un evento de prueba al bus (gated por modo escritura + confirm).
+            Level::Buses => vec![("S", "enviar evento")],
+            _ => vec![],
+        }
+    }
+
     fn title(&self) -> String {
         match &self.level {
             Level::Buses => "events".to_string(),
@@ -780,6 +788,18 @@ mod tests {
             targets: vec![],
         });
         assert!(v.detail.is_none(), "detalle de otra rule se descarta");
+    }
+
+    #[test]
+    fn hints_offer_send_event_only_on_buses() {
+        let mut v = EventsView::new();
+        assert!(
+            v.hints().iter().any(|(k, _)| *k == "S"),
+            "en buses se anuncia enviar evento"
+        );
+        v.on_message(&buses_msg(vec![bus("default")]));
+        v.on_key(key(KeyCode::Enter)); // → Rules
+        assert!(v.hints().is_empty(), "en rules no se ofrece S");
     }
 
     #[test]

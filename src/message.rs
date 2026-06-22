@@ -225,12 +225,10 @@ pub struct TargetDto {
 /// (`message.rs` es frontera permitida para nombrar servicios).
 #[derive(Clone, Debug)]
 pub enum Message {
-    /// Se cargó una página de log groups. `query` ecoa la búsqueda que la originó
-    /// (para que la vista descarte respuestas de búsquedas viejas); `more` indica
-    /// que el servidor tiene más resultados (`next_token`).
+    /// Se cargaron los log groups del ambiente. `more` indica que se topó el tope de
+    /// paginación y hay más en el servidor (la vista muestra `· parcial`).
     LogGroupsLoaded {
         groups: Vec<LogGroupDto>,
-        query: Option<String>,
         more: bool,
     },
     /// Se cargaron los streams de `group` (se incluye `group` para que la vista

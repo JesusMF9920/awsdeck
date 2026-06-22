@@ -28,9 +28,9 @@ pub enum Action {
     SwitchEnv(Env),
 
     // --- Efectos: `App` los reenvía a `effects::dispatch` (específicos de servicio) ---
-    /// Pedir log groups: una página acotada (≤50). `query=None` = primeros 50;
-    /// `query=Some(p)` = búsqueda server-side por substring (`logGroupNamePattern`).
-    LoadLogGroups { query: Option<String> },
+    /// Pedir todos los log groups del ambiente (paginados hasta un tope). El filtrado
+    /// es 100% local en la vista (fuzzy, case-insensitive), como en `sfn`/`events`.
+    LoadLogGroups,
     /// Hacer drill: pedir los log streams de un log group.
     LoadLogStreams { group: String },
     /// Hacer drill a un stream: sus eventos más recientes (`get_log_events`).

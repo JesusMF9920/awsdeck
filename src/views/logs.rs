@@ -54,6 +54,15 @@ pub struct LogsView {
     streams: Vec<LogStreamDto>,
     /// Buffer de líneas para las hojas `Events`/`Tail` (solo una activa a la vez).
     events: Vec<LogEventDto>,
+    /// Display precomputado de cada evento (lowercase + preview + estilo), paralelo a
+    /// `events`. Evita recomputar `to_lowercase()`/`replace()`/severidad por tecla y por
+    /// frame en buffers grandes (rangos amplios → hasta ~10k líneas). Se mantiene en sync
+    /// vía `set_events`/`extend_events`.
+    event_rows: Vec<EventRow>,
+    /// Índices visibles (post-filtro) del nivel actual: la fuente de verdad para
+    /// navegación y render. Se recomputa solo al cambiar filtro/lista/nivel
+    /// (`recompute_filtered`), no en cada pulsación ni en cada frame.
+    filtered: Vec<usize>,
     filter: String,
     loading: bool,
     /// Patrón server-side activo del **tail** (`filter_pattern`); `None` = sin filtro.
@@ -86,6 +95,8 @@ impl LogsView {
             groups: Vec::new(),
             streams: Vec::new(),
             events: Vec::new(),
+            event_rows: Vec::new(),
+            filtered: Vec::new(),
             filter: String::new(),
             loading: false,
             last_query: None,
@@ -103,7 +114,7 @@ impl LogsView {
     /// Abre el panel de detalle del evento seleccionado (índice absoluto en `events`).
     fn open_detail(&mut self) {
         if let Some(sel) = self.state.selected()
-            && let Some(&idx) = self.filtered_event_indices().get(sel)
+            && let Some(&idx) = self.filtered.get(sel)
         {
             self.detail = Some(idx);
             self.detail_scroll = 0;
@@ -179,23 +190,43 @@ impl LogsView {
         })
     }
 
-    /// Filtro de líneas de log: substring case-insensitive sobre el mensaje (no
-    /// fuzzy — más apropiado para texto largo), preservando el orden cronológico.
+    /// Filtro de líneas de log: substring case-insensitive sobre el mensaje (no fuzzy —
+    /// más apropiado para texto largo), preservando el orden cronológico. Usa el
+    /// lowercase precomputado (`event_rows`), así que no aloca por evento.
     fn filtered_event_indices(&self) -> Vec<usize> {
         let needle = self.filter.to_lowercase();
-        (0..self.events.len())
-            .filter(|&i| {
-                needle.is_empty() || self.events[i].message.to_lowercase().contains(&needle)
-            })
+        (0..self.event_rows.len())
+            .filter(|&i| needle.is_empty() || self.event_rows[i].lc.contains(&needle))
             .collect()
     }
 
+    /// Recalcula `self.filtered` (índices visibles del nivel actual). Se llama solo al
+    /// cambiar filtro/lista/nivel — nunca por tecla de navegación ni por frame.
+    fn recompute_filtered(&mut self) {
+        self.filtered = match self.level {
+            Level::Groups => self.filtered_group_indices(),
+            Level::Streams { .. } => self.filtered_stream_indices(),
+            Level::Events { .. } | Level::Tail { .. } => self.filtered_event_indices(),
+        };
+    }
+
+    /// Reemplaza el buffer de eventos y su display precomputado, y recomputa el filtro.
+    /// Único punto (con `extend_events`) que muta `events`/`event_rows` en sync.
+    fn set_events(&mut self, events: Vec<LogEventDto>) {
+        self.event_rows = events.iter().map(EventRow::new).collect();
+        self.events = events;
+        self.recompute_filtered();
+    }
+
+    /// Append (load-more del tail): extiende eventos + display y recomputa el filtro.
+    fn extend_events(&mut self, events: Vec<LogEventDto>) {
+        self.event_rows.extend(events.iter().map(EventRow::new));
+        self.events.extend(events);
+        self.recompute_filtered();
+    }
+
     fn visible_len(&self) -> usize {
-        match self.level {
-            Level::Groups => self.filtered_group_indices().len(),
-            Level::Streams { .. } => self.filtered_stream_indices().len(),
-            Level::Events { .. } | Level::Tail { .. } => self.filtered_event_indices().len(),
-        }
+        self.filtered.len()
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -237,9 +268,7 @@ impl LogsView {
     /// esto conserva ese baseline cuando el usuario no navegó.
     fn restore_selection(&mut self, name: Option<&str>) {
         let pos = name.and_then(|n| {
-            self.filtered_group_indices()
-                .iter()
-                .position(|&i| self.groups[i].name == n)
+            self.filtered.iter().position(|&i| self.groups[i].name == n)
         });
         self.state.select(Some(pos.unwrap_or(0)));
         self.clamp_selection();
@@ -247,13 +276,13 @@ impl LogsView {
 
     fn selected_group_name(&self) -> Option<String> {
         let sel = self.state.selected()?;
-        let idx = *self.filtered_group_indices().get(sel)?;
+        let idx = *self.filtered.get(sel)?;
         Some(self.groups[idx].name.clone())
     }
 
     fn selected_stream_name(&self) -> Option<String> {
         let sel = self.state.selected()?;
-        let idx = *self.filtered_stream_indices().get(sel)?;
+        let idx = *self.filtered.get(sel)?;
         Some(self.streams[idx].name.clone())
     }
 
@@ -267,6 +296,7 @@ impl LogsView {
                         group: group.clone(),
                     };
                     self.streams.clear();
+                    self.recompute_filtered();
                     self.loading = true;
                     self.state.select(Some(0));
                     // ClearFilter evita que el filtro de groups (server-side) se
@@ -283,7 +313,7 @@ impl LogsView {
                             group: group.clone(),
                             stream: stream.clone(),
                         };
-                        self.events.clear();
+                        self.set_events(Vec::new());
                         self.loading = true;
                         self.state.select(Some(0));
                         vec![Action::ClearFilter, Action::LoadLogEvents { group, stream }]
@@ -315,7 +345,7 @@ impl LogsView {
         match self.current_group() {
             Some(group) => {
                 self.level = Level::Tail { group };
-                self.events.clear();
+                self.set_events(Vec::new());
                 self.tail_window = window;
                 self.tail_preset = preset;
                 self.tail_token = None;
@@ -341,7 +371,7 @@ impl LogsView {
             (self.tail_preset + n - 1) % n
         };
         self.tail_window = LogWindow::Last(WINDOW_PRESETS[self.tail_preset].1);
-        self.events.clear();
+        self.set_events(Vec::new());
         self.tail_token = None;
         self.state.select(Some(0));
         self.tail_query(None)
@@ -365,6 +395,7 @@ impl LogsView {
                 self.level = Level::Streams {
                     group: group.clone(),
                 };
+                self.recompute_filtered();
                 self.state.select(Some(0));
                 self.clamp_selection();
                 self.loading = false;
@@ -374,6 +405,7 @@ impl LogsView {
             // sin filtro server-side), así que volver no recarga: solo cambia de nivel.
             Level::Streams { .. } | Level::Tail { .. } => {
                 self.level = Level::Groups;
+                self.recompute_filtered();
                 self.state.select(Some(0));
                 self.clamp_selection();
                 self.loading = false;
@@ -386,7 +418,7 @@ impl LogsView {
     fn refresh(&mut self) -> Vec<Action> {
         // El tail recarga la ventana/patrón actuales (consulta fresca, sube generation).
         if matches!(self.level, Level::Tail { .. }) {
-            self.events.clear();
+            self.set_events(Vec::new());
             self.tail_token = None;
             self.state.select(Some(0));
             return self.tail_query(None);
@@ -420,27 +452,12 @@ impl LogsView {
     }
 
     fn body_title(&self) -> String {
-        let (kind, total, shown) = match self.level {
-            Level::Groups => (
-                "log groups",
-                self.groups.len(),
-                self.filtered_group_indices().len(),
-            ),
-            Level::Streams { .. } => (
-                "streams",
-                self.streams.len(),
-                self.filtered_stream_indices().len(),
-            ),
-            Level::Events { .. } => (
-                "eventos",
-                self.events.len(),
-                self.filtered_event_indices().len(),
-            ),
-            Level::Tail { .. } => (
-                "líneas",
-                self.events.len(),
-                self.filtered_event_indices().len(),
-            ),
+        let shown = self.filtered.len();
+        let (kind, total) = match self.level {
+            Level::Groups => ("log groups", self.groups.len()),
+            Level::Streams { .. } => ("streams", self.streams.len()),
+            Level::Events { .. } => ("eventos", self.events.len()),
+            Level::Tail { .. } => ("líneas", self.events.len()),
         };
         // En el tail, antepone la ventana de tiempo activa.
         let window = if matches!(self.level, Level::Tail { .. }) {
@@ -554,7 +571,7 @@ impl View for LogsView {
     fn on_activate(&mut self) -> Vec<Action> {
         self.level = Level::Groups;
         self.streams.clear();
-        self.events.clear();
+        self.set_events(Vec::new()); // limpia events + event_rows + recomputa filtered
         self.loading = true;
         self.last_query = None;
         self.partial = false;
@@ -610,6 +627,7 @@ impl View for LogsView {
                 self.partial = *more;
                 if matches!(self.level, Level::Groups) {
                     self.loading = false;
+                    self.recompute_filtered();
                     self.restore_selection(keep.as_deref());
                 }
             }
@@ -620,6 +638,7 @@ impl View for LogsView {
                 {
                     self.streams = streams.clone();
                     self.loading = false;
+                    self.recompute_filtered();
                     self.clamp_selection();
                 }
             }
@@ -637,7 +656,7 @@ impl View for LogsView {
                     && g == group
                     && s == stream
                 {
-                    self.events = events.clone();
+                    self.set_events(events.clone());
                     self.partial = *more;
                     self.loading = false;
                     self.select_edge(true); // newest abajo (convención de terminal)
@@ -659,9 +678,9 @@ impl View for LogsView {
                     && g == group
                 {
                     if *append {
-                        self.events.extend(events.iter().cloned());
+                        self.extend_events(events.clone());
                     } else {
-                        self.events = events.clone();
+                        self.set_events(events.clone());
                     }
                     self.tail_token = next_token.clone();
                     self.partial = next_token.is_some();
@@ -682,6 +701,7 @@ impl View for LogsView {
 
     fn set_filter(&mut self, filter: &str) {
         self.filter = filter.to_string();
+        self.recompute_filtered();
         self.state.select(Some(0)); // top = mejor match (estilo fzf)
         self.clamp_selection();
     }
@@ -695,7 +715,7 @@ impl View for LogsView {
             Level::Groups => Vec::new(),
             Level::Tail { .. } => {
                 self.last_query = (!query.is_empty()).then(|| query.to_string());
-                self.events.clear();
+                self.set_events(Vec::new());
                 self.tail_token = None;
                 self.state.select(Some(0));
                 self.tail_query(None) // consulta fresca (sube generation)
@@ -752,19 +772,19 @@ impl View for LogsView {
 
         let items: Vec<ListItem> = match self.level {
             Level::Groups => self
-                .filtered_group_indices()
-                .into_iter()
-                .map(|i| group_item(&self.groups[i]))
+                .filtered
+                .iter()
+                .map(|&i| group_item(&self.groups[i]))
                 .collect(),
             Level::Streams { .. } => self
-                .filtered_stream_indices()
-                .into_iter()
-                .map(|i| stream_item(&self.streams[i]))
+                .filtered
+                .iter()
+                .map(|&i| stream_item(&self.streams[i]))
                 .collect(),
             Level::Events { .. } | Level::Tail { .. } => self
-                .filtered_event_indices()
-                .into_iter()
-                .map(|i| event_item(&self.events[i]))
+                .filtered
+                .iter()
+                .map(|&i| event_item(&self.event_rows[i]))
                 .collect(),
         };
 
@@ -797,6 +817,37 @@ impl View for LogsView {
 
 // --- Construcción de filas y formato ------------------------------------------
 
+/// Display precomputado de una línea de log: todo lo caro (lowercase para el filtro,
+/// preview colapsado, formato de hora/stream, color por severidad) se calcula una vez al
+/// ingerir el evento, no por tecla ni por frame.
+struct EventRow {
+    /// `HH:MM:SS` (o `--:--:--`), tenue.
+    clock: String,
+    /// Sufijo corto del stream (solo presente en el tail, donde se mezclan streams).
+    stream: Option<String>,
+    /// Mensaje colapsado a una línea (sin saltos) para la fila.
+    preview: String,
+    /// Color por severidad del mensaje.
+    style: Style,
+    /// Mensaje en lowercase, para el filtro substring case-insensitive sin alocar.
+    lc: String,
+}
+
+impl EventRow {
+    fn new(e: &LogEventDto) -> Self {
+        EventRow {
+            clock: e
+                .ts
+                .map(fmt_clock_millis)
+                .unwrap_or_else(|| "--:--:--".to_string()),
+            stream: e.stream.as_deref().map(stream_suffix),
+            preview: e.message.replace(['\n', '\r'], " "),
+            style: severity_style(&e.message),
+            lc: e.message.to_lowercase(),
+        }
+    }
+}
+
 fn group_item(g: &LogGroupDto) -> ListItem<'static> {
     let size = g
         .stored_bytes
@@ -821,25 +872,18 @@ fn stream_item(s: &LogStreamDto) -> ListItem<'static> {
     ]))
 }
 
-/// Una línea de log: `HH:MM:SS  [stream]  message`. El `[stream]` solo aparece en el
-/// tail (varios streams mezclados). Color por severidad del mensaje.
-fn event_item(e: &LogEventDto) -> ListItem<'static> {
-    let when =
-        e.ts.map(fmt_clock_millis)
-            .unwrap_or_else(|| "--:--:--".to_string());
+/// Una línea de log: `HH:MM:SS  [stream]  message`, ensamblada desde el `EventRow`
+/// precomputado (sin recomputar lowercase/preview/severidad por frame). El `[stream]`
+/// solo aparece en el tail (varios streams mezclados).
+fn event_item(row: &EventRow) -> ListItem<'static> {
     let mut spans = vec![
-        Span::styled(when, Style::new().dark_gray()),
+        Span::styled(row.clock.clone(), Style::new().dark_gray()),
         Span::raw("  "),
     ];
-    if let Some(stream) = &e.stream {
-        spans.push(Span::styled(
-            format!("{}  ", stream_suffix(stream)),
-            Style::new().cyan(),
-        ));
+    if let Some(stream) = &row.stream {
+        spans.push(Span::styled(format!("{stream}  "), Style::new().cyan()));
     }
-    // Preview de una sola fila: colapsa saltos (el mensaje completo se ve con `enter`).
-    let preview = e.message.replace(['\n', '\r'], " ");
-    spans.push(Span::styled(preview, severity_style(&e.message)));
+    spans.push(Span::styled(row.preview.clone(), row.style));
     ListItem::new(Line::from(spans))
 }
 
@@ -1323,6 +1367,47 @@ mod tests {
             generation: 1,
         });
         assert_eq!(v.visible_len(), 4, "append extiende el buffer");
+    }
+
+    #[test]
+    fn filtered_cache_matches_recompute() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Char('t'))); // gen=1
+        v.on_message(&tail_loaded(
+            "/svc",
+            1,
+            vec![ev("INFO a", 1), ev("ERROR b", 2), ev("INFO c", 3)],
+        ));
+        // El cache (self.filtered) es idéntico al cálculo directo, con y sin filtro.
+        assert_eq!(v.filtered, v.filtered_event_indices());
+        assert_eq!(v.filtered.len(), 3);
+        v.set_filter("error");
+        assert_eq!(v.filtered, v.filtered_event_indices());
+        assert_eq!(v.filtered.len(), 1, "filtro substring sobre el lowercase precomputado");
+        v.set_filter("");
+        assert_eq!(v.filtered.len(), 3, "limpiar el filtro restituye el cache");
+    }
+
+    #[test]
+    fn append_extends_lowercase_cache_and_filter() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Char('t'))); // gen=1
+        v.on_message(&tail_loaded("/svc", 1, vec![ev("INFO ok", 1)]));
+        v.set_filter("boom");
+        assert_eq!(v.visible_len(), 0, "nada matchea aún");
+        // Append con una línea que SÍ matchea el filtro activo: aparece (event_rows y
+        // el cache se extienden en sync).
+        v.on_message(&Message::LogTailLoaded {
+            group: "/svc".into(),
+            events: vec![ev("ERROR boom", 2)],
+            next_token: None,
+            append: true,
+            generation: 1,
+        });
+        assert_eq!(v.event_rows.len(), 2, "event_rows crece con el append");
+        assert_eq!(v.visible_len(), 1, "el append respeta el filtro vía el cache");
     }
 
     #[test]

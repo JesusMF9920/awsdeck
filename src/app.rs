@@ -329,10 +329,18 @@ impl App {
                 self.fire_search_now();
                 self.mode = Mode::Normal;
             }
-            // enter dispara la búsqueda de inmediato y vuelve a normal.
+            // enter commitea el filtro y, en la MISMA pulsación, reenvía el Enter a la
+            // vista para hacer drill (un solo enter, no dos). El drill de la vista emite
+            // `ClearFilter`, así que el filtro no se arrastra al nivel hijo; en una hoja,
+            // Enter abre el detalle. Mismo patrón de reenvío que las flechas.
             KeyCode::Enter => {
                 self.fire_search_now();
                 self.mode = Mode::Normal;
+                let actions = match self.registry.active_mut() {
+                    Some(view) => view.on_key(key),
+                    None => Vec::new(),
+                };
+                self.dispatch_all(actions);
             }
             // Flechas: navegar los resultados sin salir del filtro (estilo fzf).
             // Se reenvían a la vista (mueve su selección sobre la lista filtrada);
@@ -1131,6 +1139,26 @@ mod tests {
             app.input.value(),
             "",
             "la flecha no edita el texto del filtro"
+        );
+    }
+
+    #[test]
+    fn filter_enter_commits_and_forwards_to_view() {
+        let (mut app, _activations, keys) = app_with_counting_view();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // menú → vista
+        app.on_key(ch('/')); // abre el filtro
+        assert!(matches!(app.mode, Mode::Filter));
+        let before = keys.get();
+
+        // Un solo Enter: commitea el filtro Y se reenvía a la vista (drill en una pulsación).
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.mode, Mode::Normal), "enter commitea el filtro");
+        assert!(matches!(app.screen, Screen::View), "sigue en la vista");
+        assert_eq!(
+            keys.get(),
+            before + 1,
+            "el enter llega a la vista (no hace falta un segundo enter)"
         );
     }
 

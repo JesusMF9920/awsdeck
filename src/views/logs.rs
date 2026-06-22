@@ -286,6 +286,27 @@ impl LogsView {
         Some(self.streams[idx].name.clone())
     }
 
+    /// Texto a copiar con `y` según el contexto: en el detalle, el mensaje completo de
+    /// la línea; en groups, el ARN del group (o el nombre); en streams, el nombre del
+    /// stream; en las hojas de líneas, el mensaje de la línea seleccionada.
+    fn copy_text(&self) -> Option<String> {
+        if let Some(idx) = self.detail {
+            return self.events.get(idx).map(|e| e.message.clone());
+        }
+        match self.level {
+            Level::Groups => {
+                let idx = *self.filtered.get(self.state.selected()?)?;
+                let g = &self.groups[idx];
+                Some(g.arn.clone().unwrap_or_else(|| g.name.clone()))
+            }
+            Level::Streams { .. } => self.selected_stream_name(),
+            Level::Events { .. } | Level::Tail { .. } => {
+                let idx = *self.filtered.get(self.state.selected()?)?;
+                Some(self.events[idx].message.clone())
+            }
+        }
+    }
+
     // --- Navegación -----------------------------------------------------------
 
     fn drill(&mut self) -> Vec<Action> {
@@ -545,17 +566,17 @@ impl View for LogsView {
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
-        // Con el detalle abierto, las teclas scrollean/cierran.
+        // Con el detalle abierto, las teclas scrollean/cierran/copian.
         if self.detail.is_some() {
-            return vec![("j/k", "scroll"), ("esc", "cerrar")];
+            return vec![("j/k", "scroll"), ("y", "copiar"), ("esc", "cerrar")];
         }
         match self.level {
             // `t` abre el tail (todos los streams del group por rango): es el feature
             // que cuesta descubrir, así que se anuncia donde aplica.
-            Level::Groups | Level::Streams { .. } => vec![("t", "logs por tiempo")],
+            Level::Groups | Level::Streams { .. } => vec![("t", "logs por tiempo"), ("y", "copiar")],
             // Dentro del tail: cómo cambiar la ventana / paginar / fijar rango.
             Level::Tail { .. } => vec![("w", "ventana"), ("o", "más"), (":since", "rango")],
-            Level::Events { .. } => vec![],
+            Level::Events { .. } => vec![("y", "copiar línea")],
         }
     }
 
@@ -583,6 +604,15 @@ impl View for LogsView {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        // `y` copia al portapapeles en cualquier nivel (incluido el detalle), antes de
+        // que el panel de detalle capture las teclas.
+        if key.code == KeyCode::Char('y') {
+            return self
+                .copy_text()
+                .map(|text| Action::CopyToClipboard { text })
+                .into_iter()
+                .collect();
+        }
         // Con el panel de detalle abierto, las teclas scrollean/cierran.
         if self.detail.is_some() {
             return self.detail_key(key);
@@ -1367,6 +1397,28 @@ mod tests {
             generation: 1,
         });
         assert_eq!(v.visible_len(), 4, "append extiende el buffer");
+    }
+
+    #[test]
+    fn y_copies_group_identifier() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        match v.on_key(key(KeyCode::Char('y'))).as_slice() {
+            // `group()` no trae ARN → cae al nombre.
+            [Action::CopyToClipboard { text }] => assert_eq!(text, "/svc"),
+            other => panic!("se esperaba CopyToClipboard, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn y_in_events_copies_the_line() {
+        let mut v = LogsView::new();
+        into_events(&mut v);
+        v.on_message(&events_loaded("/svc", "stream-a", vec![ev("ERROR boom", 1)]));
+        match v.on_key(key(KeyCode::Char('y'))).as_slice() {
+            [Action::CopyToClipboard { text }] => assert_eq!(text, "ERROR boom"),
+            other => panic!("se esperaba copiar la línea, llegó {other:?}"),
+        }
     }
 
     #[test]

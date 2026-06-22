@@ -138,6 +138,16 @@ impl SfnView {
         Some(self.machines[idx].clone())
     }
 
+    /// Texto a copiar con `y`: el ARN del item del nivel actual (máquina / ejecución /
+    /// ejecución en detalle).
+    fn copy_text(&self) -> Option<String> {
+        match &self.level {
+            Level::Machines => self.selected_machine().map(|m| m.arn),
+            Level::Executions { .. } => self.selected_execution().map(|e| e.arn),
+            Level::Detail { execution_arn, .. } => Some(execution_arn.clone()),
+        }
+    }
+
     fn selected_execution(&self) -> Option<ExecutionDto> {
         let sel = self.state.selected()?;
         let idx = *self.filtered_execution_indices().get(sel)?;
@@ -437,6 +447,7 @@ impl View for SfnView {
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        let mut hints = vec![("y", "copiar ARN")];
         // `R` solo se ofrece sobre una ejecución redrivable (FAILED/TIMED_OUT/ABORTED),
         // igual que `redrive_intent`. Gated por modo escritura + confirm en el App.
         if matches!(self.level, Level::Detail { .. })
@@ -445,10 +456,9 @@ impl View for SfnView {
                 .as_ref()
                 .is_some_and(|d| d.status.is_redrivable())
         {
-            vec![("R", "redrive")]
-        } else {
-            vec![]
+            hints.push(("R", "redrive"));
         }
+        hints
     }
 
     fn title(&self) -> String {
@@ -498,6 +508,11 @@ impl View for SfnView {
             KeyCode::Esc => self.back(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('R') => self.redrive_intent(),
+            KeyCode::Char('y') => self
+                .copy_text()
+                .map(|text| Action::CopyToClipboard { text })
+                .into_iter()
+                .collect(),
             _ => vec![],
         }
     }
@@ -1054,6 +1069,16 @@ mod tests {
     }
 
     #[test]
+    fn y_copies_machine_arn() {
+        let mut v = SfnView::new();
+        v.on_message(&machines_msg(vec![machine("m1", MachineType::Standard)]));
+        match v.on_key(key(KeyCode::Char('y'))).as_slice() {
+            [Action::CopyToClipboard { text }] => assert!(text.contains(":stateMachine:m1")),
+            other => panic!("se esperaba CopyToClipboard, llegó {other:?}"),
+        }
+    }
+
+    #[test]
     fn hints_offer_redrive_only_when_redrivable() {
         let failed = view_in_detail(ExecStatus::Failed);
         assert!(
@@ -1061,7 +1086,10 @@ mod tests {
             "una ejecución fallida anuncia redrive"
         );
         let ok = view_in_detail(ExecStatus::Succeeded);
-        assert!(ok.hints().is_empty(), "una ejecución sana no anuncia redrive");
+        assert!(
+            !ok.hints().iter().any(|(k, _)| *k == "R"),
+            "una ejecución sana no anuncia redrive"
+        );
     }
 
     #[test]

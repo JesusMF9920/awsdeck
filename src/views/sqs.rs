@@ -108,6 +108,19 @@ impl SqsView {
         Some(self.queues[idx].clone())
     }
 
+    /// Texto a copiar con `y`: la URL de la cola (en la lista) o su ARN (en el detalle,
+    /// si lo conocemos por los attributes; si no, la URL).
+    fn copy_text(&self) -> Option<String> {
+        match &self.level {
+            Level::Queues => self.selected_queue().map(|q| q.url),
+            Level::Detail { queue_url } => self
+                .attrs
+                .as_ref()
+                .and_then(|a| a.arn.clone())
+                .or_else(|| Some(queue_url.clone())),
+        }
+    }
+
     // --- Navegación -----------------------------------------------------------
 
     fn drill(&mut self) -> Vec<Action> {
@@ -239,8 +252,8 @@ impl View for SqsView {
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         match self.level {
             // En el detalle de una cola, `p` purga (gated por modo escritura + confirm).
-            Level::Detail { .. } => vec![("p", "purgar")],
-            Level::Queues => vec![],
+            Level::Detail { .. } => vec![("y", "copiar ARN"), ("p", "purgar")],
+            Level::Queues => vec![("y", "copiar URL")],
         }
     }
 
@@ -282,6 +295,11 @@ impl View for SqsView {
             KeyCode::Esc => self.back(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('p') => self.purge_intent(),
+            KeyCode::Char('y') => self
+                .copy_text()
+                .map(|text| Action::CopyToClipboard { text })
+                .into_iter()
+                .collect(),
             _ => vec![],
         }
     }
@@ -566,10 +584,23 @@ mod tests {
     }
 
     #[test]
+    fn y_copies_queue_url() {
+        let mut v = SqsView::new();
+        v.on_message(&Message::QueuesLoaded(vec![queue("orders")]));
+        match v.on_key(key(KeyCode::Char('y'))).as_slice() {
+            [Action::CopyToClipboard { text }] => assert!(text.ends_with("/orders")),
+            other => panic!("se esperaba CopyToClipboard, llegó {other:?}"),
+        }
+    }
+
+    #[test]
     fn hints_offer_purge_only_in_detail() {
         let mut v = SqsView::new();
         v.on_message(&Message::QueuesLoaded(vec![queue("orders")]));
-        assert!(v.hints().is_empty(), "en la lista no hay acción gated");
+        assert!(
+            !v.hints().iter().any(|(k, _)| *k == "p"),
+            "en la lista no se ofrece la acción gated `p`"
+        );
         v.on_key(key(KeyCode::Enter)); // → Detail
         assert!(
             v.hints().iter().any(|(k, _)| *k == "p"),

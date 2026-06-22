@@ -135,6 +135,19 @@ impl EventsView {
         Some(self.rules[idx].clone())
     }
 
+    /// Texto a copiar con `y`: ARN del bus / nombre de la rule / ARN del target
+    /// seleccionado (en el detalle, la lista navegable son los targets).
+    fn copy_text(&self) -> Option<String> {
+        match &self.level {
+            Level::Buses => self.selected_bus().map(|b| b.arn),
+            Level::Rules { .. } => self.selected_rule().map(|r| r.name),
+            Level::Detail { .. } => {
+                let idx = *self.filtered_target_indices().get(self.state.selected()?)?;
+                Some(self.targets[idx].arn.clone())
+            }
+        }
+    }
+
     // --- Navegación -----------------------------------------------------------
 
     fn drill(&mut self) -> Vec<Action> {
@@ -356,8 +369,9 @@ impl View for EventsView {
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         match self.level {
             // `S` envía un evento de prueba al bus (gated por modo escritura + confirm).
-            Level::Buses => vec![("S", "enviar evento")],
-            _ => vec![],
+            Level::Buses => vec![("y", "copiar ARN"), ("S", "enviar evento")],
+            Level::Rules { .. } => vec![("y", "copiar nombre")],
+            Level::Detail { .. } => vec![("y", "copiar ARN target")],
         }
     }
 
@@ -406,6 +420,11 @@ impl View for EventsView {
             KeyCode::Esc => self.back(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('S') => self.send_intent(),
+            KeyCode::Char('y') => self
+                .copy_text()
+                .map(|text| Action::CopyToClipboard { text })
+                .into_iter()
+                .collect(),
             _ => vec![],
         }
     }
@@ -791,6 +810,16 @@ mod tests {
     }
 
     #[test]
+    fn y_copies_bus_arn() {
+        let mut v = EventsView::new();
+        v.on_message(&buses_msg(vec![bus("default")]));
+        match v.on_key(key(KeyCode::Char('y'))).as_slice() {
+            [Action::CopyToClipboard { text }] => assert!(text.contains("event-bus/default")),
+            other => panic!("se esperaba CopyToClipboard, llegó {other:?}"),
+        }
+    }
+
+    #[test]
     fn hints_offer_send_event_only_on_buses() {
         let mut v = EventsView::new();
         assert!(
@@ -799,7 +828,10 @@ mod tests {
         );
         v.on_message(&buses_msg(vec![bus("default")]));
         v.on_key(key(KeyCode::Enter)); // → Rules
-        assert!(v.hints().is_empty(), "en rules no se ofrece S");
+        assert!(
+            !v.hints().iter().any(|(k, _)| *k == "S"),
+            "en rules no se ofrece S (gated, solo en buses)"
+        );
     }
 
     #[test]

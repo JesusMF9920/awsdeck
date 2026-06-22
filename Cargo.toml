@@ -5,6 +5,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+arboard = "3.6.1"
 aws-config = "1.8"
 aws-sdk-cloudwatchlogs = "1.138"
 aws-sdk-eventbridge = "1.109"

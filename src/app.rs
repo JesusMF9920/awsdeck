@@ -380,6 +380,8 @@ impl App {
                 }
             }
             Action::SwitchEnv(env) => self.switch_env(env),
+            // Copiar al portapapeles: local (no es efecto del SDK).
+            Action::CopyToClipboard { text } => self.copy_to_clipboard(text),
             // Gate prod-safe: las mutantes pasan por modo escritura + confirm.
             mutating if is_mutating(&mutating) => self.request_confirm(mutating),
             effect => self.effects.dispatch(effect, self.epoch),
@@ -641,6 +643,15 @@ impl App {
             None => Vec::new(),
         };
         self.dispatch_all(actions);
+    }
+
+    /// Copia `text` al portapapeles del sistema (arboard) y avisa en la status bar.
+    /// Síncrono (no es I/O de red); si el portapapeles no está disponible, lo reporta.
+    fn copy_to_clipboard(&mut self, text: String) {
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
+            Ok(()) => self.set_info(format!("copiado: {text}")),
+            Err(e) => self.set_error(format!("no se pudo copiar: {e}")),
+        }
     }
 
     fn set_error(&mut self, text: impl Into<String>) {

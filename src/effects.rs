@@ -96,6 +96,7 @@ impl Effects {
             | Action::ActivateView(_)
             | Action::Back
             | Action::ClearFilter
+            | Action::CopyToClipboard { .. }
             | Action::SwitchEnv(_) => {}
         }
     }

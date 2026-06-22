@@ -26,6 +26,10 @@ pub enum Action {
     ClearFilter,
     /// Cambiar de ambiente: sube el epoch, reconstruye el `AwsContext` y refresca.
     SwitchEnv(Env),
+    /// Copiar texto (ARN/URL/línea) al portapapeles. Agnóstico: la vista decide qué
+    /// identificador del item seleccionado copiar; el `App` lo copia y avisa en la
+    /// status bar. No es un efecto del SDK (no va a `effects`).
+    CopyToClipboard { text: String },
 
     // --- Efectos: `App` los reenvía a `effects::dispatch` (específicos de servicio) ---
     /// Pedir todos los log groups del ambiente (paginados hasta un tope). El filtrado

@@ -74,6 +74,17 @@ pub trait View {
     fn description(&self) -> &'static str {
         ""
     }
+
+    /// Pistas de teclado **contextuales** que la vista quiere anunciar según su
+    /// estado actual (p. ej. el nivel de drill): pares `(tecla, qué hace)`. El `App`
+    /// las pinta en el footer ANTES de los hints globales —agnóstico: no las
+    /// interpreta, solo las muestra—. Es el canal para hacer descubribles las teclas
+    /// específicas de cada vista (`t`/`w` en logs, `p`/`R`/`S` gated, …) sin que el
+    /// core las conozca. Default vacío: la vista no contribuye ninguna. Mantenerlas
+    /// a 1–3 por estado para no saturar la única fila del footer.
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        Vec::new()
+    }
 }
 
 /// Registro de vistas. Genérico: no conoce ningún servicio. La primera vista

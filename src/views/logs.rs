@@ -467,7 +467,14 @@ impl LogsView {
             }
         };
         if self.filter.is_empty() {
-            format!(" {window}{total} {kind}{partial} ")
+            // Cue del hermano `Tail`: en groups/streams recuerda que `t` ve TODOS los
+            // streams del group por rango de tiempo (segundo canal, además del footer).
+            let cue = match self.level {
+                Level::Groups => " · t: logs por tiempo",
+                Level::Streams { .. } => " · t: todos los streams por tiempo",
+                _ => "",
+            };
+            format!(" {window}{total} {kind}{partial}{cue} ")
         } else {
             format!(
                 " {window}{shown}/{total} {kind} · filtro: {}{partial} ",
@@ -526,6 +533,21 @@ impl View for LogsView {
 
     fn description(&self) -> &'static str {
         "CloudWatch Logs — groups, streams, eventos y tail"
+    }
+
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        // Con el detalle abierto, las teclas scrollean/cierran.
+        if self.detail.is_some() {
+            return vec![("j/k", "scroll"), ("esc", "cerrar")];
+        }
+        match self.level {
+            // `t` abre el tail (todos los streams del group por rango): es el feature
+            // que cuesta descubrir, así que se anuncia donde aplica.
+            Level::Groups | Level::Streams { .. } => vec![("t", "logs por tiempo")],
+            // Dentro del tail: cómo cambiar la ventana / paginar / fijar rango.
+            Level::Tail { .. } => vec![("w", "ventana"), ("o", "más"), (":since", "rango")],
+            Level::Events { .. } => vec![],
+        }
     }
 
     fn title(&self) -> String {
@@ -1603,6 +1625,55 @@ mod tests {
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("orders"), "debe listar el group seleccionado");
         assert!(text.contains("log groups"), "el título muestra el conteo");
+    }
+
+    #[test]
+    fn hints_announce_tail_then_window_by_level() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        // Groups y Streams anuncian `t` (abre el tail de TODOS los streams por tiempo).
+        assert!(v.hints().iter().any(|(k, _)| *k == "t"), "groups anuncia t");
+        v.on_key(key(KeyCode::Enter));
+        v.on_message(&stream("s1"));
+        assert!(v.hints().iter().any(|(k, _)| *k == "t"), "streams anuncia t");
+        // Dentro del tail: anuncia ventana/paginación/rango y ya no `t`.
+        v.on_key(key(KeyCode::Char('t')));
+        let keys: Vec<&str> = v.hints().iter().map(|(k, _)| *k).collect();
+        assert!(
+            keys.contains(&"w") && keys.contains(&"o") && keys.contains(&":since"),
+            "el tail anuncia w/o/:since: {keys:?}"
+        );
+        assert!(!keys.contains(&"t"), "en el tail ya no se ofrece t");
+    }
+
+    #[test]
+    fn hints_in_line_detail_offer_close() {
+        let mut v = LogsView::new();
+        into_events(&mut v);
+        v.on_message(&events_loaded("/svc", "stream-a", vec![ev("hola", 1)]));
+        v.on_key(key(KeyCode::Enter)); // abre el detalle de la línea
+        assert!(
+            v.hints().iter().any(|(k, _)| *k == "esc"),
+            "el detalle ofrece cerrar"
+        );
+    }
+
+    #[test]
+    fn body_title_announces_tail_only_without_filter() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        assert!(
+            v.body_title().contains("t:"),
+            "groups anuncia el tail en el título: {}",
+            v.body_title()
+        );
+        // Con filtro aplicado, la rama con-filtro no arrastra el cue.
+        v.set_filter("svc");
+        assert!(
+            !v.body_title().contains("t:"),
+            "con filtro no se muestra el cue: {}",
+            v.body_title()
+        );
     }
 
     fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {

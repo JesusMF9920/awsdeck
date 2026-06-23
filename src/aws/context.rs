@@ -4,7 +4,10 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use aws_config::retry::RetryConfig;
+use aws_config::timeout::TimeoutConfig;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_cloudwatchlogs::Client as LogsClient;
 use aws_sdk_eventbridge::Client as EventBridgeClient;
@@ -76,6 +79,19 @@ impl AwsContext {
                 aws_config::defaults(BehaviorVersion::latest())
                     .profile_name(&self.env.profile)
                     .region(Region::new(self.env.region.clone()))
+                    // Retry adaptativo: en cuentas grandes la paginación + el fan-out de
+                    // casing invitan a ThrottlingException; el modo adaptativo respeta el
+                    // backoff del servicio en vez de degradar a error crudo al primer 429.
+                    .retry_config(RetryConfig::adaptive())
+                    // Timeouts acotados: una región/endpoint colgado no congela la TUI a la
+                    // espera; falla con un error de red (clasificado como `Network`) que el
+                    // usuario puede reintentar con `r`.
+                    .timeout_config(
+                        TimeoutConfig::builder()
+                            .operation_attempt_timeout(Duration::from_secs(10))
+                            .operation_timeout(Duration::from_secs(30))
+                            .build(),
+                    )
                     .load()
                     .await
             })

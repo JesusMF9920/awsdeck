@@ -2,9 +2,11 @@
 //! coloreado) → detalle (event_pattern + targets). Pura y síncrona; NUNCA importa
 //! `aws-sdk-*` (recibe DTOs planos vía `on_message`).
 //!
-//! `S` en el nivel de buses emite la intención `SendEvent` (un evento de prueba
-//! canned contra el bus seleccionado); la vista NO sabe de modo escritura ni
-//! confirm: ese gate vive en el `App` (reusa el de `PurgeQueue`/`RedriveExecution`).
+//! `S` en el nivel de buses abre un form multi-campo (`source`/`detail-type`/`detail`
+//! JSON, vía `ui::form`); al enviar valida el JSON y emite `SendEvent` con el payload.
+//! La vista NO sabe de modo escritura ni confirm: ese gate vive en el `App` (reusa el de
+//! `PurgeQueue`/`RedriveExecution`). Con el form abierto declara `wants_raw_input` para
+//! recibir las teclas crudas.
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -17,6 +19,7 @@ use super::View;
 use crate::action::{Action, ConsoleTarget};
 use crate::message::{EventBusDto, Message, RuleDetailDto, RuleDto, RuleState, TargetDto};
 use crate::ui::detail::DetailPanel;
+use crate::ui::form::{Form, FormOutcome};
 use crate::util::{fuzzy_score, ranked};
 
 /// Nivel de drill actual. Cada nivel carga los identificadores que `back()`
@@ -41,6 +44,9 @@ pub struct EventsView {
     /// Panel de detalle abierto (el `event_pattern` con `P`, o el `input` de un target
     /// con `enter`): contenido completo scrolleable/copiable. `None` = vista normal.
     detail_panel: Option<DetailPanel>,
+    /// Form de envío de evento abierto (`S` en buses): `(bus, form)`. El bus se captura
+    /// al abrir (las teclas van al form, la selección no cambia). `None` = sin form.
+    event_form: Option<(String, Form)>,
     filter: String,
     loading: bool,
     /// Se alcanzó el tope de paginación de buses (hay más sin traer).
@@ -59,6 +65,7 @@ impl EventsView {
             detail: None,
             targets: Vec::new(),
             detail_panel: None,
+            event_form: None,
             filter: String::new(),
             loading: false,
             buses_partial: false,
@@ -266,6 +273,7 @@ impl EventsView {
     /// `esc`: despoja un nivel; en la raíz (buses) emite `Back` (→ menú).
     fn back(&mut self) -> Vec<Action> {
         self.detail_panel = None; // cerrar cualquier panel al subir de nivel
+        self.event_form = None; // y cerrar el form de envío si estaba abierto
         let bus = if let Level::Detail { event_bus_name, .. } = &self.level {
             Some(event_bus_name.clone())
         } else {
@@ -308,17 +316,47 @@ impl EventsView {
         actions
     }
 
-    /// `S` en el nivel de buses: emite la intención de enviar un evento de prueba
-    /// contra el bus seleccionado. El App la gatea (modo escritura + confirm).
-    fn send_intent(&self) -> Vec<Action> {
+    /// `S` en el nivel de buses: abre el form de envío con defaults editables y stashea
+    /// el bus elegido. El envío (con el payload tecleado) se gatea en el App al `Submit`.
+    fn open_send_form(&mut self) {
         if matches!(self.level, Level::Buses)
             && let Some(b) = self.selected_bus()
         {
-            return vec![Action::SendEvent {
-                event_bus_name: b.name,
-            }];
+            let form = Form::new(
+                format!("enviar evento → {}", b.name),
+                vec![
+                    ("source", "awsdeck.manual"),
+                    ("detail-type", "awsdeck test event"),
+                    ("detail", r#"{"sentBy":"awsdeck"}"#),
+                ],
+            );
+            self.event_form = Some((b.name, form));
         }
-        vec![]
+    }
+
+    /// Valida y envía el form (`enter`): si `detail` no es JSON, muestra el error y deja
+    /// el form abierto; si es válido, lo cierra y emite `SendEvent` (que el App gatea).
+    fn submit_form(&mut self) -> Vec<Action> {
+        let Some((_, form)) = self.event_form.as_ref() else {
+            return vec![];
+        };
+        let vals = form.values();
+        let source = vals.first().cloned().unwrap_or_default();
+        let detail_type = vals.get(1).cloned().unwrap_or_default();
+        let detail = vals.get(2).cloned().unwrap_or_default();
+        if serde_json::from_str::<serde_json::Value>(detail.trim()).is_err() {
+            if let Some((_, f)) = self.event_form.as_mut() {
+                f.set_error("detail no es JSON válido (revisá comillas/llaves)");
+            }
+            return vec![];
+        }
+        let event_bus_name = self.event_form.take().map(|(b, _)| b).unwrap_or_default();
+        vec![Action::SendEvent {
+            event_bus_name,
+            source,
+            detail_type,
+            detail,
+        }]
     }
 
     // --- Render ---------------------------------------------------------------
@@ -426,7 +464,15 @@ impl View for EventsView {
         "EventBridge: buses, rules, patrón y send"
     }
 
+    fn wants_raw_input(&self) -> bool {
+        self.event_form.is_some()
+    }
+
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        // Form de envío abierto: sus teclas (campo/enviar/cancelar) mandan.
+        if let Some((_, form)) = &self.event_form {
+            return form.hints();
+        }
         // Con el panel abierto, sus teclas (scroll/copiar/cerrar) mandan.
         if let Some(p) = &self.detail_panel {
             return p.hints();
@@ -464,6 +510,7 @@ impl View for EventsView {
         self.rules.clear();
         self.detail = None;
         self.detail_panel = None;
+        self.event_form = None;
         self.targets.clear();
         self.loading = true;
         self.buses_partial = false;
@@ -473,6 +520,19 @@ impl View for EventsView {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        // Form de envío abierto: rutea TODAS las teclas al form (el App nos las manda
+        // crudas vía `wants_raw_input`). `enter` valida+envía, `esc` cancela.
+        if self.event_form.is_some() {
+            let outcome = self.event_form.as_mut().unwrap().1.on_key(key);
+            return match outcome {
+                FormOutcome::Cancel => {
+                    self.event_form = None;
+                    vec![]
+                }
+                FormOutcome::Submit => self.submit_form(),
+                FormOutcome::Editing => vec![],
+            };
+        }
         // Panel de detalle abierto: `y` copia su contenido, el resto scrollea/cierra.
         if self.detail_panel.is_some() {
             if key.code == KeyCode::Char('y') {
@@ -523,7 +583,10 @@ impl View for EventsView {
             }
             KeyCode::Esc => self.back(),
             KeyCode::Char('r') => self.refresh(),
-            KeyCode::Char('S') => self.send_intent(),
+            KeyCode::Char('S') => {
+                self.open_send_form();
+                vec![]
+            }
             KeyCode::Char('y') => self
                 .copy_text()
                 .map(|text| Action::CopyToClipboard { text })
@@ -647,6 +710,10 @@ impl View for EventsView {
                     .collect();
                 self.render_list(frame, targets, block, items);
             }
+        }
+        // Form de envío: popup centrado sobre el cuerpo (la lista de buses queda detrás).
+        if let Some((_, form)) = &self.event_form {
+            form.render(frame, area);
         }
     }
 }
@@ -1017,17 +1084,65 @@ mod tests {
     }
 
     #[test]
-    fn send_emits_intent_only_at_bus_level() {
+    fn s_opens_send_form_only_at_bus_level() {
         let mut v = EventsView::new();
         v.on_message(&buses_msg(vec![bus("default")]));
-        // En Buses: S emite la intención.
-        match v.on_key(key(KeyCode::Char('S'))).as_slice() {
-            [Action::SendEvent { event_bus_name }] => assert_eq!(event_bus_name, "default"),
-            other => panic!("se esperaba SendEvent, llegó {other:?}"),
-        }
-        // En Rules: S no hace nada (SendEvent es a nivel de bus).
+        // En Buses: S abre el form (no emite acción todavía) y captura entrada cruda.
+        assert!(v.on_key(key(KeyCode::Char('S'))).is_empty());
+        assert!(v.event_form.is_some(), "S abre el form");
+        assert!(
+            v.wants_raw_input(),
+            "con el form abierto captura teclas crudas"
+        );
+        // esc cierra el form sin emitir.
+        v.on_key(key(KeyCode::Esc));
+        assert!(v.event_form.is_none());
+        assert!(!v.wants_raw_input());
+
+        // En Rules: S no abre form (es a nivel de bus).
         v.on_key(key(KeyCode::Enter)); // → Rules
         assert!(v.on_key(key(KeyCode::Char('S'))).is_empty());
+        assert!(v.event_form.is_none());
+    }
+
+    #[test]
+    fn submit_emits_send_event_with_payload_and_validates_json() {
+        let mut v = EventsView::new();
+        v.on_message(&buses_msg(vec![bus("default")]));
+        v.on_key(key(KeyCode::Char('S'))); // abre el form (defaults JSON válidos)
+
+        // JSON por defecto válido → enter emite SendEvent con el payload tecleado.
+        match v.on_key(key(KeyCode::Enter)).as_slice() {
+            [
+                Action::SendEvent {
+                    event_bus_name,
+                    source,
+                    detail_type,
+                    detail,
+                },
+            ] => {
+                assert_eq!(event_bus_name, "default");
+                assert_eq!(source, "awsdeck.manual");
+                assert_eq!(detail_type, "awsdeck test event");
+                assert!(detail.contains("sentBy"));
+            }
+            other => panic!("se esperaba SendEvent con payload, llegó {other:?}"),
+        }
+        assert!(v.event_form.is_none(), "tras enviar, el form se cierra");
+    }
+
+    #[test]
+    fn submit_with_invalid_json_keeps_form_open_without_emitting() {
+        let mut v = EventsView::new();
+        v.on_message(&buses_msg(vec![bus("default")]));
+        v.on_key(key(KeyCode::Char('S')));
+        // Ir al campo `detail` (3º) y romper el JSON tecleando una llave suelta.
+        v.on_key(key(KeyCode::Tab)); // source → detail-type
+        v.on_key(key(KeyCode::Tab)); // detail-type → detail
+        v.on_key(key(KeyCode::Char('{'))); // detail ahora inválido
+        // enter NO emite: el JSON es inválido → el form sigue abierto.
+        assert!(v.on_key(key(KeyCode::Enter)).is_empty());
+        assert!(v.event_form.is_some(), "JSON inválido deja el form abierto");
     }
 
     #[test]

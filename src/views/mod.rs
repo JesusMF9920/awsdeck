@@ -84,6 +84,14 @@ pub trait View {
         Vec::new()
     }
 
+    /// `true` si la vista está capturando **entrada de texto cruda** (p. ej. un form
+    /// abierto donde se teclea JSON). Cuando lo es, el `App` le reenvía TODAS las teclas
+    /// sin interceptar `:`/`/`/`q`/`esc`/etc. Agnóstico: el core no sabe POR QUÉ, solo
+    /// deja de robar teclas. Default `false` (modo normal). Ver `events::EventsView`.
+    fn wants_raw_input(&self) -> bool {
+        false
+    }
+
     /// Dibuja la vista dentro de `area`.
     fn render(&mut self, frame: &mut Frame, area: Rect);
 

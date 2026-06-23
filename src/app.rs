@@ -333,6 +333,17 @@ impl App {
     }
 
     fn on_normal_key(&mut self, key: KeyEvent) {
+        // Si la vista activa captura texto crudo (un form abierto), reenviarle TODAS las
+        // teclas sin interceptar las globales (`:`/`/`/`q`/`esc`/`^e`/`?`/backspace). Así
+        // se puede teclear JSON arbitrario en el form. Agnóstico: el core no sabe por qué.
+        if self.registry.active().is_some_and(|v| v.wants_raw_input()) {
+            let actions = match self.registry.active_mut() {
+                Some(view) => view.on_key(key),
+                None => Vec::new(),
+            };
+            self.dispatch_all(actions);
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('q') => self.dispatch(Action::Quit),
@@ -617,9 +628,16 @@ impl App {
                     action,
                 }
             }
-            Action::SendEvent { event_bus_name } => Confirm {
-                title: " enviar evento de prueba ".to_string(),
-                body: format!("se publicará un evento de prueba en el bus:\n{event_bus_name}"),
+            Action::SendEvent {
+                event_bus_name,
+                source,
+                detail_type,
+                ..
+            } => Confirm {
+                title: " enviar evento ".to_string(),
+                body: format!(
+                    "se publicará en el bus {event_bus_name}:\nsource: {source}\ndetail-type: {detail_type}"
+                ),
                 action,
             },
             // `is_mutating` ya filtró; cualquier otra no debería llegar aquí.
@@ -1190,6 +1208,61 @@ mod tests {
         fn render(&mut self, _frame: &mut Frame, _area: Rect) {}
     }
 
+    /// Vista que captura entrada cruda (como un form abierto): cuenta las teclas que recibe.
+    struct RawView {
+        keys: Rc<Cell<u32>>,
+    }
+    impl View for RawView {
+        fn id(&self) -> &'static str {
+            "logs"
+        }
+        fn title(&self) -> String {
+            "logs".to_string()
+        }
+        fn on_activate(&mut self) -> Vec<Action> {
+            Vec::new()
+        }
+        fn on_key(&mut self, _key: KeyEvent) -> Vec<Action> {
+            self.keys.set(self.keys.get() + 1);
+            Vec::new()
+        }
+        fn on_message(&mut self, _message: &Message) {}
+        fn set_filter(&mut self, _filter: &str) {}
+        fn wants_raw_input(&self) -> bool {
+            true
+        }
+        fn render(&mut self, _frame: &mut Frame, _area: Rect) {}
+    }
+
+    #[test]
+    fn raw_input_view_receives_global_keys_uncaptured() {
+        let keys = Rc::new(Cell::new(0));
+        let (tx, rx) = mpsc::channel(8);
+        let env = Env::new("default", "us-east-1");
+        let effects = Effects::new_mock(tx, env.clone());
+        let mut registry = Registry::new();
+        registry.register(Box::new(RawView { keys: keys.clone() }));
+        let mut app = App::new(env, registry, effects, rx);
+        // Activar la vista desde el menú (Enter), sin pasar por command mode.
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.screen, Screen::View));
+        let before = keys.get();
+        // `:` y `q` normalmente abrirían command mode / saldrían; con raw input van crudas
+        // a la vista (un form puede teclear `:` y `q` dentro del JSON).
+        app.on_key(ch(':'));
+        app.on_key(ch('q'));
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "':' no abrió command mode"
+        );
+        assert!(!app.should_quit, "'q' no salió");
+        assert_eq!(
+            keys.get(),
+            before + 2,
+            "ambas teclas llegaron crudas a la vista"
+        );
+    }
+
     #[test]
     fn clear_filter_action_empties_filter() {
         let mut app = test_app();
@@ -1722,6 +1795,9 @@ mod tests {
     fn send_event(bus: &str) -> Action {
         Action::SendEvent {
             event_bus_name: bus.to_string(),
+            source: "awsdeck.manual".to_string(),
+            detail_type: "test".to_string(),
+            detail: "{}".to_string(),
         }
     }
 

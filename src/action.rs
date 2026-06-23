@@ -102,8 +102,15 @@ pub enum Action {
     RedriveDlq { queue_url: String },
     /// Redrive de una ejecución fallida: la relanza desde el último estado fallido.
     RedriveExecution { execution_arn: String },
-    /// Publicar un evento de prueba (canned) contra un bus de EventBridge.
-    SendEvent { event_bus_name: String },
+    /// Publicar un evento contra un bus de EventBridge con el payload que el usuario
+    /// editó en el form (`source` / `detail-type` / `detail` JSON). La vista valida que
+    /// `detail` sea JSON antes de emitirla.
+    SendEvent {
+        event_bus_name: String,
+        source: String,
+        detail_type: String,
+        detail: String,
+    },
 }
 
 /// Recurso a abrir en la consola de AWS. Service-shaped (vive en `action.rs`, frontera

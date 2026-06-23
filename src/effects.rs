@@ -123,7 +123,12 @@ impl Effects {
                 event_bus_name,
                 rule_name,
             } => self.load_rule_detail(event_bus_name, rule_name, epoch),
-            Action::SendEvent { event_bus_name } => self.send_event(event_bus_name, epoch),
+            Action::SendEvent {
+                event_bus_name,
+                source,
+                detail_type,
+                detail,
+            } => self.send_event(event_bus_name, source, detail_type, detail, epoch),
             Action::OpenConsole { target } => self.open_console(target, epoch),
             Action::VerifyIdentity => self.verify_identity(epoch),
             Action::Quit
@@ -615,7 +620,14 @@ impl Effects {
         }
     }
 
-    fn send_event(&self, event_bus_name: String, epoch: u64) {
+    fn send_event(
+        &self,
+        event_bus_name: String,
+        source: String,
+        detail_type: String,
+        detail: String,
+        epoch: u64,
+    ) {
         let tx = self.tx.clone();
         match &self.backend {
             Backend::Mock(_) => {
@@ -628,7 +640,15 @@ impl Effects {
             Backend::Real(ctx) => {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    let msg = match send_event_real(&ctx, &event_bus_name).await {
+                    let msg = match send_event_real(
+                        &ctx,
+                        &event_bus_name,
+                        &source,
+                        &detail_type,
+                        &detail,
+                    )
+                    .await
+                    {
                         Ok(()) => Message::EventSent { event_bus_name },
                         Err(e) => sdk_error("put_events", &e),
                     };
@@ -1480,14 +1500,20 @@ async fn fetch_rule_detail(
     Ok((detail, targets))
 }
 
-/// Publica un evento de prueba (canned) en el bus. PutEvents puede fallar
+/// Publica un evento con el payload que el usuario editó. PutEvents puede fallar
 /// parcialmente (HTTP 200 con `failed_entry_count > 0`): se traduce a error.
-async fn send_event_real(ctx: &AwsContext, event_bus_name: &str) -> color_eyre::Result<()> {
+async fn send_event_real(
+    ctx: &AwsContext,
+    event_bus_name: &str,
+    source: &str,
+    detail_type: &str,
+    detail: &str,
+) -> color_eyre::Result<()> {
     use aws_sdk_eventbridge::types::PutEventsRequestEntry;
     let entry = PutEventsRequestEntry::builder()
-        .source("awsdeck.manual")
-        .detail_type("awsdeck test event")
-        .detail(r#"{"sentBy":"awsdeck","note":"manual test event"}"#)
+        .source(source)
+        .detail_type(detail_type)
+        .detail(detail)
         .event_bus_name(event_bus_name)
         .build();
     let out = ctx
@@ -2690,6 +2716,9 @@ mod tests {
         fx.dispatch(
             Action::SendEvent {
                 event_bus_name: "default".into(),
+                source: "awsdeck.manual".into(),
+                detail_type: "test".into(),
+                detail: "{}".into(),
             },
             1,
         );

@@ -9,7 +9,10 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 
 const KEYS: &[(&str, &str)] = &[
     (":", "command bar (p. ej. :logs, :sqs, :sfn, :events)"),
-    ("/", "buscar (fuzzy; ↑/↓ navega sin salir)"),
+    (
+        "/",
+        "buscar (fuzzy; en logs tolera mayús/minús; ↑/↓ navega sin salir)",
+    ),
     (
         "enter",
         "drill (group → stream → eventos) · en una línea, expandir",
@@ -29,6 +32,10 @@ const KEYS: &[(&str, &str)] = &[
     (
         ":since/:from",
         "logs: rango — :since 2d · :from 2026-06-19 [to …] (UTC)",
+    ),
+    (
+        "l",
+        "sfn: abrir los logs de la Lambda del estado seleccionado",
     ),
     ("p", "purgar cola SQS — gated por modo escritura"),
     ("R", "redrive ejecución sfn — gated por modo escritura"),

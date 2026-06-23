@@ -159,8 +159,10 @@ un evento abre el mensaje completo (wrap + scroll, JSON pretty; `esc` cierra). `
 reloj solo en `effects`); mock + real, sin gate (lectura). El tail y su selector de tiempo se
 **anuncian** en el footer y en el título del group (`View::hints`). Los **log groups** se buscan
 **server-side por subcadena** sin prefijo (`logGroupNamePattern`, infix; 1 página por request — no
-carga todo, escala a miles) + ranking fuzzy local; el tail con rango amplio navega fluido (cache de
-filtrado + display precomputado).
+carga todo, escala a miles) + ranking fuzzy local. Como ese patrón es *case-sensitive*, la búsqueda
+hace **fan-out** de ≤5 variantes de casing en paralelo (`util::case_variants`), así `createOrder`
+encuentra `…CreateOrderV3` (no reconstruye CamelCase desde todo-minúsculas). El tail con rango amplio
+navega fluido (cache de filtrado + display precomputado).
 
 ### v1 — Vista `sqs` — ✅ hecho
 Listar colas del ambiente; ver attributes (mensajes visibles, in-flight, DLQ); *peek* de mensajes (receive sin borrar). Acción mutante `PurgeQueue` detrás de confirm + modo escritura.
@@ -196,7 +198,8 @@ Entregado: 3 niveles (event buses → rules → detalle). L1 `list_event_buses` 
 | `q` | salir |
 
 `logs` añade: `t` tail del group, `w`/`W` ventana, `o` paginar, `f` tail en vivo (`tail -f`),
-`:since`/`:from` rango. Mutantes gated: `p` (sqs), `R` (sfn), `S` (events).
+`:since`/`:from` rango. `sfn` añade `l` (logs de la Lambda del estado). Mutantes gated: `p` (sqs),
+`R` (sfn), `S` (events).
 
 ### Reglas de código
 - El core nunca conoce servicios concretos: solo el registry los conecta.
@@ -209,11 +212,12 @@ Entregado: 3 niveles (event buses → rules → detalle). L1 `list_event_buses` 
 ## 8. Backlog / futuro
 
 - **Hecho (transversal):** copiar ARN/URL (`y`), abrir en consola AWS (`O`), búsqueda de groups por
-  subcadena sin prefijo (server-side + fuzzy local, sin cargar todo — escala a miles), un solo
-  `enter` desde el filtro, tail en vivo (`f`, `tail -f`), y config **load-only** en
-  `~/.config/awsdeck/config.toml` (`default_profile`/`default_region`/`default_tail_window`).
-- Vínculo a CloudWatch Logs desde otras vistas (del Lambda de un estado de SFN → sus logs): diseñado
-  (`ViewContext`/`View::on_context`, ARN del SDK ya verificado), diferido a un PR aparte.
+  subcadena sin prefijo y **tolerante a casing** (fan-out server-side + fuzzy local, sin cargar todo —
+  escala a miles), un solo `enter` desde el filtro, tail en vivo (`f`, `tail -f`), config **load-only**
+  en `~/.config/awsdeck/config.toml` (`default_profile`/`default_region`/`default_tail_window`), y
+  **vínculo a CloudWatch Logs desde otras vistas** — `l` en el detalle de `sfn` abre los logs de la
+  Lambda de un estado, vía el handoff agnóstico `ActivateViewWithContext`/`View::on_context` (el core
+  no inspecciona el `ViewContext`).
 - Escribir la config en disco (hoy solo se lee); profiles favoritos, modo escritura por ambiente.
 - Más vistas: Lambda (invoke + config), DynamoDB (scan/query), ECS (services/tasks), RDS (estado), S3.
 - Temas / paleta, y modo "denso" para pantallas chicas.

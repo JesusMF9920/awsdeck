@@ -39,7 +39,7 @@ se muestra en la **status bar** (no crashea).
 | Tecla | Acción |
 |-------|--------|
 | `:` | command bar (saltar de herramienta, p. ej. `:logs`, `:sqs`, `:sfn`, `:events`) |
-| `/` | buscar (en `logs` consulta al server por subcadena + fuzzy local; `↑`/`↓` navegan sin salir; `enter` entra directo) |
+| `/` | buscar (en `logs` consulta al server por subcadena + fuzzy local, tolerante a mayús/minús; `↑`/`↓` navegan sin salir; `enter` entra directo) |
 | `enter` | drill al detalle (en `logs`: group → stream → **eventos**); sobre una **línea**, la **expande** completa |
 | `esc` | con filtro aplicado lo limpia (1er `esc`); si no, vuelve un nivel (drill back; en la raíz, al menú) |
 | `:menu` · `backspace` | volver al menú principal |
@@ -52,6 +52,7 @@ se muestra en la **status bar** (no crashea).
 | `o` | `logs`: **cargar más** líneas (paginación de la ventana) |
 | `f` | `logs`: **tail en vivo** (`tail -f`) — auto-refresca el tail |
 | `:since` · `:from`/`to` | `logs`: rango — `:since 2d` · `:from 2026-06-19 [to 2026-06-20]` (UTC) |
+| `l` | `sfn` (detalle): abrir los **logs de la Lambda** del estado seleccionado (cross-link a `logs`) |
 | `p` | purgar cola SQS (gated: modo escritura + confirm) |
 | `R` | redrive ejecución `sfn` fallida (gated: modo escritura + confirm) |
 | `S` | enviar evento de prueba a un bus `events` (gated: modo escritura + confirm) |
@@ -68,7 +69,7 @@ se muestra en la **status bar** (no crashea).
 
 ```bash
 AWSDECK_MOCK=1 cargo run    # ver el TUI con datos, sin tocar AWS
-cargo test                  # 179 tests, sin red
+cargo test                  # 189 tests, sin red
 cargo clippy --all-targets  # lint
 cargo fmt --check           # formato
 ```
@@ -87,9 +88,10 @@ Recorrido rápido (con `AWSDECK_MOCK=1 cargo run`):
    `enter` sobre una **línea** la **expande** completa (wrap + scroll, JSON pretty); `esc` cierra.
 3. En `sfn`, `enter` entra a una state machine → sus **ejecuciones con status coloreado** y duración;
    `enter` en una FAILED → detalle con input/output, error/cause y el **timeline de estados** (el que
-   reventó va resaltado y preseleccionado). En una máquina `[express]` se muestra una nota (sus
-   ejecuciones viven en CloudWatch Logs). Con `:write`, `R` hace **redrive** de una ejecución fallida
-   (confirm modal).
+   reventó va resaltado y preseleccionado). Sobre un estado de tipo Lambda, `l` salta a **`logs`** y
+   abre el tail de la Lambda en la ventana del estado. En una máquina `[express]` se muestra una nota
+   (sus ejecuciones viven en CloudWatch Logs). Con `:write`, `R` hace **redrive** de una ejecución
+   fallida (confirm modal).
 4. En `events`, `enter` entra a un event bus → sus **rules** con estado `[enabled]`/`[disabled]`;
    `enter` en una rule → detalle partido **meta / patrón / targets** (el `event_pattern` queda visible
    y los targets se filtran con `/`). Con `:write`, `S` sobre un bus **envía un evento de prueba**
@@ -102,7 +104,9 @@ cuenta anterior (probado en `app::tests::epoch_guard_discards_stale_and_accepts_
 
 **Escala (logs):** con miles de log groups **no se cargan todos** (eso bloqueaba segundos). Se trae
 **una página** (≤50, 1 round-trip) y `/` **busca server-side por subcadena** (`logGroupNamePattern`,
-infix, debounced ~280ms): teclear `CreateOrder` trae `…-CreateOrderV3` sin escribir el prefijo. El
+infix, debounced ~280ms): teclear `CreateOrder` trae `…-CreateOrderV3` sin escribir el prefijo. Como
+ese patrón es *case-sensitive*, la búsqueda hace **fan-out** de ≤5 variantes de casing en paralelo
+(`createOrder` también encuentra `…CreateOrderV3`; no reconstruye CamelCase desde todo-minúsculas). El
 `fuzzy` local rankea/refina lo devuelto; el título marca `· parcial` si hay más en el server. Los
 **logs del group** se traen por **rango de tiempo** (`w`/`:since`/`:from-to`), se paginan en demanda
 (`o`) y siguen en vivo con `f` (`tail -f`); el reloj vive solo en `effects`. El tail no recomputa el
@@ -140,14 +144,15 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
   JSON pretty).
 - **v1** ✅ `sqs` — colas, attributes, *peek*, `PurgeQueue` (gated por modo escritura + confirm).
 - **v2** ✅ `sfn` — state machines, ejecuciones (status coloreado), timeline de estados con duración,
-  `Redrive` (gated).
+  `Redrive` (gated), **cross-link `l` → logs de la Lambda** de una ejecución.
 - **v3** ✅ `events` — event buses, rules (estado coloreado), detalle con patrón + targets,
   `SendEvent` (gated).
 - **Transversal** ✅ copiar ARN/URL (`y`), abrir en consola AWS (`O`), config en disco
-  (`~/.config/awsdeck/config.toml`), búsqueda de groups por subcadena sin prefijo (server-side +
-  fuzzy local, sin cargar todo), un solo `enter` desde el filtro.
+  (`~/.config/awsdeck/config.toml`), búsqueda de groups por subcadena sin prefijo y **tolerante a
+  casing** (fan-out server-side + fuzzy local, sin cargar todo), un solo `enter` desde el filtro,
+  **handoff entre vistas con contexto** (`ActivateViewWithContext`/`View::on_context`).
 
-Backlog: cross-link `sfn` → logs de la Lambda de una ejecución, `SendEvent` con payload editable,
+Backlog: `SendEvent` con payload editable,
 input/output por estado en el timeline de `sfn`, escribir config en disco, más vistas (Lambda,
 DynamoDB, ECS…).
 

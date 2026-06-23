@@ -80,7 +80,8 @@ por subcadena; con `↑/↓` navegas sin salir; `enter` entra directo, sin doble
 `esc` back de dos etapas (con filtro lo limpia;
 si no, un nivel; desde la raíz, al menú) · `r` refresh · `y` copiar ARN/URL/línea · `O` abrir en
 la consola AWS · `ctrl-e` cambiar ambiente · `?` ayuda · `q` salir. En `logs`: `t` tail del group,
-`w/W` ventana, `o` paginar, `f` tail en vivo. Acciones mutantes gated por modo escritura (`:write`)
+`w/W` ventana, `o` paginar, `f` tail en vivo. En `sfn` detalle: `l` abre los logs de la Lambda del
+estado seleccionado. Acciones mutantes gated por modo escritura (`:write`)
 + confirm: `p` purgar cola (`sqs`), `R` redrive ejecución (`sfn`), `S` enviar evento a un bus
 (`events`). Las teclas propias de cada vista se **anuncian** en el footer según el contexto
 (`View::hints`): no hay que memorizar la tabla ni abrir `?`.
@@ -205,8 +206,13 @@ list/describe).
   **server-side por subcadena** (`logGroupNamePattern`, infix → `CreateOrder` trae
   `…-CreateOrderV3` sin el prefijo) y el `fuzzy_score` local rankea/refina esos resultados
   (case-insensitive). `last_query` + guard "latest wins" en `LogGroupsLoaded`; `back()` recarga la
-  1ª página al volver de una búsqueda. (Caveat: el server pattern es case-sensitive; el fuzzy local
-  sobre la página sí es case-insensitive.)
+  1ª página al volver de una búsqueda.
+  - **Tolerancia de casing (fan-out)**: `logGroupNamePattern` es substring *case-sensitive*, así
+    que con búsqueda `fetch_log_groups` hace **fan-out**: dispara ≤5 variantes de casing de la query
+    (`util::case_variants`: as-typed, lower, UPPER, primera-letra, Title-por-segmento) en paralelo
+    (`join_all`), mergea dedup por nombre y OR-ea el `more`. Así `createOrder` encuentra
+    `…CreateOrderV3` sin acertar la primera mayúscula. **Limitación**: NO reconstruye CamelCase
+    interno desde todo-minúsculas (`createorder` ≠ `CreateOrder`). El mock espeja la misma cobertura.
 - **Performance del tail (rangos amplios)**: `logs` cachea los índices filtrados (`filtered`) y
   precomputa por evento lowercase/preview/severidad (`event_rows`), en sync vía
   `set_events`/`extend_events` (únicos puntos de mutación) + `recompute_filtered` (solo al cambiar
@@ -226,18 +232,31 @@ list/describe).
   `XDG_CONFIG_HOME`) con `default_profile`/`default_region` (fallbacks de `Env` tras el entorno) y
   `default_tail_window` (preset del tail, vía `LogsView::with_default_window`). Si no existe/no parsea,
   defaults. Escribir queda como follow-up.
+- **Cross-link `sfn` → logs de la Lambda (`l`)**: en el detalle de una ejecución, `l` sobre un estado
+  de tipo Lambda task salta a `logs` y abre el **tail de su log group** acotado a la ventana del
+  estado. Mecanismo **agnóstico**: `effects::parse_history` cuelga el ARN de la Lambda de cada estado
+  (`StateSpanDto::resource_arn`: integración directa vía `LambdaFunctionScheduled.resource` u
+  optimizada `arn:aws:states:::lambda:invoke` vía `TaskScheduled` + `FunctionName` de los parameters);
+  `util::lambda_log_group_from_arn` → `/aws/lambda/<fn>`; la vista emite
+  `Action::ActivateViewWithContext { id: "logs", context: ViewContext::LogGroupTail { group, window } }`
+  y el `App` activa la vista destino llamando `View::on_context` (en vez de `on_activate`) **sin
+  inspeccionar** el `ViewContext` (espeja `on_message`/`ConsoleTarget`: el core nunca nombra
+  servicios). `logs::on_context` abre el tail directo (`open_group_tail`). Lectura → sin gate; el hint
+  `l` solo aparece sobre un estado con Lambda.
 
-179 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, búsqueda de
-groups server-side por subcadena + fuzzy local + "latest wins", menú, drill x3 en `sfn`/`events` y
+189 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, búsqueda de
+groups server-side por subcadena + fuzzy local + fan-out de casing ("createOrder" → "CreateOrderV3") +
+"latest wins", menú, drill x3 en `sfn`/`events` y
 eventos/tail de `logs`, back→menú de dos etapas,
 navegación en filtro + `enter` que drillea, preservación de selección, `ClearFilter` al cambiar de
 nivel, señal `· parcial`, rango de tiempo del tail —`w`/`o`/`:since`/`:from-to`, staleness por gen,
 append—, cache de filtrado invariante, copiar (`y`) y abrir consola (`O`) por vista + URLs de consola,
 tail en vivo (`f`/`on_tick`/`[LIVE]`), config (`Config::parse`), expandir línea (JSON pretty), parsers
-de fecha/duración, guard EXPRESS, `parse_history`, hints por vista + footer, render con `TestBackend`).
-`AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
+de fecha/duración, guard EXPRESS, `parse_history` —incluye resource_arn de Lambda—, cross-link
+`sfn`→logs (`on_context`/`ActivateViewWithContext`), `lambda_log_group_from_arn`, hints por vista +
+footer, render con `TestBackend`). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
 
-Pendiente: cross-link `sfn` → logs de la Lambda de una ejecución (diseñado, diferido a un PR aparte),
-`SendEvent` con payload editable (form multi-campo; v3 envía un evento canned), input/output por estado
-en el timeline de `sfn`, escribir config en disco (hoy load-only). Backlog de vistas: Lambda,
+Pendiente: `SendEvent` con payload editable (form multi-campo; v3 envía un evento canned),
+input/output por estado en el timeline de `sfn`, escribir config en disco (hoy load-only). Backlog de
+vistas: Lambda,
 DynamoDB, ECS…

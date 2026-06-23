@@ -22,6 +22,10 @@ use crate::message::{
 use crate::ui::detail::DetailPanel;
 use crate::util::{fmt_epoch_millis, fuzzy_score, lambda_log_group_from_arn, ranked};
 
+/// Presupuesto inicial de páginas del history y el paso de cada load-more (`o`).
+/// Coincide con `effects::MAX_HISTORY_PAGES` (la carga inicial usa ese tope).
+const HISTORY_PAGE_STEP: usize = 10;
+
 /// Nivel de drill actual. Cada nivel carga los identificadores que `back()`
 /// necesita para reconstruir el padre y que `on_message` usa como guard.
 enum Level {
@@ -56,6 +60,9 @@ pub struct SfnView {
     machines_partial: bool,
     /// Se topó el tope de paginación del history de la ejecución (>~10k eventos).
     history_partial: bool,
+    /// Páginas del history pedidas para la ejecución actual (`o` lo sube por
+    /// `HISTORY_PAGE_STEP`). Se reinicia al drillear a una ejecución.
+    history_pages: usize,
     /// El servidor tiene más ejecuciones (`next_token`): se muestran las recientes.
     executions_partial: bool,
     /// `next_token` de las ejecuciones para `o` (load-more, append). `None` = no hay más.
@@ -79,6 +86,7 @@ impl SfnView {
             loading: false,
             machines_partial: false,
             history_partial: false,
+            history_pages: HISTORY_PAGE_STEP,
             executions_partial: false,
             exec_token: None,
             exec_status: None,
@@ -275,6 +283,7 @@ impl SfnView {
                     self.history.clear();
                     self.failed_state = None;
                     self.history_partial = false;
+                    self.history_pages = HISTORY_PAGE_STEP; // presupuesto fresco por ejecución
                     self.loading = true;
                     self.state.select(Some(0));
                     vec![
@@ -378,6 +387,22 @@ impl SfnView {
                 machine_arn,
                 status: self.exec_status,
                 token: Some(token),
+            }];
+        }
+        vec![]
+    }
+
+    /// `o` en Detail: carga más del history si está parcial. Sube el presupuesto de
+    /// páginas y re-pide (effects re-fetchea y re-parsea TODO → emparejamiento correcto).
+    fn load_more_history(&mut self) -> Vec<Action> {
+        if let Level::Detail { execution_arn, .. } = &self.level
+            && self.history_partial
+        {
+            self.history_pages += HISTORY_PAGE_STEP;
+            self.loading = true;
+            return vec![Action::LoadMoreExecutionHistory {
+                execution_arn: execution_arn.clone(),
+                page_budget: self.history_pages,
             }];
         }
         vec![]
@@ -537,7 +562,7 @@ impl SfnView {
             ""
         };
         let partial = if self.history_partial {
-            " · parcial"
+            " · parcial · o: más"
         } else {
             ""
         };
@@ -647,6 +672,10 @@ impl View for SfnView {
         {
             hints.push(("enter", "in/out"));
         }
+        // En el detalle con history parcial, `o` trae más estados del timeline.
+        if matches!(self.level, Level::Detail { .. }) && self.history_partial {
+            hints.push(("o", "más history"));
+        }
         // `l` solo si el estado seleccionado del timeline invoca una Lambda (cross-link
         // a sus logs). Lectura → sin gate.
         if self
@@ -692,6 +721,7 @@ impl View for SfnView {
         self.loading = true;
         self.machines_partial = false;
         self.history_partial = false;
+        self.history_pages = HISTORY_PAGE_STEP;
         self.executions_partial = false;
         self.state.select(Some(0));
         vec![Action::LoadStateMachines]
@@ -743,7 +773,12 @@ impl View for SfnView {
             KeyCode::Enter => self.drill(),
             KeyCode::Esc => self.back(),
             KeyCode::Char('r') => self.refresh(),
-            KeyCode::Char('o') => self.load_more_executions(),
+            // `o` carga más según el nivel: ejecuciones (append) o history (re-fetch).
+            KeyCode::Char('o') => match self.level {
+                Level::Executions { .. } => self.load_more_executions(),
+                Level::Detail { .. } => self.load_more_history(),
+                Level::Machines => vec![],
+            },
             KeyCode::Char('R') => self.redrive_intent(),
             KeyCode::Char('l') => self.open_lambda_logs(),
             KeyCode::Char('y') => self
@@ -814,19 +849,31 @@ impl View for SfnView {
                 } = &self.level
                     && current == execution_arn
                 {
+                    // Recordar qué estado estaba seleccionado ANTES de reemplazar el
+                    // history (para preservarlo en el load-more, donde la lista crece).
+                    let prev_name = self.selected_state_span().map(|s| s.name);
                     self.detail = Some(detail.clone());
                     self.history = history.clone();
                     self.failed_state = failed_state.clone();
                     self.history_partial = *history_more;
                     self.loading = false;
-                    // Saltar al estado que reventó (si lo hay), sobre la lista visible
-                    // (filtrada). Tras el drill el filtro está vacío → es la identidad.
+                    // Preservar la selección por NOMBRE sobre la lista visible (robusto a
+                    // que la lista crezca con `o`). Si no había selección previa (1ª carga),
+                    // saltar al estado que reventó; si tampoco, al tope.
                     let visible = self.filtered_history_indices();
-                    let idx = self
-                        .failed_state
-                        .as_ref()
-                        .and_then(|fs| visible.iter().position(|&i| &self.history[i].name == fs));
-                    self.state.select(Some(idx.unwrap_or(0)));
+                    let pos = |hist: &[StateSpanDto], vis: &[usize], name: &str| {
+                        vis.iter().position(|&i| hist[i].name == name)
+                    };
+                    let idx = prev_name
+                        .as_deref()
+                        .and_then(|n| pos(&self.history, &visible, n))
+                        .or_else(|| {
+                            self.failed_state
+                                .as_deref()
+                                .and_then(|fs| pos(&self.history, &visible, fs))
+                        })
+                        .unwrap_or(0);
+                    self.state.select(Some(idx));
                     self.clamp_selection();
                 }
             }
@@ -1588,6 +1635,120 @@ mod tests {
             v.timeline_title().contains("parcial"),
             "history_more=true → timeline parcial"
         );
+    }
+
+    fn span_named(name: &str, from: i64) -> StateSpanDto {
+        StateSpanDto {
+            name: name.to_string(),
+            entered_ts: Some(from),
+            exited_ts: Some(from + 1_000),
+            failed: false,
+            input: None,
+            output: None,
+            resource_arn: None,
+        }
+    }
+
+    fn ok_detail_dto() -> ExecutionDetailDto {
+        ExecutionDetailDto {
+            status: ExecStatus::Succeeded,
+            start_ts: Some(0),
+            stop_ts: Some(1),
+            input: None,
+            output: None,
+            error: None,
+            cause: None,
+            redrive_count: None,
+        }
+    }
+
+    /// Lleva la vista a `Detail` con un `history` dado y la señal `more`.
+    fn view_in_detail_with_history(
+        history: Vec<StateSpanDto>,
+        failed: Option<&str>,
+        more: bool,
+    ) -> SfnView {
+        let mut v = SfnView::new();
+        v.on_message(&machines_msg(vec![machine("m1", MachineType::Standard)]));
+        v.on_key(key(KeyCode::Enter)); // → Executions
+        v.on_message(&Message::ExecutionsLoaded {
+            machine_arn: "arn:aws:states:us-east-1:000:stateMachine:m1".into(),
+            executions: vec![exec("e1", ExecStatus::Succeeded)],
+            next_token: None,
+            append: false,
+        });
+        v.on_key(key(KeyCode::Enter)); // → Detail
+        v.on_message(&Message::ExecutionDetailLoaded {
+            execution_arn: exec("e1", ExecStatus::Succeeded).arn,
+            detail: ok_detail_dto(),
+            history,
+            failed_state: failed.map(String::from),
+            history_more: more,
+        });
+        v
+    }
+
+    #[test]
+    fn o_in_detail_loads_more_history_only_when_partial() {
+        let history = vec![span_named("Step06", 6_000), span_named("Step07", 7_000)];
+        let mut v = view_in_detail_with_history(history, None, true);
+        assert!(v.history_partial);
+
+        // 1ª `o`: sube el presupuesto a 20 (10 inicial + paso 10).
+        match v.on_key(key(KeyCode::Char('o'))).as_slice() {
+            [
+                Action::LoadMoreExecutionHistory {
+                    execution_arn,
+                    page_budget,
+                },
+            ] => {
+                assert!(execution_arn.ends_with("e1"));
+                assert_eq!(*page_budget, 20);
+            }
+            other => panic!("se esperaba LoadMoreExecutionHistory budget 20, llegó {other:?}"),
+        }
+        // 2ª `o` (sigue parcial): presupuesto 30.
+        match v.on_key(key(KeyCode::Char('o'))).as_slice() {
+            [Action::LoadMoreExecutionHistory { page_budget, .. }] => assert_eq!(*page_budget, 30),
+            other => panic!("se esperaba budget 30, llegó {other:?}"),
+        }
+
+        // Sin parcial → `o` en Detail es no-op.
+        let mut done = view_in_detail_with_history(vec![span_named("Step01", 1_000)], None, false);
+        assert!(done.on_key(key(KeyCode::Char('o'))).is_empty());
+    }
+
+    #[test]
+    fn load_more_preserves_selection_by_name() {
+        // History inicial parcial (Step06..Step08); selecciono Step07.
+        let initial = vec![
+            span_named("Step06", 6_000),
+            span_named("Step07", 7_000),
+            span_named("Step08", 8_000),
+        ];
+        let mut v = view_in_detail_with_history(initial, None, true);
+        v.on_key(key(KeyCode::Char('j'))); // 0 (Step06) → 1 (Step07)
+        assert_eq!(v.selected_state_span().unwrap().name, "Step07");
+
+        // Llega el load-more: el timeline crece con estados más viejos al frente.
+        let arn = match &v.level {
+            Level::Detail { execution_arn, .. } => execution_arn.clone(),
+            _ => unreachable!(),
+        };
+        let grown: Vec<StateSpanDto> = (1..=8)
+            .map(|n| span_named(&format!("Step{n:02}"), (n as i64) * 1_000))
+            .collect();
+        v.on_message(&Message::ExecutionDetailLoaded {
+            execution_arn: arn,
+            detail: ok_detail_dto(),
+            history: grown,
+            failed_state: None,
+            history_more: false,
+        });
+
+        // Step07 sigue seleccionado (en un índice distinto) y ya no es parcial.
+        assert_eq!(v.selected_state_span().unwrap().name, "Step07");
+        assert!(!v.history_partial);
     }
 
     #[test]

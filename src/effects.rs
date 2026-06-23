@@ -114,6 +114,10 @@ impl Effects {
             Action::LoadExecutionDetail { execution_arn } => {
                 self.load_execution_detail(execution_arn, epoch)
             }
+            Action::LoadMoreExecutionHistory {
+                execution_arn,
+                page_budget,
+            } => self.load_more_execution_history(execution_arn, page_budget, epoch),
             Action::RedriveExecution { execution_arn } => {
                 self.redrive_execution(execution_arn, epoch)
             }
@@ -480,13 +484,14 @@ impl Effects {
             Backend::Mock(_) => {
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(450)).await;
-                    let (detail, history, failed_state) = mock_execution_detail(&execution_arn);
+                    let (detail, history, failed_state, history_more) =
+                        mock_execution_detail(&execution_arn, MAX_HISTORY_PAGES);
                     let msg = Message::ExecutionDetailLoaded {
                         execution_arn,
                         detail,
                         history,
                         failed_state,
-                        history_more: false,
+                        history_more,
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -496,6 +501,50 @@ impl Effects {
                 tokio::spawn(async move {
                     let msg = match fetch_execution_detail(&ctx, &execution_arn, MAX_HISTORY_PAGES)
                         .await
+                    {
+                        Ok((detail, history, failed_state, history_more)) => {
+                            Message::ExecutionDetailLoaded {
+                                execution_arn,
+                                detail,
+                                history,
+                                failed_state,
+                                history_more,
+                            }
+                        }
+                        Err(e) => sdk_error("execution detail", &e),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+        }
+    }
+
+    /// Load-more del history (`o` en Detail): re-fetchea describe + history con un
+    /// `page_budget` mayor y re-parsea TODO el prefijo (la única forma correcta sin
+    /// guardar eventos crudos; ver `fetch_execution_detail`). Emite el MISMO
+    /// `ExecutionDetailLoaded` que la carga inicial (la vista lo trata igual).
+    fn load_more_execution_history(&self, execution_arn: String, page_budget: usize, epoch: u64) {
+        let tx = self.tx.clone();
+        match &self.backend {
+            Backend::Mock(_) => {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let (detail, history, failed_state, history_more) =
+                        mock_execution_detail(&execution_arn, page_budget);
+                    let msg = Message::ExecutionDetailLoaded {
+                        execution_arn,
+                        detail,
+                        history,
+                        failed_state,
+                        history_more,
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match fetch_execution_detail(&ctx, &execution_arn, page_budget).await
                     {
                         Ok((detail, history, failed_state, history_more)) => {
                             Message::ExecutionDetailLoaded {
@@ -1877,13 +1926,15 @@ fn mock_state_machines(env: &Env) -> Vec<StateMachineDto> {
 /// una FAILED y una RUNNING (sin `stop_ts`). Los `tag`s (`fail`/`run`/…) los lee
 /// `mock_execution_detail` para producir un detalle coherente.
 fn mock_executions(machine_arn: &str, status: Option<ExecStatus>) -> Vec<ExecutionDto> {
-    let specs: [(&str, ExecStatus); 6] = [
+    let specs: [(&str, ExecStatus); 7] = [
         ("fail", ExecStatus::Failed),
         ("ok-1", ExecStatus::Succeeded),
         ("ok-2", ExecStatus::Succeeded),
         ("run", ExecStatus::Running),
         ("abort", ExecStatus::Aborted),
         ("timeout", ExecStatus::TimedOut),
+        // History largo: demuestra el load-more del timeline (`o` en Detail).
+        ("big", ExecStatus::Succeeded),
     ];
     let base_ts: i64 = 1_750_000_000_000;
     specs
@@ -1909,10 +1960,13 @@ fn mock_executions(machine_arn: &str, status: Option<ExecStatus>) -> Vec<Executi
 
 /// Detalle falso de una ejecución, determinista por el arn: si contiene un tag de
 /// fallo (`fail`/`abort`/`timeout`) → FAILED con error/cause y un timeline donde
-/// revienta `ProcessOrder`; `run` → RUNNING (último estado abierto); si no → SUCCEEDED.
+/// revienta `ProcessOrder`; `run` → RUNNING (último estado abierto); `big` → un history
+/// largo que crece con `page_budget` (demuestra el load-more); si no → SUCCEEDED.
+/// Devuelve también `history_more` (espeja la paginación del SDK real).
 fn mock_execution_detail(
     execution_arn: &str,
-) -> (ExecutionDetailDto, Vec<StateSpanDto>, Option<String>) {
+    page_budget: usize,
+) -> (ExecutionDetailDto, Vec<StateSpanDto>, Option<String>, bool) {
     let base: i64 = 1_750_000_000_000;
     let input = Some("{\n  \"orderId\": \"A-1001\",\n  \"amount\": 4200\n}".to_string());
     let span = |name: &str, from: i64, to: Option<i64>, failed: bool| StateSpanDto {
@@ -1950,7 +2004,36 @@ fn mock_execution_detail(
             span("ChargeCard", 2_000, Some(5_000), false),
             span("ProcessOrder", 5_000, None, true),
         ];
-        (detail, history, Some("ProcessOrder".to_string()))
+        (detail, history, Some("ProcessOrder".to_string()), false)
+    } else if execution_arn.contains("big") {
+        // History largo (15 estados contiguos). Con `reverse_order` el SDK trae los más
+        // recientes primero; emulamos eso revelando los ÚLTIMOS `page_budget` estados
+        // (los más viejos aparecen al cargar más). `more` = quedan estados sin revelar.
+        const TOTAL: usize = 15;
+        let reveal = page_budget.min(TOTAL);
+        let start = TOTAL - reveal;
+        let history: Vec<StateSpanDto> = (start..TOTAL)
+            .map(|i| {
+                let from = (i as i64) * 1_000;
+                span(
+                    &format!("Step{:02}", i + 1),
+                    from,
+                    Some(from + 1_000),
+                    false,
+                )
+            })
+            .collect();
+        let detail = ExecutionDetailDto {
+            status: ExecStatus::Succeeded,
+            start_ts: Some(base),
+            stop_ts: Some(base + (TOTAL as i64) * 1_000),
+            input,
+            output: Some("{\n  \"status\": \"ok\"\n}".to_string()),
+            error: None,
+            cause: None,
+            redrive_count: Some(0),
+        };
+        (detail, history, None, reveal < TOTAL)
     } else if execution_arn.contains("run") {
         let detail = ExecutionDetailDto {
             status: ExecStatus::Running,
@@ -1966,7 +2049,7 @@ fn mock_execution_detail(
             span("Validate", 0, Some(2_000), false),
             span("ChargeCard", 2_000, None, false),
         ];
-        (detail, history, None)
+        (detail, history, None, false)
     } else {
         let detail = ExecutionDetailDto {
             status: ExecStatus::Succeeded,
@@ -1983,7 +2066,7 @@ fn mock_execution_detail(
             span("ChargeCard", 2_000, Some(5_000), false),
             span("ProcessOrder", 5_000, Some(9_000), false),
         ];
-        (detail, history, None)
+        (detail, history, None, false)
     }
 }
 
@@ -2642,6 +2725,62 @@ mod tests {
                 assert_eq!(detail.status, ExecStatus::Succeeded);
                 assert!(failed_state.is_none());
                 assert!(detail.error.is_none());
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_big_history_paginates_and_load_more_completes() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+        let arn = "arn:…:exec:exec-big-6";
+
+        // Carga inicial (budget=10): history parcial.
+        fx.dispatch(
+            Action::LoadExecutionDetail {
+                execution_arn: arn.into(),
+            },
+            1,
+        );
+        let first = rx.recv().await.expect("envelope");
+        let initial_len = match first.message {
+            Message::ExecutionDetailLoaded {
+                history,
+                history_more,
+                ..
+            } => {
+                assert!(history_more, "con budget 10 el history es parcial");
+                assert!(
+                    history.iter().all(|s| s.exited_ts.is_some()),
+                    "todos los spans revelados son contiguos (sin huérfanos)"
+                );
+                history.len()
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        };
+
+        // Load-more (budget=20): más spans, ya no parcial.
+        fx.dispatch(
+            Action::LoadMoreExecutionHistory {
+                execution_arn: arn.into(),
+                page_budget: 20,
+            },
+            1,
+        );
+        let second = rx.recv().await.expect("envelope");
+        match second.message {
+            Message::ExecutionDetailLoaded {
+                history,
+                history_more,
+                ..
+            } => {
+                assert!(!history_more, "con budget 20 ya está completo");
+                assert!(history.len() > initial_len, "load-more revela más estados");
+                assert!(
+                    history.iter().all(|s| s.exited_ts.is_some()),
+                    "el set completo sigue contiguo"
+                );
             }
             other => panic!("mensaje inesperado: {other:?}"),
         }

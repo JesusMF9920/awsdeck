@@ -84,6 +84,14 @@ pub enum Action {
     },
     /// Hacer drill a una ejecución: describe + history (timeline de estados).
     LoadExecutionDetail { execution_arn: String },
+    /// Cargar más del history de una ejecución (`o` en Detail): re-pide describe +
+    /// history con un `page_budget` mayor y re-parsea TODO (el emparejamiento
+    /// entry/exit requiere un prefijo cronológico contiguo). Reusa
+    /// `Message::ExecutionDetailLoaded`.
+    LoadMoreExecutionHistory {
+        execution_arn: String,
+        page_budget: usize,
+    },
     /// Pedir los event buses de EventBridge del ambiente activo.
     LoadEventBuses,
     /// Hacer drill a un bus: sus rules.

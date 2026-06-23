@@ -176,7 +176,11 @@ impl Effects {
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(400)).await;
                     let streams = mock_log_streams(&group);
-                    let msg = Message::LogStreamsLoaded { group, streams };
+                    let msg = Message::LogStreamsLoaded {
+                        group,
+                        streams,
+                        more: false,
+                    };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
             }
@@ -184,7 +188,11 @@ impl Effects {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
                     let msg = match fetch_log_streams(&ctx, &group).await {
-                        Ok(streams) => Message::LogStreamsLoaded { group, streams },
+                        Ok((streams, more)) => Message::LogStreamsLoaded {
+                            group,
+                            streams,
+                            more,
+                        },
                         Err(e) => sdk_error("describe_log_streams", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
@@ -787,28 +795,46 @@ async fn fetch_log_groups_page(
     Ok((groups, out.next_token().is_some()))
 }
 
-async fn fetch_log_streams(ctx: &AwsContext, group: &str) -> color_eyre::Result<Vec<LogStreamDto>> {
+/// Tope de páginas de streams. Un group puede tener decenas de miles de streams;
+/// `into_paginator().items()` los drenaba TODOS (segundos de bloqueo). Acotamos a
+/// `MAX_STREAM_PAGES × 50` (los más recientes primero) y señalamos `· parcial`.
+const MAX_STREAM_PAGES: usize = 10;
+
+async fn fetch_log_streams(
+    ctx: &AwsContext,
+    group: &str,
+) -> color_eyre::Result<(Vec<LogStreamDto>, bool)> {
     use aws_sdk_cloudwatchlogs::types::OrderBy;
 
     let client = ctx.logs().await;
-    let mut pages = client
-        .describe_log_streams()
-        .log_group_name(group)
-        .order_by(OrderBy::LastEventTime)
-        .descending(true)
-        .into_paginator()
-        .items()
-        .send();
-
     let mut streams = Vec::new();
-    while let Some(item) = pages.next().await {
-        let s = item?;
-        streams.push(LogStreamDto {
-            name: s.log_stream_name().unwrap_or_default().to_string(),
-            last_event_ts: s.last_event_timestamp(),
-        });
+    let mut next: Option<String> = None;
+    let mut more = false;
+
+    for page in 0..MAX_STREAM_PAGES {
+        let out = client
+            .describe_log_streams()
+            .log_group_name(group)
+            .order_by(OrderBy::LastEventTime)
+            .descending(true)
+            .limit(50)
+            .set_next_token(next)
+            .send()
+            .await?;
+        for s in out.log_streams() {
+            streams.push(LogStreamDto {
+                name: s.log_stream_name().unwrap_or_default().to_string(),
+                last_event_ts: s.last_event_timestamp(),
+            });
+        }
+        next = out.next_token().map(str::to_string);
+        match &next {
+            Some(_) if page == MAX_STREAM_PAGES - 1 => more = true,
+            Some(_) => {}
+            None => break,
+        }
     }
-    Ok(streams)
+    Ok((streams, more))
 }
 
 /// Tope de líneas por carga. `get_log_events` con `start_from_head(false)` trae las
@@ -2044,9 +2070,14 @@ mod tests {
         let envelope = rx.recv().await.expect("debe llegar un envelope");
         assert_eq!(envelope.epoch, 3);
         match envelope.message {
-            Message::LogStreamsLoaded { group, streams } => {
+            Message::LogStreamsLoaded {
+                group,
+                streams,
+                more,
+            } => {
                 assert_eq!(group, "/ecs/checkout-service");
                 assert!(!streams.is_empty());
+                assert!(!more, "el mock no es parcial");
             }
             other => panic!("mensaje inesperado: {other:?}"),
         }

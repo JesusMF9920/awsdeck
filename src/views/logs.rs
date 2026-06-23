@@ -72,6 +72,9 @@ pub struct LogsView {
     last_query: Option<String>,
     /// `true` si el servidor tiene más groups que los traídos (next_token).
     partial: bool,
+    /// `true` si se topó el tope de paginación de streams (hay más sin traer). Campo
+    /// propio (no `partial`) para sobrevivir el ida-y-vuelta a `Events` (que reusa `partial`).
+    streams_partial: bool,
     /// Ventana de tiempo activa del tail (logs del group).
     tail_window: LogWindow,
     /// Índice del preset activo en `WINDOW_PRESETS` (para ciclar con `w`/`W`).
@@ -115,6 +118,7 @@ impl LogsView {
             loading: false,
             last_query: None,
             partial: false,
+            streams_partial: false,
             tail_window: LogWindow::Last(WINDOW_PRESETS[DEFAULT_PRESET].1),
             tail_preset: DEFAULT_PRESET,
             tail_token: None,
@@ -354,6 +358,7 @@ impl LogsView {
                         group: group.clone(),
                     };
                     self.streams.clear();
+                    self.streams_partial = false;
                     self.recompute_filtered();
                     self.loading = true;
                     self.state.select(Some(0));
@@ -590,15 +595,13 @@ impl LogsView {
         } else {
             String::new()
         };
-        let partial = if !self.partial {
-            ""
-        } else {
-            match self.level {
-                Level::Groups => " · parcial (/ busca server-side)",
-                Level::Events { .. } => " · parcial · o: más viejas",
-                Level::Tail { .. } => " · parcial · o: cargar más",
-                Level::Streams { .. } => "",
-            }
+        let partial = match self.level {
+            // Streams usa su propio flag (sobrevive el ida-y-vuelta a Events).
+            Level::Streams { .. } if self.streams_partial => " · parcial",
+            Level::Groups if self.partial => " · parcial (/ busca server-side)",
+            Level::Events { .. } if self.partial => " · parcial · o: más viejas",
+            Level::Tail { .. } if self.partial => " · parcial · o: cargar más",
+            _ => "",
         };
         if self.filter.is_empty() {
             // Cue del hermano `Tail`: en groups/streams recuerda que `t` ve TODOS los
@@ -795,12 +798,17 @@ impl View for LogsView {
                     self.restore_selection(keep.as_deref());
                 }
             }
-            Message::LogStreamsLoaded { group, streams } => {
+            Message::LogStreamsLoaded {
+                group,
+                streams,
+                more,
+            } => {
                 // Aceptar solo si corresponden al group del drill actual.
                 if let Level::Streams { group: current } = &self.level
                     && current == group
                 {
                     self.streams = streams.clone();
+                    self.streams_partial = *more;
                     self.loading = false;
                     self.recompute_filtered();
                     self.clamp_selection();
@@ -1172,6 +1180,7 @@ mod tests {
                 name: name.to_string(),
                 last_event_ts: None,
             }],
+            more: false,
         }
     }
 
@@ -2048,6 +2057,7 @@ mod tests {
                     last_event_ts: None,
                 },
             ],
+            more: false,
         });
         assert_eq!(v.visible_len(), 2);
 
@@ -2055,6 +2065,31 @@ mod tests {
         v.on_key(key(KeyCode::Esc));
         assert!(matches!(v.level, Level::Groups));
         assert_eq!(v.visible_len(), 2);
+    }
+
+    #[test]
+    fn streams_partial_shows_in_title_and_resets_on_redrill() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/ecs/checkout")]));
+        v.on_key(key(KeyCode::Enter)); // drill a streams
+        v.on_message(&Message::LogStreamsLoaded {
+            group: "/ecs/checkout".into(),
+            streams: vec![LogStreamDto {
+                name: "s1".into(),
+                last_event_ts: None,
+            }],
+            more: true,
+        });
+        assert!(
+            v.streams_partial,
+            "more=true marca los streams como parciales"
+        );
+        assert!(v.body_title().contains("parcial"));
+
+        // Volver a groups y re-drillear resetea el flag antes de la nueva carga.
+        v.on_key(key(KeyCode::Esc)); // streams → groups
+        v.on_key(key(KeyCode::Enter)); // drill de nuevo
+        assert!(!v.streams_partial, "el re-drill resetea el parcial");
     }
 
     #[test]
@@ -2152,6 +2187,7 @@ mod tests {
                 name: "x".into(),
                 last_event_ts: None,
             }],
+            more: false,
         });
         assert_eq!(v.visible_len(), 0, "no se aceptan streams de otro group");
     }

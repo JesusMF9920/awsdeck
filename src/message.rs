@@ -327,10 +327,12 @@ pub enum Message {
         more: bool,
     },
     /// Se cargaron los streams de `group` (se incluye `group` para que la vista
-    /// confirme que corresponden al drill actual).
+    /// confirme que corresponden al drill actual). `more` = se topó el tope de
+    /// paginación con más streams pendientes (la vista muestra `· parcial`).
     LogStreamsLoaded {
         group: String,
         streams: Vec<LogStreamDto>,
+        more: bool,
     },
     /// Eventos de un stream (`get_log_events`). `group`+`stream` confirman el drill
     /// actual; `next_token` = hay líneas más viejas (para `o` traer más); `append` = es

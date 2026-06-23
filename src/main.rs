@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::app::App;
 use crate::aws::context::Env;
-use crate::config::Config;
+use crate::config::{Config, State};
 use crate::effects::Effects;
 use crate::tui::Tui;
 use crate::views::Registry;
@@ -31,9 +31,10 @@ use crate::views::sqs::SqsView;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Config opcional del disco (load-only); si no hay, defaults.
+    // Config opcional del disco (load-only) + estado persistido (último ambiente).
     let config = Config::load();
-    let env = initial_env(&config);
+    let state = State::load();
+    let env = initial_env(&config, &state);
 
     // Canal de resultados async: effects manda, App recibe en el select! loop.
     let (tx, rx) = mpsc::channel(64);
@@ -72,16 +73,71 @@ async fn main() -> Result<()> {
     result
 }
 
-/// Ambiente inicial: entorno > config en disco > defaults sensatos.
-fn initial_env(config: &Config) -> Env {
-    let profile = std::env::var("AWS_PROFILE")
+/// Ambiente inicial leyendo el entorno; delega la precedencia a `pick_env` (puro).
+fn initial_env(config: &Config, state: &State) -> Env {
+    let env_region = std::env::var("AWS_REGION")
         .ok()
+        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok());
+    pick_env(std::env::var("AWS_PROFILE").ok(), env_region, config, state)
+}
+
+/// Precedencia del ambiente inicial (pura, testeable): entorno > `default_*` del
+/// `config.toml` (preferencia explícita) > último ambiente usado (`state.toml`) >
+/// defaults sensatos.
+fn pick_env(
+    env_profile: Option<String>,
+    env_region: Option<String>,
+    config: &Config,
+    state: &State,
+) -> Env {
+    let profile = env_profile
         .or_else(|| config.default_profile.clone())
+        .or_else(|| state.last_profile.clone())
         .unwrap_or_else(|| "default".to_string());
-    let region = std::env::var("AWS_REGION")
-        .ok()
-        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+    let region = env_region
         .or_else(|| config.default_region.clone())
+        .or_else(|| state.last_region.clone())
         .unwrap_or_else(|| "us-east-1".to_string());
     Env::new(profile, region)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pick_env_precedence_env_over_config_over_state() {
+        let config = Config {
+            default_profile: Some("cfg-prof".into()),
+            default_region: Some("cfg-region".into()),
+            default_tail_window: None,
+        };
+        let state = State {
+            last_profile: Some("state-prof".into()),
+            last_region: Some("state-region".into()),
+        };
+        // El entorno gana sobre todo.
+        let e = pick_env(
+            Some("env-prof".into()),
+            Some("env-region".into()),
+            &config,
+            &state,
+        );
+        assert_eq!(e, Env::new("env-prof", "env-region"));
+        // Sin entorno: gana el default explícito del config.
+        let e = pick_env(None, None, &config, &state);
+        assert_eq!(e, Env::new("cfg-prof", "cfg-region"));
+    }
+
+    #[test]
+    fn pick_env_falls_back_to_state_then_default() {
+        let config = Config::default();
+        let state = State {
+            last_profile: Some("last".into()),
+            last_region: None,
+        };
+        // Sin entorno ni config: recuerda el último profile; región cae al default.
+        let e = pick_env(None, None, &config, &state);
+        assert_eq!(e, Env::new("last", "us-east-1"));
+    }
 }

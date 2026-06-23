@@ -218,6 +218,13 @@ impl App {
                 _ = tick.tick() => self.on_tick(),
             }
         }
+        // Persistir el último ambiente para recordarlo al reabrir. No-destructivo:
+        // escribe `state.toml` aparte, no toca el `config.toml` hand-editado. Best-effort.
+        crate::config::State {
+            last_profile: Some(self.env.profile.clone()),
+            last_region: Some(self.env.region.clone()),
+        }
+        .save();
         Ok(())
     }
 

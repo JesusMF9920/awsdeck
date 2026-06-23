@@ -6,6 +6,7 @@ use ratatui::layout::{Constraint, Flex, Layout, Rect};
 
 pub mod command_bar;
 pub mod confirm;
+pub mod detail;
 pub mod header;
 pub mod help;
 pub mod picker;

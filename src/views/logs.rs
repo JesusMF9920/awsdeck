@@ -8,11 +8,12 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::View;
 use crate::action::{Action, ConsoleTarget, ViewContext};
 use crate::message::{LogEventDto, LogGroupDto, LogStreamDto, LogWindow, Message};
+use crate::ui::detail::DetailPanel;
 use crate::util::{
     fmt_clock_millis, fmt_epoch_millis, fuzzy_score, parse_datetime, parse_duration, ranked,
 };
@@ -86,11 +87,9 @@ pub struct LogsView {
     /// Preset de ventana por defecto al abrir el tail (configurable en disco vía
     /// `with_default_window`). Por defecto `DEFAULT_PRESET` (1h).
     default_preset: usize,
-    /// Línea expandida: índice ABSOLUTO en `events` del evento abierto en el panel de
-    /// detalle (`enter` sobre una línea). `None` = mostrando la lista.
-    detail: Option<usize>,
-    /// Scroll vertical del panel de detalle (líneas).
-    detail_scroll: u16,
+    /// Panel de detalle de la línea expandida (`enter` sobre un evento): snapshot del
+    /// mensaje completo, scrolleable. `None` = mostrando la lista.
+    detail: Option<DetailPanel>,
     /// Selección de la lista visible (índice dentro de la lista filtrada).
     state: ListState,
 }
@@ -115,7 +114,6 @@ impl LogsView {
             tail_live: false,
             default_preset: DEFAULT_PRESET,
             detail: None,
-            detail_scroll: 0,
             state: ListState::default().with_selected(Some(0)),
         }
     }
@@ -131,36 +129,34 @@ impl LogsView {
         self
     }
 
-    /// Abre el panel de detalle del evento seleccionado (índice absoluto en `events`).
+    /// Abre el panel de detalle del evento seleccionado (snapshot del mensaje completo).
     fn open_detail(&mut self) {
         if let Some(sel) = self.state.selected()
             && let Some(&idx) = self.filtered.get(sel)
+            && let Some(e) = self.events.get(idx)
         {
-            self.detail = Some(idx);
-            self.detail_scroll = 0;
+            let when =
+                e.ts.map(fmt_epoch_millis)
+                    .unwrap_or_else(|| "—".to_string());
+            let stream = e
+                .stream
+                .as_deref()
+                .map(|s| format!(" · {s}"))
+                .unwrap_or_default();
+            self.detail = Some(DetailPanel::new(
+                format!("{when}{stream}"),
+                e.message.clone(),
+            ));
         }
     }
 
-    fn close_detail(&mut self) {
-        self.detail = None;
-        self.detail_scroll = 0;
-    }
-
-    /// Teclas mientras el panel de detalle está abierto: scroll + cerrar.
+    /// Teclas mientras el panel de detalle está abierto: scroll + cerrar (lo maneja el
+    /// `DetailPanel`; `esc`/`enter` lo cierran).
     fn detail_key(&mut self, key: KeyEvent) -> Vec<Action> {
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.detail_scroll = self.detail_scroll.saturating_add(1)
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(1)
-            }
-            KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(10),
-            KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
-            KeyCode::Char('g') | KeyCode::Home => self.detail_scroll = 0,
-            KeyCode::Char('G') | KeyCode::End => self.detail_scroll = u16::MAX, // clamp al render
-            KeyCode::Esc | KeyCode::Enter => self.close_detail(),
-            _ => {}
+        if let Some(p) = self.detail.as_mut()
+            && p.on_key(key)
+        {
+            self.detail = None;
         }
         vec![]
     }
@@ -308,8 +304,8 @@ impl LogsView {
     /// la línea; en groups, el ARN del group (o el nombre); en streams, el nombre del
     /// stream; en las hojas de líneas, el mensaje de la línea seleccionada.
     fn copy_text(&self) -> Option<String> {
-        if let Some(idx) = self.detail {
-            return self.events.get(idx).map(|e| e.message.clone());
+        if let Some(p) = &self.detail {
+            return Some(p.content().to_string());
         }
         match self.level {
             Level::Groups => {
@@ -570,40 +566,12 @@ impl LogsView {
         }
     }
 
-    /// Pinta el evento expandido: cabecera (hora · stream) + mensaje completo con wrap
-    /// y scroll; JSON pretty si parsea. Ocupa el cuerpo entero (en vez de la lista).
+    /// Pinta el panel de detalle (snapshot del mensaje completo, wrap + scroll, JSON
+    /// pretty). Ocupa el cuerpo entero (en vez de la lista).
     fn render_detail(&mut self, frame: &mut Frame, area: Rect) {
-        let Some(idx) = self.detail else { return };
-        if idx >= self.events.len() {
-            // El evento ya no existe (una recarga lo movió): cierra el detalle.
-            self.close_detail();
-            frame.render_widget(
-                Paragraph::new("(evento no disponible)").block(Block::bordered()),
-                area,
-            );
-            return;
+        if let Some(p) = self.detail.as_mut() {
+            p.render(frame, area);
         }
-        let e = &self.events[idx];
-        let when =
-            e.ts.map(fmt_epoch_millis)
-                .unwrap_or_else(|| "—".to_string());
-        let stream = e
-            .stream
-            .as_deref()
-            .map(|s| format!(" · {s}"))
-            .unwrap_or_default();
-        let body = pretty_or_raw(&e.message); // string propio: libera el préstamo de `e`
-        let total = body.lines().count() as u16;
-
-        // Clampa el scroll (soporta `G` = u16::MAX) al final del contenido.
-        self.detail_scroll = self.detail_scroll.min(total.saturating_sub(1));
-
-        let title = format!(" {when}{stream} · esc cierra · j/k scroll ");
-        let para = Paragraph::new(body)
-            .block(Block::bordered().title(title))
-            .wrap(Wrap { trim: false })
-            .scroll((self.detail_scroll, 0));
-        frame.render_widget(para, area);
     }
 }
 
@@ -623,9 +591,9 @@ impl View for LogsView {
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
-        // Con el detalle abierto, las teclas scrollean/cierran/copian.
-        if self.detail.is_some() {
-            return vec![("j/k", "scroll"), ("y", "copiar"), ("esc", "cerrar")];
+        // Con el detalle abierto, el panel dicta sus teclas (scroll/copiar/cerrar).
+        if let Some(p) = &self.detail {
+            return p.hints();
         }
         match self.level {
             // `t` abre el tail (todos los streams del group por rango): es el feature
@@ -1025,15 +993,6 @@ fn event_item(row: &EventRow) -> ListItem<'static> {
     }
     spans.push(Span::styled(row.preview.clone(), row.style));
     ListItem::new(Line::from(spans))
-}
-
-/// Pretty-print del mensaje si es JSON válido; si no, el texto tal cual. Para el panel
-/// de detalle (`enter`), donde sí queremos saltos de línea e indentación.
-fn pretty_or_raw(msg: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(msg.trim())
-        .ok()
-        .and_then(|v| serde_json::to_string_pretty(&v).ok())
-        .unwrap_or_else(|| msg.to_string())
 }
 
 /// Sufijo corto e identificable de un nombre de stream (la parte tras `]`, p. ej.

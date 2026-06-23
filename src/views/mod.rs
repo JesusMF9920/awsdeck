@@ -92,6 +92,15 @@ pub trait View {
         false
     }
 
+    /// El recurso seleccionado en el nivel raíz como candidato a favorito: `(key, label)`.
+    /// `key` es opaca para el core (la vista la re-interpreta en `on_context` al abrir el
+    /// favorito); `label` es lo que se pinta en el menú. El `App` la usa para la tecla `*`
+    /// (marcar/desmarcar) y le pone el `view_id` de la vista activa. Default `None` = la
+    /// vista no participa en favoritos. Agnóstico: el core nunca interpreta la `key`.
+    fn selected_favorite(&self) -> Option<(String, String)> {
+        None
+    }
+
     /// Dibuja la vista dentro de `area`.
     fn render(&mut self, frame: &mut Frame, area: Rect);
 

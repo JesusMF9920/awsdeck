@@ -719,6 +719,12 @@ impl View for LogsView {
             ViewContext::LogGroupTail { group, window } => {
                 self.open_group_tail(group.clone(), *window)
             }
+            // Favorito/reciente de logs: la `key` es el nombre del group → abre su tail en
+            // la ventana por defecto (lo más útil para "saltar a este group").
+            ViewContext::Favorite { key } => {
+                let window = LogWindow::Last(WINDOW_PRESETS[self.default_preset].1);
+                self.open_group_tail(key.clone(), window)
+            }
         }
     }
 

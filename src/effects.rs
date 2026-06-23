@@ -151,6 +151,7 @@ impl Effects {
             | Action::Back
             | Action::ClearFilter
             | Action::CopyToClipboard { .. }
+            | Action::RecordRecent { .. }
             | Action::SwitchEnv(_) => {}
         }
     }

@@ -43,6 +43,10 @@ pub enum Action {
     /// `App` al arrancar y al cambiar de ambiente; `effects` responde con
     /// `IdentityLoaded`. Read-only, sin gate. (Service-shaped: vive en `action.rs`.)
     VerifyIdentity,
+    /// Registrar un acceso reciente al recurso seleccionado. La emite la vista al
+    /// drillear a un recurso raíz; el `App` —agnóstico— le pone el `view_id` de la vista
+    /// activa y lo guarda en `state.favorites` (recientes auto). No es un efecto del SDK.
+    RecordRecent { key: String, label: String },
 
     // --- Efectos: `App` los reenvía a `effects::dispatch` (específicos de servicio) ---
     /// Pedir una página acotada (≤50) de log groups. `query=None` = primera página;
@@ -146,4 +150,8 @@ pub enum ViewContext {
     /// Abrir el tail de un log group en una ventana de tiempo (p. ej. `sfn` → logs de la
     /// Lambda de una ejecución, acotado a la duración del estado).
     LogGroupTail { group: String, window: LogWindow },
+    /// Abrir un favorito/reciente: la vista destino re-interpreta su `key` opaca para
+    /// drillear al recurso (p. ej. `logs` abre los streams del group, `sqs` el detalle de
+    /// la cola). Lo arma el `App` desde el menú; la vista lo matchea en `on_context`.
+    Favorite { key: String },
 }

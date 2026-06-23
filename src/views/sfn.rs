@@ -1543,7 +1543,9 @@ mod tests {
         match v.on_key(key(KeyCode::Char('l'))).as_slice() {
             [Action::ActivateViewWithContext { id, context }] => {
                 assert_eq!(id, "logs");
-                let ViewContext::LogGroupTail { group, window } = context;
+                let ViewContext::LogGroupTail { group, window } = context else {
+                    panic!("se esperaba LogGroupTail, llegó {context:?}");
+                };
                 assert_eq!(group, "/aws/lambda/ProcessOrder");
                 // Ventana = rango del span (sin salir → `to: None`).
                 assert!(matches!(window, LogWindow::Range { to: None, .. }));

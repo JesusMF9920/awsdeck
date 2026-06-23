@@ -92,6 +92,9 @@ pub struct LogsView {
     /// Preset de ventana por defecto al abrir el tail (configurable en disco vía
     /// `with_default_window`). Por defecto `DEFAULT_PRESET` (1h).
     default_preset: usize,
+    /// `next_token` (hacia atrás) de los eventos por-stream para `o` (load-more: trae
+    /// líneas más viejas, se anteponen). `None` = no hay más / no aplica.
+    events_token: Option<String>,
     /// Panel de detalle de la línea expandida (`enter` sobre un evento): snapshot del
     /// mensaje completo, scrolleable. `None` = mostrando la lista.
     detail: Option<DetailPanel>,
@@ -119,6 +122,7 @@ impl LogsView {
             tail_live: false,
             live_refresh: false,
             default_preset: DEFAULT_PRESET,
+            events_token: None,
             detail: None,
             state: ListState::default().with_selected(Some(0)),
         }
@@ -248,6 +252,18 @@ impl LogsView {
         self.recompute_filtered();
     }
 
+    /// Prepend (load-more de Events: página más vieja → va arriba): antepone eventos +
+    /// display y recomputa el filtro. Tercer y último punto de mutación del buffer en
+    /// sync; mantiene la invariante `events`/`event_rows`.
+    fn prepend_events(&mut self, mut older: Vec<LogEventDto>) {
+        let mut rows: Vec<EventRow> = older.iter().map(EventRow::new).collect();
+        rows.append(&mut self.event_rows);
+        self.event_rows = rows;
+        older.append(&mut self.events);
+        self.events = older;
+        self.recompute_filtered();
+    }
+
     fn visible_len(&self) -> usize {
         self.filtered.len()
     }
@@ -356,9 +372,17 @@ impl LogsView {
                             stream: stream.clone(),
                         };
                         self.set_events(Vec::new());
+                        self.events_token = None;
                         self.loading = true;
                         self.state.select(Some(0));
-                        vec![Action::ClearFilter, Action::LoadLogEvents { group, stream }]
+                        vec![
+                            Action::ClearFilter,
+                            Action::LoadLogEvents {
+                                group,
+                                stream,
+                                token: None,
+                            },
+                        ]
                     }
                     None => vec![],
                 }
@@ -449,10 +473,26 @@ impl LogsView {
         }
     }
 
-    /// `o`: carga la siguiente página del tail (append) si hay `next_token`.
+    /// `o`: carga la siguiente página. En `Tail` trae más (append, hacia adelante); en
+    /// `Events` trae líneas más viejas del stream (prepend, hacia atrás).
     fn load_more(&mut self) -> Vec<Action> {
-        match (&self.level, self.tail_token.clone()) {
-            (Level::Tail { .. }, Some(token)) => self.tail_query(Some(token)),
+        match &self.level {
+            Level::Tail { .. } => match self.tail_token.clone() {
+                Some(token) => self.tail_query(Some(token)),
+                None => vec![],
+            },
+            Level::Events { group, stream } => match self.events_token.clone() {
+                Some(token) => {
+                    let (group, stream) = (group.clone(), stream.clone());
+                    self.loading = true;
+                    vec![Action::LoadLogEvents {
+                        group,
+                        stream,
+                        token: Some(token),
+                    }]
+                }
+                None => vec![],
+            },
             _ => vec![],
         }
     }
@@ -511,10 +551,14 @@ impl LogsView {
             Level::Streams { group } => vec![Action::LoadLogStreams {
                 group: group.clone(),
             }],
-            Level::Events { group, stream } => vec![Action::LoadLogEvents {
-                group: group.clone(),
-                stream: stream.clone(),
-            }],
+            Level::Events { group, stream } => {
+                self.events_token = None; // refresh recarga desde los más recientes
+                vec![Action::LoadLogEvents {
+                    group: group.clone(),
+                    stream: stream.clone(),
+                    token: None,
+                }]
+            }
             Level::Tail { .. } => vec![], // manejado arriba
         }
     }
@@ -551,7 +595,7 @@ impl LogsView {
         } else {
             match self.level {
                 Level::Groups => " · parcial (/ busca server-side)",
-                Level::Events { .. } => " · parcial (más viejas arriba)",
+                Level::Events { .. } => " · parcial · o: más viejas",
                 Level::Tail { .. } => " · parcial · o: cargar más",
                 Level::Streams { .. } => "",
             }
@@ -615,7 +659,13 @@ impl View for LogsView {
                 ("f", if self.tail_live { "detener" } else { "tail -f" }),
                 (":since", "rango"),
             ],
-            Level::Events { .. } => vec![("y", "copiar línea"), ("O", "consola")],
+            Level::Events { .. } => {
+                let mut h = vec![("y", "copiar línea"), ("O", "consola")];
+                if self.partial {
+                    h.push(("o", "más viejas")); // hay líneas anteriores en el stream
+                }
+                h
+            }
         }
     }
 
@@ -760,7 +810,8 @@ impl View for LogsView {
                 group,
                 stream,
                 events,
-                more,
+                next_token,
+                append,
             } => {
                 // Aceptar solo si corresponden al stream del drill actual.
                 if let Level::Events {
@@ -770,10 +821,24 @@ impl View for LogsView {
                     && g == group
                     && s == stream
                 {
-                    self.set_events(events.clone());
-                    self.partial = *more;
+                    if *append {
+                        // Página más vieja: anteponer y conservar la línea que el usuario
+                        // leía (entran filas arriba → su índice se desplaza hacia abajo).
+                        let prev = self.state.selected();
+                        let before = self.filtered.len();
+                        self.prepend_events(events.clone());
+                        let delta = self.filtered.len() - before; // prepended visibles
+                        match prev {
+                            Some(i) => self.state.select(Some(i + delta)),
+                            None => self.select_edge(false),
+                        }
+                    } else {
+                        self.set_events(events.clone());
+                        self.select_edge(true); // newest abajo (convención de terminal)
+                    }
+                    self.events_token = next_token.clone();
+                    self.partial = next_token.is_some();
                     self.loading = false;
-                    self.select_edge(true); // newest abajo (convención de terminal)
                 }
             }
             Message::LogTailLoaded {
@@ -1123,7 +1188,8 @@ mod tests {
             group: group.into(),
             stream: stream.into(),
             events,
-            more: false,
+            next_token: None,
+            append: false,
         }
     }
 
@@ -1154,12 +1220,62 @@ mod tests {
         v.on_message(&stream("stream-a"));
         let actions = v.on_key(key(KeyCode::Enter)); // streams → events
         match actions.as_slice() {
-            [Action::ClearFilter, Action::LoadLogEvents { group, stream }] => {
+            [
+                Action::ClearFilter,
+                Action::LoadLogEvents {
+                    group,
+                    stream,
+                    token: None,
+                },
+            ] => {
                 assert_eq!(group, "/svc");
                 assert_eq!(stream, "stream-a");
             }
             other => panic!("se esperaba ClearFilter+LoadLogEvents, llegó {other:?}"),
         }
+    }
+
+    #[test]
+    fn o_in_events_loads_older_lines_and_preserves_position() {
+        let mut v = LogsView::new();
+        into_events(&mut v); // Level::Events de stream-a
+        // Primera página (recientes) con next_token → marca parcial; selección al fondo.
+        v.on_message(&Message::LogEventsLoaded {
+            group: "/svc".into(),
+            stream: "stream-a".into(),
+            events: vec![ev("c", 3), ev("d", 4)],
+            next_token: Some("older".into()),
+            append: false,
+        });
+        assert_eq!(v.visible_len(), 2);
+        assert!(v.partial, "hay líneas más viejas");
+        assert_eq!(v.state.selected(), Some(1), "newest abajo");
+
+        // El usuario sube a leer la primera línea (índice 0 = "c").
+        v.on_key(key(KeyCode::Char('k')));
+        assert_eq!(v.state.selected(), Some(0));
+
+        // `o` pide líneas más viejas con el token (hacia atrás).
+        match v.on_key(key(KeyCode::Char('o'))).as_slice() {
+            [Action::LoadLogEvents { token: Some(t), .. }] => assert_eq!(t, "older"),
+            other => panic!("se esperaba LoadLogEvents con token, llegó {other:?}"),
+        }
+        // Llega la página más vieja (append) → se antepone; la línea que leía ("c") se
+        // desplaza 2 hacia abajo (entraron "a","b" arriba).
+        v.on_message(&Message::LogEventsLoaded {
+            group: "/svc".into(),
+            stream: "stream-a".into(),
+            events: vec![ev("a", 1), ev("b", 2)],
+            next_token: None,
+            append: true,
+        });
+        assert_eq!(v.visible_len(), 4, "4 líneas tras anteponer 2");
+        assert_eq!(
+            v.state.selected(),
+            Some(2),
+            "sigue sobre 'c', desplazada por el prepend"
+        );
+        assert!(!v.partial, "ya no quedan más viejas");
         assert!(matches!(v.level, Level::Events { .. }));
     }
 

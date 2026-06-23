@@ -52,7 +52,12 @@ pub enum Action {
     /// Hacer drill: pedir los log streams de un log group.
     LoadLogStreams { group: String },
     /// Hacer drill a un stream: sus eventos más recientes (`get_log_events`).
-    LoadLogEvents { group: String, stream: String },
+    /// `token=Some` = continuar hacia atrás (load-more con `o`, trae líneas más viejas).
+    LoadLogEvents {
+        group: String,
+        stream: String,
+        token: Option<String>,
+    },
     /// Logs de un group por rango de tiempo (`filter_log_events` sobre todos sus
     /// streams). `pattern` = filtro server-side; `window` = rango; `token=Some` =
     /// continuar paginando (load-more, append); `generation` = generación (staleness).

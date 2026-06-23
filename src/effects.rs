@@ -89,7 +89,11 @@ impl Effects {
         match action {
             Action::LoadLogGroups { query } => self.load_log_groups(query, epoch),
             Action::LoadLogStreams { group } => self.load_log_streams(group, epoch),
-            Action::LoadLogEvents { group, stream } => self.load_log_events(group, stream, epoch),
+            Action::LoadLogEvents {
+                group,
+                stream,
+                token,
+            } => self.load_log_events(group, stream, token, epoch),
             Action::LoadLogTail {
                 group,
                 pattern,
@@ -189,8 +193,9 @@ impl Effects {
         }
     }
 
-    fn load_log_events(&self, group: String, stream: String, epoch: u64) {
+    fn load_log_events(&self, group: String, stream: String, token: Option<String>, epoch: u64) {
         let tx = self.tx.clone();
+        let append = token.is_some();
         match &self.backend {
             Backend::Mock(_) => {
                 tokio::spawn(async move {
@@ -200,7 +205,8 @@ impl Effects {
                         group,
                         stream,
                         events,
-                        more: false,
+                        next_token: None,
+                        append,
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -208,12 +214,13 @@ impl Effects {
             Backend::Real(ctx) => {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    let msg = match fetch_log_events(&ctx, &group, &stream).await {
-                        Ok((events, more)) => Message::LogEventsLoaded {
+                    let msg = match fetch_log_events(&ctx, &group, &stream, token).await {
+                        Ok((events, next_token)) => Message::LogEventsLoaded {
                             group,
                             stream,
                             events,
-                            more,
+                            next_token,
+                            append,
                         },
                         Err(e) => sdk_error("get_log_events", &e),
                     };
@@ -856,9 +863,12 @@ async fn fetch_log_events(
     ctx: &AwsContext,
     group: &str,
     stream: &str,
-) -> color_eyre::Result<(Vec<LogEventDto>, bool)> {
+    start_token: Option<String>,
+) -> color_eyre::Result<(Vec<LogEventDto>, Option<String>)> {
     let client = ctx.logs().await;
-    let mut token: Option<String> = None;
+    // `start_token=None` arranca en los más recientes; con token (load-more) continúa
+    // hacia atrás desde ahí (líneas más viejas).
+    let mut token: Option<String> = start_token;
     let mut collected: Vec<LogEventDto> = Vec::new();
 
     for _ in 0..MAX_EVENT_PAGES {
@@ -892,16 +902,17 @@ async fn fetch_log_events(
         token = next;
 
         if collected.len() as i32 >= EVENTS_LIMIT || exhausted {
-            let more = collected.len() as i32 >= EVENTS_LIMIT && !exhausted;
+            // `token` apunta justo más atrás de lo recién traído: continuación para `o`.
+            let next = (!exhausted).then(|| token.clone()).flatten();
             collected.truncate(EVENTS_LIMIT as usize);
-            return Ok((collected, more));
+            return Ok((collected, next));
         }
     }
 
     // Topamos el cap de páginas con algo juntado: probablemente hay más hacia atrás.
-    let more = !collected.is_empty();
+    let next = (!collected.is_empty()).then(|| token.clone()).flatten();
     collected.truncate(EVENTS_LIMIT as usize);
-    Ok((collected, more))
+    Ok((collected, next))
 }
 
 /// Logs de un group por rango de tiempo (`filter_log_events` sobre todos sus streams).
@@ -2042,6 +2053,7 @@ mod tests {
             Action::LoadLogEvents {
                 group: "/ecs/checkout-service".into(),
                 stream: "2026/06/21/[$LATEST]abc".into(),
+                token: None,
             },
             4,
         );
@@ -2053,11 +2065,13 @@ mod tests {
                 group,
                 stream,
                 events,
-                more,
+                next_token,
+                append,
             } => {
                 assert_eq!(group, "/ecs/checkout-service");
                 assert_eq!(stream, "2026/06/21/[$LATEST]abc");
-                assert!(!more);
+                assert!(next_token.is_none());
+                assert!(!append);
                 assert!(!events.is_empty());
                 assert!(
                     events.iter().all(|e| e.stream.is_none()),

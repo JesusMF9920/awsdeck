@@ -327,12 +327,14 @@ pub enum Message {
         streams: Vec<LogStreamDto>,
     },
     /// Eventos de un stream (`get_log_events`). `group`+`stream` confirman el drill
-    /// actual; `more` indica que hay líneas más viejas que las traídas.
+    /// actual; `next_token` = hay líneas más viejas (para `o` traer más); `append` = es
+    /// una página más vieja (la vista la **antepone**, las líneas viejas van arriba).
     LogEventsLoaded {
         group: String,
         stream: String,
         events: Vec<LogEventDto>,
-        more: bool,
+        next_token: Option<String>,
+        append: bool,
     },
     /// Logs del group por rango de tiempo (`filter_log_events` sobre todos sus
     /// streams). `group` confirma el drill actual; `generation` es la generación que la

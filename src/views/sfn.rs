@@ -19,6 +19,7 @@ use crate::message::{
     ExecStatus, ExecutionDetailDto, ExecutionDto, LogWindow, MachineType, Message, StateMachineDto,
     StateSpanDto,
 };
+use crate::ui::detail::DetailPanel;
 use crate::util::{fmt_epoch_millis, fuzzy_score, lambda_log_group_from_arn, ranked};
 
 /// Nivel de drill actual. Cada nivel carga los identificadores que `back()`
@@ -45,6 +46,10 @@ pub struct SfnView {
     detail: Option<ExecutionDetailDto>,
     history: Vec<StateSpanDto>,
     failed_state: Option<String>,
+    /// Panel con el input/output completo del estado seleccionado del timeline
+    /// (`enter` en Detail): la fila los colapsa; el panel los muestra enteros,
+    /// scrolleable/copiable. `None` = vista normal.
+    detail_panel: Option<DetailPanel>,
     filter: String,
     loading: bool,
     /// Se alcanzó el tope de paginación de máquinas (hay más sin traer).
@@ -67,6 +72,7 @@ impl SfnView {
             detail: None,
             history: Vec::new(),
             failed_state: None,
+            detail_panel: None,
             filter: String::new(),
             loading: false,
             machines_partial: false,
@@ -186,6 +192,24 @@ impl SfnView {
         Some(self.history[idx].clone())
     }
 
+    /// Abre el panel con el input/output completos del estado seleccionado (la fila los
+    /// colapsa). `enter` sobre un estado del timeline en `Detail`.
+    fn open_state_io(&mut self) {
+        let Some(span) = self.selected_state_span() else {
+            return;
+        };
+        let body = match (&span.input, &span.output) {
+            (None, None) => "(este estado no expone input/output)".to_string(),
+            (i, o) => {
+                let part = |label: &str, v: &Option<String>| {
+                    format!("=== {label} ===\n{}", v.as_deref().unwrap_or("(ninguno)"))
+                };
+                format!("{}\n\n{}", part("input", i), part("output", o))
+            }
+        };
+        self.detail_panel = Some(DetailPanel::new(span.name, body));
+    }
+
     // --- Navegación -----------------------------------------------------------
 
     fn drill(&mut self) -> Vec<Action> {
@@ -265,6 +289,7 @@ impl SfnView {
 
     /// `esc`: despoja un nivel; en la raíz (machines) emite `Back` (→ menú).
     fn back(&mut self) -> Vec<Action> {
+        self.detail_panel = None; // cerrar cualquier panel al subir de nivel
         // Detail → Executions (reconstruido con lo que Detail carga; la lista de
         // ejecuciones sigue cacheada, así que no se recarga).
         let ctx = if let Level::Detail {
@@ -593,6 +618,10 @@ impl View for SfnView {
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        // Con el panel de input/output abierto, sus teclas (scroll/copiar/cerrar) mandan.
+        if let Some(p) = &self.detail_panel {
+            return p.hints();
+        }
         let mut hints = vec![("y", "copiar ARN"), ("O", "consola")];
         // En ejecuciones: filtrar por estado y traer más allá del top-50.
         if matches!(self.level, Level::Executions { .. }) {
@@ -600,6 +629,13 @@ impl View for SfnView {
             if self.executions_partial {
                 hints.push(("o", "más"));
             }
+        }
+        // En el detalle, `enter` expande el input/output del estado seleccionado.
+        if self
+            .selected_state_span()
+            .is_some_and(|s| s.input.is_some() || s.output.is_some())
+        {
+            hints.push(("enter", "in/out"));
         }
         // `l` solo si el estado seleccionado del timeline invoca una Lambda (cross-link
         // a sus logs). Lectura → sin gate.
@@ -642,6 +678,7 @@ impl View for SfnView {
         self.detail = None;
         self.history.clear();
         self.failed_state = None;
+        self.detail_panel = None;
         self.loading = true;
         self.machines_partial = false;
         self.executions_partial = false;
@@ -650,6 +687,25 @@ impl View for SfnView {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        // Panel de input/output abierto: `y` copia su contenido, el resto scrollea/cierra.
+        if self.detail_panel.is_some() {
+            if key.code == KeyCode::Char('y') {
+                return self
+                    .detail_panel
+                    .as_ref()
+                    .map(|p| Action::CopyToClipboard {
+                        text: p.content().to_string(),
+                    })
+                    .into_iter()
+                    .collect();
+            }
+            if let Some(p) = self.detail_panel.as_mut()
+                && p.on_key(key)
+            {
+                self.detail_panel = None;
+            }
+            return vec![];
+        }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.move_selection(1);
@@ -665,6 +721,12 @@ impl View for SfnView {
             }
             KeyCode::Char('G') | KeyCode::End => {
                 self.select_edge(true);
+                vec![]
+            }
+            // En el detalle, `enter` expande el input/output del estado seleccionado del
+            // timeline (la lista navegable son los estados); en los demás niveles, drillea.
+            KeyCode::Enter if matches!(self.level, Level::Detail { .. }) => {
+                self.open_state_io();
                 vec![]
             }
             KeyCode::Enter => self.drill(),
@@ -780,6 +842,11 @@ impl View for SfnView {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect) {
+        // Panel de input/output del estado: ocupa el cuerpo entero.
+        if let Some(p) = self.detail_panel.as_mut() {
+            p.render(frame, area);
+            return;
+        }
         match &self.level {
             Level::Machines => {
                 let block = Block::bordered().title(self.machines_title());
@@ -1015,6 +1082,8 @@ mod tests {
                     entered_ts: Some(0),
                     exited_ts: Some(2_000),
                     failed: false,
+                    input: Some("{\"step\":\"validate\"}".into()),
+                    output: Some("{\"valid\":true}".into()),
                     resource_arn: None, // estado sin Lambda → `l` no aplica
                 },
                 StateSpanDto {
@@ -1022,6 +1091,8 @@ mod tests {
                     entered_ts: Some(2_000),
                     exited_ts: None,
                     failed: status.is_redrivable(),
+                    input: Some("{\"step\":\"process\"}".into()),
+                    output: None, // no salió (falló o en curso)
                     resource_arn: Some(
                         "arn:aws:lambda:us-east-1:000000000000:function:ProcessOrder".into(),
                     ),
@@ -1430,6 +1501,47 @@ mod tests {
         assert!(failed.hints().iter().any(|(k, _)| *k == "l"));
         let ok = view_in_detail(ExecStatus::Succeeded); // Validate (no lambda)
         assert!(!ok.hints().iter().any(|(k, _)| *k == "l"));
+    }
+
+    #[test]
+    fn enter_in_detail_opens_state_io_panel_and_esc_closes() {
+        // FAILED → ProcessOrder (con input) queda preseleccionado (idx 1 del timeline).
+        let mut v = view_in_detail(ExecStatus::Failed);
+        assert_eq!(v.state.selected(), Some(1));
+
+        // `enter` abre el panel con el input/output del estado (no drillea, no redrive).
+        let actions = v.on_key(key(KeyCode::Enter));
+        assert!(
+            actions.is_empty(),
+            "enter en Detail abre el panel, no drillea"
+        );
+        let p = v.detail_panel.as_ref().expect("panel abierto");
+        assert!(p.content().contains("input"), "muestra el input del estado");
+        assert!(p.content().contains("process"));
+
+        // `y` copia el contenido del panel.
+        match v.on_key(key(KeyCode::Char('y'))).as_slice() {
+            [Action::CopyToClipboard { text }] => assert!(text.contains("process")),
+            other => panic!("se esperaba copiar el io del estado, llegó {other:?}"),
+        }
+
+        // `esc` cierra el panel pero NO sube de nivel.
+        let actions = v.on_key(key(KeyCode::Esc));
+        assert!(actions.is_empty());
+        assert!(v.detail_panel.is_none());
+        assert!(
+            matches!(v.level, Level::Detail { .. }),
+            "sigue en el detalle"
+        );
+    }
+
+    #[test]
+    fn hints_offer_state_io_in_detail() {
+        let v = view_in_detail(ExecStatus::Failed);
+        assert!(
+            v.hints().iter().any(|(k, _)| *k == "enter"),
+            "el detalle anuncia enter: in/out cuando el estado expone io"
+        );
     }
 
     #[test]

@@ -1427,6 +1427,8 @@ fn parse_history(
                 entered_ts: ts,
                 exited_ts: None,
                 failed: false,
+                input: pretty_truncate(d.input()),
+                output: None,
                 resource_arn: None,
             });
         } else if let Some(d) = ev.state_exited_event_details() {
@@ -1434,6 +1436,7 @@ fn parse_history(
             if let Some(idx) = open.get_mut(d.name()).and_then(Vec::pop) {
                 spans[idx].exited_ts = ts;
                 spans[idx].failed = false;
+                spans[idx].output = pretty_truncate(d.output());
             }
         } else if is_failure_event(ev) {
             // El estado que reventó es el span abierto más reciente (innermost).
@@ -1738,6 +1741,11 @@ fn mock_execution_detail(
         entered_ts: Some(base + from),
         exited_ts: to.map(|t| base + t),
         failed,
+        // Input por estado (siempre); output solo si el estado salió (`enter` lo expande).
+        input: Some(format!(
+            "{{\n  \"state\": \"{name}\",\n  \"orderId\": \"A-1001\"\n}}"
+        )),
+        output: to.map(|_| format!("{{\n  \"state\": \"{name}\",\n  \"ok\": true\n}}")),
         // Los estados de tipo Lambda task llevan su ARN → habilita el cross-link `l`
         // en mock (p. ej. `ProcessOrder` → `/aws/lambda/ProcessOrder`).
         resource_arn: matches!(name, "Validate" | "ChargeCard" | "ProcessOrder")

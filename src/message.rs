@@ -166,6 +166,12 @@ pub struct StateSpanDto {
     pub exited_ts: Option<i64>,
     /// `true` si este estado fue el que reventó.
     pub failed: bool,
+    /// Input del estado (`StateEntered`), ya pretty-printeado/truncado desde `effects`.
+    /// `enter` sobre el estado lo expande en un panel scrolleable. `None` = no expuesto.
+    pub input: Option<String>,
+    /// Output del estado (`StateExited`), ya pretty-printeado/truncado. `None` = el estado
+    /// no salió (falló o sigue corriendo) o no lo expone.
+    pub output: Option<String>,
     /// ARN/identidad de la Lambda que invocó este estado, si es una invocación Lambda
     /// (integración directa o `arn:aws:states:::lambda:invoke`). Habilita el cross-link
     /// `sfn` → logs de la Lambda (`l`). `None` = el estado no invoca una Lambda (o no se

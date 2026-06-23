@@ -632,14 +632,27 @@ impl App {
                 event_bus_name,
                 source,
                 detail_type,
+                time,
+                resources,
                 ..
-            } => Confirm {
-                title: " enviar evento ".to_string(),
-                body: format!(
+            } => {
+                // Prod-safe: el confirm muestra exactamente qué se publica, incluidos los
+                // campos opcionales time/resources cuando el usuario los completó.
+                let mut body = format!(
                     "se publicará en el bus {event_bus_name}:\nsource: {source}\ndetail-type: {detail_type}"
-                ),
-                action,
-            },
+                );
+                if let Some(ms) = time {
+                    body += &format!("\ntime: {}", crate::util::fmt_epoch_millis(*ms));
+                }
+                if !resources.is_empty() {
+                    body += &format!("\nresources: {}", resources.join(", "));
+                }
+                Confirm {
+                    title: " enviar evento ".to_string(),
+                    body,
+                    action,
+                }
+            }
             // `is_mutating` ya filtró; cualquier otra no debería llegar aquí.
             _ => return,
         };
@@ -1818,6 +1831,33 @@ mod tests {
         app.write_mode = true;
         app.dispatch(send_event("default"));
         assert!(app.confirm.is_some(), "con modo escritura abre el confirm");
+    }
+
+    #[test]
+    fn send_event_confirm_body_shows_time_and_resources_when_present() {
+        let mut app = test_app();
+        app.write_mode = true;
+        // Sin time/resources: el body no los menciona.
+        app.dispatch(send_event("default"));
+        let body = &app.confirm.as_ref().unwrap().body;
+        assert!(!body.contains("time:") && !body.contains("resources:"));
+        app.confirm = None;
+
+        // Con time/resources: ambos aparecen en el body (prod-safe).
+        app.dispatch(Action::SendEvent {
+            event_bus_name: "default".to_string(),
+            source: "awsdeck.manual".to_string(),
+            detail_type: "test".to_string(),
+            detail: "{}".to_string(),
+            time: Some(1_700_000_000_000),
+            resources: vec!["arn:aws:s3:::a".to_string(), "arn:aws:s3:::b".to_string()],
+        });
+        let body = &app.confirm.as_ref().expect("confirm abierto").body;
+        assert!(body.contains("time:"), "muestra el time");
+        assert!(
+            body.contains("arn:aws:s3:::a") && body.contains("arn:aws:s3:::b"),
+            "lista los resources"
+        );
     }
 
     #[tokio::test]

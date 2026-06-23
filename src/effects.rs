@@ -494,7 +494,9 @@ impl Effects {
             Backend::Real(ctx) => {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    let msg = match fetch_execution_detail(&ctx, &execution_arn).await {
+                    let msg = match fetch_execution_detail(&ctx, &execution_arn, MAX_HISTORY_PAGES)
+                        .await
+                    {
                         Ok((detail, history, failed_state, history_more)) => {
                             Message::ExecutionDetailLoaded {
                                 execution_arn,
@@ -1331,14 +1333,22 @@ fn exec_status_filter(status: ExecStatus) -> Option<aws_sdk_sfn::types::Executio
 
 /// Combina `describe_execution` (status/tiempos/input/output/error) +
 /// `get_execution_history` (timeline) en una sola task, como `fetch_queue_detail`.
-/// Tope de páginas del history (≈10k eventos). Antes era una sola llamada de
-/// `max_results(1000)`: un history más largo (Map/Parallel grandes) perdía eventos
-/// en silencio. Acotamos y señalamos `· parcial` si queda `next_token`.
+/// Tope de páginas del history por defecto (≈10k eventos). Antes era una sola llamada
+/// de `max_results(1000)`: un history más largo (Map/Parallel grandes) perdía eventos
+/// en silencio. Acotamos y señalamos `· parcial` si queda `next_token`; el load-more
+/// (`o` en Detail) re-pide con un `page_budget` mayor (ver `load_more_execution_history`).
 const MAX_HISTORY_PAGES: usize = 10;
 
+/// `page_budget` = cuántas páginas de `get_execution_history` traer (cada una ≤1000
+/// eventos). El load-more re-fetchea con un presupuesto creciente y re-parsea TODO el
+/// prefijo (siempre contiguo desde el inicio cronológico): `parse_history` empareja
+/// StateEntered/StateExited con una pila por nombre, así que acumular solo páginas
+/// nuevas rompería el emparejamiento en el borde. Re-parsear el set completo es la
+/// única forma correcta sin guardar eventos crudos del SDK (effects es stateless).
 async fn fetch_execution_detail(
     ctx: &AwsContext,
     execution_arn: &str,
+    page_budget: usize,
 ) -> color_eyre::Result<(ExecutionDetailDto, Vec<StateSpanDto>, Option<String>, bool)> {
     let client = ctx.sfn().await;
 
@@ -1361,11 +1371,11 @@ async fn fetch_execution_detail(
     // `reverse_order(true)` trae los eventos más recientes primero: garantiza que
     // el evento de fallo (que ocurre al FINAL del timeline) entre en la primera
     // página aunque el history supere los 1000 eventos. Acumulamos hasta
-    // MAX_HISTORY_PAGES y luego revertimos a orden cronológico para `parse_history`.
+    // `page_budget` y luego revertimos a orden cronológico para `parse_history`.
     let mut events = Vec::new();
     let mut next: Option<String> = None;
     let mut more = false;
-    for page in 0..MAX_HISTORY_PAGES {
+    for page in 0..page_budget {
         let hist = client
             .get_execution_history()
             .execution_arn(execution_arn)
@@ -1377,7 +1387,7 @@ async fn fetch_execution_detail(
         events.extend(hist.events().iter().cloned());
         next = hist.next_token().map(str::to_string);
         match &next {
-            Some(_) if page == MAX_HISTORY_PAGES - 1 => more = true,
+            Some(_) if page == page_budget - 1 => more = true,
             Some(_) => {}
             None => break,
         }

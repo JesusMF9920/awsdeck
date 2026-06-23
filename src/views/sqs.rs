@@ -15,6 +15,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use super::View;
 use crate::action::{Action, ConsoleTarget};
 use crate::message::{Message, QueueAttrsDto, QueueDto, QueueMessageDto};
+use crate::ui::detail::DetailPanel;
 use crate::util::{fmt_epoch_millis, fuzzy_score, ranked};
 
 /// Nivel de drill actual.
@@ -28,6 +29,9 @@ pub struct SqsView {
     queues: Vec<QueueDto>,
     attrs: Option<QueueAttrsDto>,
     messages: Vec<QueueMessageDto>,
+    /// Panel con el cuerpo completo de un mensaje (`enter` en el detalle): la fila lo
+    /// colapsa a 60 chars; el panel lo muestra entero, scrolleable/copiable. `None` = normal.
+    detail_panel: Option<DetailPanel>,
     filter: String,
     loading: bool,
     state: ListState,
@@ -40,6 +44,7 @@ impl SqsView {
             queues: Vec::new(),
             attrs: None,
             messages: Vec::new(),
+            detail_panel: None,
             filter: String::new(),
             loading: false,
             state: ListState::default().with_selected(Some(0)),
@@ -108,6 +113,21 @@ impl SqsView {
         Some(self.queues[idx].clone())
     }
 
+    fn selected_message(&self) -> Option<QueueMessageDto> {
+        let sel = self.state.selected()?;
+        let idx = *self.filtered_message_indices().get(sel)?;
+        self.messages.get(idx).cloned()
+    }
+
+    /// Abre el panel con el cuerpo completo del mensaje seleccionado (la fila lo colapsa a
+    /// 60 chars). `enter` sobre un mensaje en el detalle.
+    fn open_message_detail(&mut self) {
+        if let Some(m) = self.selected_message() {
+            let id: String = m.id.chars().take(8).collect();
+            self.detail_panel = Some(DetailPanel::new(format!("msg {id}"), m.body));
+        }
+    }
+
     /// Texto a copiar con `y`: la URL de la cola (en la lista) o su ARN (en el detalle,
     /// si lo conocemos por los attributes; si no, la URL).
     fn copy_text(&self) -> Option<String> {
@@ -157,6 +177,7 @@ impl SqsView {
     /// `esc`: despoja un nivel de drill. En la raíz (queues) no hay nada que
     /// despojar → emite `Back` para que el `App` vuelva al menú.
     fn back(&mut self) -> Vec<Action> {
+        self.detail_panel = None; // cerrar cualquier panel al subir de nivel
         if matches!(self.level, Level::Detail { .. }) {
             self.level = Level::Queues;
             self.loading = false;
@@ -259,9 +280,18 @@ impl View for SqsView {
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        // Con el panel del cuerpo abierto, sus teclas (scroll/copiar/cerrar) mandan.
+        if let Some(p) = &self.detail_panel {
+            return p.hints();
+        }
         match self.level {
             // En el detalle de una cola, `p` purga (gated por modo escritura + confirm).
-            Level::Detail { .. } => vec![("y", "copiar ARN"), ("O", "consola"), ("p", "purgar")],
+            Level::Detail { .. } => vec![
+                ("enter", "ver cuerpo"),
+                ("y", "copiar ARN"),
+                ("O", "consola"),
+                ("p", "purgar"),
+            ],
             Level::Queues => vec![("y", "copiar URL"), ("O", "consola")],
         }
     }
@@ -277,12 +307,32 @@ impl View for SqsView {
         self.level = Level::Queues;
         self.attrs = None;
         self.messages.clear();
+        self.detail_panel = None;
         self.loading = true;
         self.state.select(Some(0));
         vec![Action::LoadQueues]
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        // Panel del cuerpo abierto: `y` copia su contenido, el resto scrollea/cierra.
+        if self.detail_panel.is_some() {
+            if key.code == KeyCode::Char('y') {
+                return self
+                    .detail_panel
+                    .as_ref()
+                    .map(|p| Action::CopyToClipboard {
+                        text: p.content().to_string(),
+                    })
+                    .into_iter()
+                    .collect();
+            }
+            if let Some(p) = self.detail_panel.as_mut()
+                && p.on_key(key)
+            {
+                self.detail_panel = None;
+            }
+            return vec![];
+        }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.move_selection(1);
@@ -298,6 +348,12 @@ impl View for SqsView {
             }
             KeyCode::Char('G') | KeyCode::End => {
                 self.select_edge(true);
+                vec![]
+            }
+            // En el detalle, `enter` expande el cuerpo del mensaje (la lista navegable son
+            // los mensajes peekeados); en queues, drillea.
+            KeyCode::Enter if matches!(self.level, Level::Detail { .. }) => {
+                self.open_message_detail();
                 vec![]
             }
             KeyCode::Enter => self.drill(),
@@ -367,6 +423,11 @@ impl View for SqsView {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect) {
+        // Panel del cuerpo del mensaje: ocupa el cuerpo entero.
+        if let Some(p) = self.detail_panel.as_mut() {
+            p.render(frame, area);
+            return;
+        }
         if matches!(self.level, Level::Queues) {
             let block = Block::bordered().title(self.queues_title());
             let items: Vec<ListItem> = self
@@ -544,6 +605,46 @@ mod tests {
         v.on_key(key(KeyCode::Esc));
         assert!(matches!(v.level, Level::Queues));
         assert_eq!(v.visible_len(), 2);
+    }
+
+    #[test]
+    fn enter_in_detail_expands_message_body_and_esc_closes() {
+        let mut v = SqsView::new();
+        v.on_message(&Message::QueuesLoaded(vec![queue("orders")]));
+        v.on_key(key(KeyCode::Enter)); // → Detail
+        let long = format!("payload {}", "x".repeat(200));
+        v.on_message(&Message::QueueDetailLoaded {
+            queue_url: queue("orders").url,
+            attrs: QueueAttrsDto::default(),
+            messages: vec![QueueMessageDto {
+                id: "abcdef123456".into(),
+                body: long.clone(),
+                sent_ts: None,
+                receive_count: Some(2),
+            }],
+        });
+
+        // `enter` expande el cuerpo completo (no drillea, no purga).
+        let actions = v.on_key(key(KeyCode::Enter));
+        assert!(actions.is_empty());
+        assert_eq!(
+            v.detail_panel.as_ref().expect("panel").content(),
+            long,
+            "muestra el cuerpo completo, no los 60 chars de la fila"
+        );
+        // `y` copia el cuerpo completo.
+        match v.on_key(key(KeyCode::Char('y'))).as_slice() {
+            [Action::CopyToClipboard { text }] => assert_eq!(*text, long),
+            other => panic!("se esperaba copiar el cuerpo, llegó {other:?}"),
+        }
+        // `esc` cierra el panel pero NO sube de nivel.
+        let actions = v.on_key(key(KeyCode::Esc));
+        assert!(actions.is_empty());
+        assert!(v.detail_panel.is_none());
+        assert!(
+            matches!(v.level, Level::Detail { .. }),
+            "sigue en el detalle"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 
-use crate::action::Action;
+use crate::action::{Action, ViewContext};
 use crate::message::Message;
 
 pub mod events;
@@ -29,6 +29,16 @@ pub trait View {
     /// Acciones a emitir cuando la vista se vuelve activa (típicamente cargar su
     /// data inicial). El `App` las despacha igual que las de `on_key`.
     fn on_activate(&mut self) -> Vec<Action>;
+
+    /// Activación **con contexto** (handoff desde otra vista vía
+    /// [`Action::ActivateViewWithContext`]). El `App` la llama en vez de `on_activate`
+    /// y pasa el `context` opaco; la vista lo interpreta para arrancar en un estado
+    /// específico (p. ej. `logs` abre el tail de un group). Default: ignora el contexto
+    /// y cae a `on_activate` (una vista que no entiende el contexto se activa normal).
+    fn on_context(&mut self, context: &ViewContext) -> Vec<Action> {
+        let _ = context;
+        self.on_activate()
+    }
 
     /// Reacciona a una tecla (en modo normal) y devuelve acciones a despachar.
     /// La navegación interna (drill/back, mover selección) se resuelve aquí.

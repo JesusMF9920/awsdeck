@@ -166,6 +166,11 @@ pub struct StateSpanDto {
     pub exited_ts: Option<i64>,
     /// `true` si este estado fue el que reventó.
     pub failed: bool,
+    /// ARN/identidad de la Lambda que invocó este estado, si es una invocación Lambda
+    /// (integración directa o `arn:aws:states:::lambda:invoke`). Habilita el cross-link
+    /// `sfn` → logs de la Lambda (`l`). `None` = el estado no invoca una Lambda (o no se
+    /// pudo determinar). Lo puebla `effects::parse_history`.
+    pub resource_arn: Option<String>,
 }
 
 // --- EventBridge (v3) ---------------------------------------------------------

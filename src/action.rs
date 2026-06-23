@@ -16,6 +16,11 @@ pub enum Action {
     Quit,
     /// Activar la vista con este `id` (p. ej. desde `:logs`).
     ActivateView(String),
+    /// Activar la vista `id` pasándole un contexto de arranque (handoff entre vistas,
+    /// p. ej. `sfn` → `logs` de la Lambda de una ejecución). El `App` activa la vista y
+    /// le entrega el `context` vía `View::on_context` (en vez de `on_activate`) sin
+    /// inspeccionarlo: `ViewContext` es opaco para el core (como `ConsoleTarget`).
+    ActivateViewWithContext { id: String, context: ViewContext },
     /// Volver un nivel. La vista la emite cuando `esc` ya no tiene drill que
     /// despojar (está en su raíz); el `App` la interpreta como "volver al menú".
     /// La vista nunca nombra al menú: solo dice "atrás".
@@ -94,4 +99,15 @@ pub enum ConsoleTarget {
     Execution { arn: String },
     EventBus { name: String },
     Rule { event_bus: String, name: String },
+}
+
+/// Contexto de arranque que una vista pasa a otra al activarla (handoff). Service-shaped
+/// (vive en `action.rs`, frontera permitida); el `App` lo entrega opaco a
+/// `View::on_context` sin inspeccionarlo, y la vista destino matchea la variante que le
+/// concierne (las demás → activación normal).
+#[derive(Clone, Debug)]
+pub enum ViewContext {
+    /// Abrir el tail de un log group en una ventana de tiempo (p. ej. `sfn` → logs de la
+    /// Lambda de una ejecución, acotado a la duración del estado).
+    LogGroupTail { group: String, window: LogWindow },
 }

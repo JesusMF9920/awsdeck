@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
-use crate::action::Action;
+use crate::action::{Action, ViewContext};
 use crate::aws::context::{Env, ProfileEntry, list_profiles};
 use crate::effects::Effects;
 use crate::message::{Envelope, Message};
@@ -391,6 +391,10 @@ impl App {
         match action {
             Action::Quit => self.should_quit = true,
             Action::ActivateView(id) => self.activate_view(&id),
+            // Handoff entre vistas: activa `id` y le entrega el `context` opaco.
+            Action::ActivateViewWithContext { id, context } => {
+                self.activate_view_with_context(&id, context)
+            }
             // `esc` en la raíz de una vista: volver al menú principal.
             Action::Back => self.go_home(),
             // La vista cambió de nivel de drill: el filtro del nivel anterior no
@@ -422,6 +426,27 @@ impl App {
             self.screen = Screen::View;
             self.clear_filter();
             let actions = self.on_activate_active();
+            self.dispatch_all(actions);
+        } else {
+            let available = self.registry.ids().join(", ");
+            self.set_error(format!(
+                "comando desconocido: {id} (disponibles: {available})"
+            ));
+        }
+    }
+
+    /// Activación con contexto (handoff). Espeja `activate_view` pero, en vez de
+    /// `on_activate`, entrega el `context` a la vista destino vía `on_context` (que lo
+    /// interpreta para arrancar en un estado específico). El `App` no inspecciona el
+    /// `ViewContext`: lo pasa opaco.
+    fn activate_view_with_context(&mut self, id: &str, context: ViewContext) {
+        if self.registry.activate(id) {
+            self.screen = Screen::View;
+            self.clear_filter();
+            let actions = match self.registry.active_mut() {
+                Some(view) => view.on_context(&context),
+                None => Vec::new(),
+            };
             self.dispatch_all(actions);
         } else {
             let available = self.registry.ids().join(", ");
@@ -920,6 +945,62 @@ mod tests {
         let status = app.status.as_ref().expect("debe haber status");
         assert!(status.error);
         assert!(status.text.contains("desconocido"));
+    }
+
+    /// Vista que distingue si fue activada normal (`on_activate`) o con contexto
+    /// (`on_context`), para verificar el handoff `ActivateViewWithContext`.
+    struct ContextView {
+        activated: Rc<Cell<u32>>,
+        contexts: Rc<Cell<u32>>,
+    }
+    impl View for ContextView {
+        fn id(&self) -> &'static str {
+            "logs"
+        }
+        fn title(&self) -> String {
+            "logs".to_string()
+        }
+        fn on_activate(&mut self) -> Vec<Action> {
+            self.activated.set(self.activated.get() + 1);
+            Vec::new()
+        }
+        fn on_context(&mut self, _context: &ViewContext) -> Vec<Action> {
+            self.contexts.set(self.contexts.get() + 1);
+            Vec::new()
+        }
+        fn on_key(&mut self, _key: KeyEvent) -> Vec<Action> {
+            Vec::new()
+        }
+        fn on_message(&mut self, _message: &Message) {}
+        fn set_filter(&mut self, _filter: &str) {}
+        fn render(&mut self, _frame: &mut Frame, _area: Rect) {}
+    }
+
+    #[test]
+    fn activate_with_context_calls_on_context_not_on_activate() {
+        let activated = Rc::new(Cell::new(0));
+        let contexts = Rc::new(Cell::new(0));
+        let (tx, rx) = mpsc::channel(8);
+        let env = Env::new("default", "us-east-1");
+        let effects = Effects::new_mock(tx, env.clone());
+        let mut registry = Registry::new();
+        registry.register(Box::new(ContextView {
+            activated: activated.clone(),
+            contexts: contexts.clone(),
+        }));
+        let mut app = App::new(env, registry, effects, rx);
+
+        app.dispatch(Action::ActivateViewWithContext {
+            id: "logs".to_string(),
+            context: ViewContext::LogGroupTail {
+                group: "/aws/lambda/Fn".to_string(),
+                window: crate::message::LogWindow::Last(3_600_000),
+            },
+        });
+
+        assert!(matches!(app.screen, Screen::View), "la vista queda activa");
+        assert_eq!(contexts.get(), 1, "se entregó el contexto vía on_context");
+        assert_eq!(activated.get(), 0, "no se llamó on_activate en el handoff");
     }
 
     /// Vista que reclama el comando `die` (emite `Quit`) y ningún otro.

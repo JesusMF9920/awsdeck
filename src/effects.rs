@@ -19,6 +19,7 @@ use crate::message::{
     LogStreamDto, LogWindow, MachineType, Message, QueueAttrsDto, QueueDto, QueueMessageDto,
     RuleDetailDto, RuleDto, RuleState, StateMachineDto, StateSpanDto, TargetDto,
 };
+use crate::util::case_variants;
 
 /// Fuente de datos.
 enum Backend {
@@ -117,6 +118,7 @@ impl Effects {
             Action::OpenConsole { target } => self.open_console(target, epoch),
             Action::Quit
             | Action::ActivateView(_)
+            | Action::ActivateViewWithContext { .. }
             | Action::Back
             | Action::ClearFilter
             | Action::CopyToClipboard { .. }
@@ -638,15 +640,56 @@ fn cw_encode(s: &str) -> String {
 
 // --- SDK real -----------------------------------------------------------------
 
-/// Tope de páginas de `describe_log_groups` que juntamos por carga (auto-paginación).
-/// Espeja `MAX_MACHINE_PAGES`: 20 × 50 = 1000 groups, todos alcanzables por el fuzzy
-/// local. Si se topa, `more=true` (la vista muestra `· parcial`).
-/// Una página acotada (≤50) de log groups. Con `pattern`, busca server-side por
-/// subcadena (`logGroupNamePattern`, infix, case-sensitive — NO lowercasear). La vista
-/// rankea con fuzzy local lo devuelto. Un solo round-trip (rápido a cualquier escala);
-/// `more=true` si el servidor tiene más (`next_token`). Nota: con pattern el SDK no
-/// devuelve `storedBytes`.
+/// Log groups del ambiente. Sin búsqueda (`query=None`) trae UNA página acotada (≤50,
+/// 1 round-trip → rápido a cualquier escala). Con búsqueda hace **fan-out**: como
+/// `logGroupNamePattern` es substring **case-sensitive**, dispara una variante de casing
+/// por request en paralelo (`case_variants`), mergea dedup por nombre y OR-ea el `more`.
+/// La vista rankea con fuzzy local lo devuelto. Cubre diferencias de casing comunes
+/// (primera letra, ALL-CAPS, kebab); NO CamelCase interno desde minúsculas.
 async fn fetch_log_groups(
+    ctx: &AwsContext,
+    query: Option<&str>,
+) -> color_eyre::Result<(Vec<LogGroupDto>, bool)> {
+    let Some(q) = query else {
+        return fetch_log_groups_page(ctx, None).await;
+    };
+    let variants = case_variants(q);
+    let results =
+        futures::future::join_all(variants.iter().map(|v| fetch_log_groups_page(ctx, Some(v))))
+            .await;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut groups: Vec<LogGroupDto> = Vec::new();
+    let mut more = false;
+    let mut last_err = None;
+    let mut any_ok = false;
+    for r in results {
+        match r {
+            Ok((page, page_more)) => {
+                any_ok = true;
+                more |= page_more;
+                for g in page {
+                    if seen.insert(g.name.clone()) {
+                        groups.push(g);
+                    }
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    // Best-effort: si alguna variante respondió, usamos lo que llegó; solo si TODAS
+    // fallaron propagamos el error (no dejar la búsqueda en blanco por un fallo parcial).
+    match last_err {
+        Some(e) if !any_ok => Err(e),
+        _ => Ok((groups, more)),
+    }
+}
+
+/// Una página acotada (≤50) de log groups. Con `pattern`, busca server-side por
+/// subcadena (`logGroupNamePattern`, infix, case-sensitive — NO lowercasear). Un solo
+/// round-trip; `more=true` si el servidor tiene más (`next_token`). Nota: con pattern el
+/// SDK no devuelve `storedBytes`.
+async fn fetch_log_groups_page(
     ctx: &AwsContext,
     pattern: Option<&str>,
 ) -> color_eyre::Result<(Vec<LogGroupDto>, bool)> {
@@ -1286,6 +1329,7 @@ fn parse_history(
                 entered_ts: ts,
                 exited_ts: None,
                 failed: false,
+                resource_arn: None,
             });
         } else if let Some(d) = ev.state_exited_event_details() {
             // Cierra el span homónimo más reciente (LIFO); salir = se recuperó.
@@ -1297,6 +1341,14 @@ fn parse_history(
             // El estado que reventó es el span abierto más reciente (innermost).
             if let Some(&idx) = open.values().flatten().max() {
                 spans[idx].failed = true;
+            }
+        } else if let Some(arn) = lambda_resource(ev) {
+            // Evento de scheduling de Lambda: lo cuelga del span abierto más reciente
+            // (el estado que la invocó) para el cross-link `l`. Primero gana.
+            if let Some(&idx) = open.values().flatten().max()
+                && spans[idx].resource_arn.is_none()
+            {
+                spans[idx].resource_arn = Some(arn);
             }
         }
     }
@@ -1315,6 +1367,27 @@ fn parse_history(
 fn is_failure_event(ev: &aws_sdk_sfn::types::HistoryEvent) -> bool {
     let t = ev.r#type().as_str();
     t.contains("Failed") || t.contains("TimedOut") || t.contains("Aborted")
+}
+
+/// ARN/identidad de la Lambda de un evento de scheduling, si lo es. Cubre las dos
+/// integraciones: **directa** (`LambdaFunctionScheduled` → `resource` = ARN de la
+/// función) y **optimizada** `arn:aws:states:::lambda:invoke` (`TaskScheduled` con
+/// `resourceType=lambda` → `FunctionName` en los `parameters` JSON). `None` para
+/// cualquier otro evento (o si los parameters no traen `FunctionName`).
+fn lambda_resource(ev: &aws_sdk_sfn::types::HistoryEvent) -> Option<String> {
+    if let Some(d) = ev.lambda_function_scheduled_event_details() {
+        return Some(d.resource().to_string());
+    }
+    if let Some(d) = ev.task_scheduled_event_details()
+        && d.resource_type() == "lambda"
+    {
+        let params: serde_json::Value = serde_json::from_str(d.parameters()).ok()?;
+        return params
+            .get("FunctionName")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+    }
+    None
 }
 
 // --- Mock (tests / sin red) ---------------------------------------------------
@@ -1339,8 +1412,9 @@ fn mock_log_groups(env: &Env, query: Option<&str>) -> Vec<LogGroupDto> {
     ];
     names
         .into_iter()
-        // Mimetiza el filtro server-side por subcadena (logGroupNamePattern).
-        .filter(|name| query.is_none_or(|q| name.contains(q)))
+        // Mimetiza el fan-out server-side: substring case-sensitive contra cada variante
+        // de casing de la query (mock y real coinciden en cobertura).
+        .filter(|name| query.is_none_or(|q| case_variants(q).iter().any(|v| name.contains(v))))
         .map(|name| {
             let stored = (name.len() as i64) * 7_919 % 5_000_000;
             let arn = format!(
@@ -1564,6 +1638,10 @@ fn mock_execution_detail(
         entered_ts: Some(base + from),
         exited_ts: to.map(|t| base + t),
         failed,
+        // Los estados de tipo Lambda task llevan su ARN → habilita el cross-link `l`
+        // en mock (p. ej. `ProcessOrder` → `/aws/lambda/ProcessOrder`).
+        resource_arn: matches!(name, "Validate" | "ChargeCard" | "ProcessOrder")
+            .then(|| format!("arn:aws:lambda:us-east-1:123456789012:function:{name}")),
     };
 
     if execution_arn.contains("fail")
@@ -1808,6 +1886,24 @@ mod tests {
             }
             other => panic!("mensaje inesperado: {other:?}"),
         }
+    }
+
+    #[test]
+    fn mock_log_groups_search_tolerates_casing() {
+        let env = Env::new("dev", "us-east-1");
+        // Fan-out de variantes: `createOrder` (primera letra minúscula) ahora encuentra
+        // `…CreateOrderV3` vía la variante `CreateOrder`.
+        let hits = mock_log_groups(&env, Some("createOrder"));
+        assert!(
+            hits.iter().any(|g| g.name.contains("CreateOrderV3")),
+            "createOrder debe encontrar CreateOrderV3: {hits:?}"
+        );
+        // Limitación documentada: todo en minúsculas NO reconstruye el CamelCase interno.
+        let miss = mock_log_groups(&env, Some("createorder"));
+        assert!(
+            !miss.iter().any(|g| g.name.contains("CreateOrderV3")),
+            "createorder (minúsculas) no reconstruye CreateOrder"
+        );
     }
 
     #[tokio::test]
@@ -2332,6 +2428,82 @@ mod tests {
             .r#type(ty)
             .build()
             .unwrap()
+    }
+
+    /// `LambdaFunctionScheduled` con `resource` = ARN de la función (integración directa).
+    fn ev_lambda_scheduled(id: i64, ts: i64, resource: &str) -> aws_sdk_sfn::types::HistoryEvent {
+        use aws_sdk_sfn::primitives::DateTime;
+        use aws_sdk_sfn::types::{
+            HistoryEvent, HistoryEventType as T, LambdaFunctionScheduledEventDetails,
+        };
+        HistoryEvent::builder()
+            .id(id)
+            .timestamp(DateTime::from_millis(ts))
+            .r#type(T::LambdaFunctionScheduled)
+            .lambda_function_scheduled_event_details(
+                LambdaFunctionScheduledEventDetails::builder()
+                    .resource(resource)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap()
+    }
+
+    /// `TaskScheduled` (integración optimizada): `resource_type` + `parameters` JSON.
+    fn ev_task_scheduled(
+        id: i64,
+        ts: i64,
+        resource_type: &str,
+        parameters: &str,
+    ) -> aws_sdk_sfn::types::HistoryEvent {
+        use aws_sdk_sfn::primitives::DateTime;
+        use aws_sdk_sfn::types::{HistoryEvent, HistoryEventType as T, TaskScheduledEventDetails};
+        HistoryEvent::builder()
+            .id(id)
+            .timestamp(DateTime::from_millis(ts))
+            .r#type(T::TaskScheduled)
+            .task_scheduled_event_details(
+                TaskScheduledEventDetails::builder()
+                    .resource_type(resource_type)
+                    .resource("invoke")
+                    .region("us-east-1")
+                    .parameters(parameters)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn parse_history_attaches_lambda_resource_per_state() {
+        // Integración directa: el `LambdaFunctionScheduled` dentro del estado cuelga su
+        // ARN del span abierto (Charge). La optimizada (`TaskScheduled` resourceType
+        // lambda) saca `FunctionName` de los parameters (Process).
+        let events = vec![
+            ev_entered(1, 0, "Charge"),
+            ev_lambda_scheduled(
+                2,
+                50,
+                "arn:aws:lambda:us-east-1:111122223333:function:Charge",
+            ),
+            ev_exited(3, 100, "Charge"),
+            ev_entered(4, 100, "Process"),
+            ev_task_scheduled(5, 150, "lambda", "{\"FunctionName\":\"ProcessFn\"}"),
+            ev_exited(6, 200, "Process"),
+            // Estado sin Lambda: no debe ganar resource.
+            ev_entered(7, 200, "Wait"),
+            ev_exited(8, 250, "Wait"),
+        ];
+        let (spans, _) = parse_history(&events);
+        let by = |n: &str| spans.iter().find(|s| s.name == n).unwrap();
+        assert_eq!(
+            by("Charge").resource_arn.as_deref(),
+            Some("arn:aws:lambda:us-east-1:111122223333:function:Charge")
+        );
+        assert_eq!(by("Process").resource_arn.as_deref(), Some("ProcessFn"));
+        assert_eq!(by("Wait").resource_arn, None);
     }
 
     #[test]

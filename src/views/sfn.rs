@@ -14,12 +14,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::View;
-use crate::action::{Action, ConsoleTarget};
+use crate::action::{Action, ConsoleTarget, ViewContext};
 use crate::message::{
-    ExecStatus, ExecutionDetailDto, ExecutionDto, MachineType, Message, StateMachineDto,
+    ExecStatus, ExecutionDetailDto, ExecutionDto, LogWindow, MachineType, Message, StateMachineDto,
     StateSpanDto,
 };
-use crate::util::{fmt_epoch_millis, fuzzy_score, ranked};
+use crate::util::{fmt_epoch_millis, fuzzy_score, lambda_log_group_from_arn, ranked};
 
 /// Nivel de drill actual. Cada nivel carga los identificadores que `back()`
 /// necesita para reconstruir el padre y que `on_message` usa como guard.
@@ -167,6 +167,17 @@ impl SfnView {
         let sel = self.state.selected()?;
         let idx = *self.filtered_execution_indices().get(sel)?;
         Some(self.executions[idx].clone())
+    }
+
+    /// Estado seleccionado del timeline (en `Detail`). `None` fuera de `Detail` o si la
+    /// lista visible está vacía.
+    fn selected_state_span(&self) -> Option<StateSpanDto> {
+        if !matches!(self.level, Level::Detail { .. }) {
+            return None;
+        }
+        let sel = self.state.selected()?;
+        let idx = *self.filtered_history_indices().get(sel)?;
+        Some(self.history[idx].clone())
     }
 
     // --- Navegación -----------------------------------------------------------
@@ -320,6 +331,50 @@ impl SfnView {
         vec![]
     }
 
+    /// `l` en el detalle: salta a los logs de la Lambda del estado seleccionado.
+    /// Resuelve el log group desde el `resource_arn` del span y emite el handoff
+    /// `ActivateViewWithContext` (lectura → sin gate). No ofrece nada si el estado no
+    /// invoca una Lambda. La ventana se acota a la duración del estado.
+    fn open_lambda_logs(&self) -> Vec<Action> {
+        let Some(span) = self.selected_state_span() else {
+            return vec![];
+        };
+        let Some(group) = span
+            .resource_arn
+            .as_deref()
+            .and_then(lambda_log_group_from_arn)
+        else {
+            return vec![];
+        };
+        vec![Action::ActivateViewWithContext {
+            id: "logs".to_string(),
+            context: ViewContext::LogGroupTail {
+                group,
+                window: self.lambda_window(&span),
+            },
+        }]
+    }
+
+    /// Ventana de tiempo para los logs de la Lambda de un estado: el rango del span
+    /// (con colchón de 1 min para no perder líneas de borde), con fallback a la ventana
+    /// de la ejecución y, en último caso, la última hora.
+    fn lambda_window(&self, span: &StateSpanDto) -> LogWindow {
+        const PAD: i64 = 60_000; // 1 min de colchón a cada lado
+        let range = |from: Option<i64>, to: Option<i64>| {
+            from.map(|f| LogWindow::Range {
+                from: f - PAD,
+                to: to.map(|t| t + PAD),
+            })
+        };
+        range(span.entered_ts, span.exited_ts)
+            .or_else(|| {
+                self.detail
+                    .as_ref()
+                    .and_then(|d| range(d.start_ts, d.stop_ts))
+            })
+            .unwrap_or(LogWindow::Last(3_600_000))
+    }
+
     // --- Render ---------------------------------------------------------------
 
     fn machines_title(&self) -> String {
@@ -463,6 +518,14 @@ impl View for SfnView {
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         let mut hints = vec![("y", "copiar ARN"), ("O", "consola")];
+        // `l` solo si el estado seleccionado del timeline invoca una Lambda (cross-link
+        // a sus logs). Lectura → sin gate.
+        if self
+            .selected_state_span()
+            .is_some_and(|s| s.resource_arn.is_some())
+        {
+            hints.push(("l", "logs Lambda"));
+        }
         // `R` solo se ofrece sobre una ejecución redrivable (FAILED/TIMED_OUT/ABORTED),
         // igual que `redrive_intent`. Gated por modo escritura + confirm en el App.
         if matches!(self.level, Level::Detail { .. })
@@ -523,6 +586,7 @@ impl View for SfnView {
             KeyCode::Esc => self.back(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('R') => self.redrive_intent(),
+            KeyCode::Char('l') => self.open_lambda_logs(),
             KeyCode::Char('y') => self
                 .copy_text()
                 .map(|text| Action::CopyToClipboard { text })
@@ -850,12 +914,16 @@ mod tests {
                     entered_ts: Some(0),
                     exited_ts: Some(2_000),
                     failed: false,
+                    resource_arn: None, // estado sin Lambda → `l` no aplica
                 },
                 StateSpanDto {
                     name: "ProcessOrder".into(),
                     entered_ts: Some(2_000),
                     exited_ts: None,
                     failed: status.is_redrivable(),
+                    resource_arn: Some(
+                        "arn:aws:lambda:us-east-1:000000000000:function:ProcessOrder".into(),
+                    ),
                 },
             ],
             failed_state: status.is_redrivable().then(|| "ProcessOrder".into()),
@@ -1143,6 +1211,37 @@ mod tests {
         // RUNNING tampoco es redrivable.
         let mut run = view_in_detail(ExecStatus::Running);
         assert!(run.on_key(key(KeyCode::Char('R'))).is_empty());
+    }
+
+    #[test]
+    fn lambda_logs_crosslink_only_for_lambda_states() {
+        // FAILED → ProcessOrder (con resource_arn) queda preseleccionado: `l` salta a
+        // los logs de su Lambda con el handoff agnóstico.
+        let mut v = view_in_detail(ExecStatus::Failed);
+        assert_eq!(v.state.selected(), Some(1), "ProcessOrder preseleccionado");
+        match v.on_key(key(KeyCode::Char('l'))).as_slice() {
+            [Action::ActivateViewWithContext { id, context }] => {
+                assert_eq!(id, "logs");
+                let ViewContext::LogGroupTail { group, window } = context;
+                assert_eq!(group, "/aws/lambda/ProcessOrder");
+                // Ventana = rango del span (sin salir → `to: None`).
+                assert!(matches!(window, LogWindow::Range { to: None, .. }));
+            }
+            other => panic!("se esperaba ActivateViewWithContext, llegó {other:?}"),
+        }
+
+        // Estado sin Lambda (Validate, seleccionado en SUCCEEDED) → `l` no ofrece nada.
+        let mut ok = view_in_detail(ExecStatus::Succeeded);
+        assert_eq!(ok.state.selected(), Some(0), "Validate seleccionado");
+        assert!(ok.on_key(key(KeyCode::Char('l'))).is_empty());
+    }
+
+    #[test]
+    fn hints_offer_lambda_logs_only_on_lambda_state() {
+        let failed = view_in_detail(ExecStatus::Failed); // ProcessOrder (lambda)
+        assert!(failed.hints().iter().any(|(k, _)| *k == "l"));
+        let ok = view_in_detail(ExecStatus::Succeeded); // Validate (no lambda)
+        assert!(!ok.hints().iter().any(|(k, _)| *k == "l"));
     }
 
     #[test]

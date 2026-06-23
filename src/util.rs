@@ -150,6 +150,68 @@ pub fn ranked(len: usize, filter: &str, score: impl Fn(usize) -> Option<i32>) ->
     scored.into_iter().map(|(_, i)| i).collect()
 }
 
+/// Variantes de casing de `q` para la búsqueda server-side de log groups. La API de
+/// CloudWatch (`logGroupNamePattern`) hace substring **case-sensitive**, así que
+/// `effects` dispara una variante por request (en paralelo) y mergea; el fuzzy local
+/// rankea lo devuelto. Cubre diferencias comunes —primera letra, ALL-CAPS, kebab en
+/// minúsculas, Title por segmento— pero NO reconstruye CamelCase interno desde
+/// minúsculas (`createorder` ≠ `CreateOrder`): eso exigiría adivinar el corte de
+/// palabras. Dedup, ≤5 variantes; `q` vacío → vacío.
+pub fn case_variants(q: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for v in [
+        q.to_string(),
+        q.to_lowercase(),
+        q.to_uppercase(),
+        capitalize_first(q),
+        title_segments(q),
+    ] {
+        if !v.is_empty() && !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Primera letra en mayúscula, el resto sin tocar (`createOrder` → `CreateOrder`).
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Mayúscula inicial de cada segmento (separadores `-_/.: ` o el inicio), el resto sin
+/// tocar (`orders-api` → `Orders-Api`). Capta convenciones Title-Case por segmento.
+fn title_segments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut at_boundary = true;
+    for ch in s.chars() {
+        if at_boundary && ch.is_alphabetic() {
+            out.extend(ch.to_uppercase());
+        } else {
+            out.push(ch);
+        }
+        at_boundary = matches!(ch, '-' | '_' | '/' | '.' | ' ' | ':');
+    }
+    out
+}
+
+/// Log group de la Lambda a partir de su ARN/identidad. Acepta ARN completo
+/// (`arn:aws:lambda:region:acct:function:NAME[:qualifier]`), ARN parcial
+/// (`…:function:NAME`) o el nombre pelado (`NAME`) → `/aws/lambda/NAME`. Descarta el
+/// qualifier (`:PROD`, `:1`). `None` si el nombre queda vacío. Habilita el cross-link
+/// `sfn` → logs de la Lambda de una ejecución.
+pub fn lambda_log_group_from_arn(s: &str) -> Option<String> {
+    let s = s.trim();
+    // Tras `:function:` viene el nombre (+ opcional `:qualifier`); sin `:function:`,
+    // tratamos `s` como el nombre pelado.
+    let after = s.rsplit_once(":function:").map_or(s, |(_, n)| n);
+    let name = after.split(':').next().unwrap_or("").trim();
+    (!name.is_empty()).then(|| format!("/aws/lambda/{name}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +292,68 @@ mod tests {
             boundary > midword,
             "boundary {boundary} debe superar midword {midword}"
         );
+    }
+
+    #[test]
+    fn case_variants_cover_common_casings() {
+        let v = case_variants("createOrder");
+        // El caso del usuario: `createOrder` genera `CreateOrder`, que matchea
+        // `…CreateOrderV3` server-side.
+        assert!(
+            v.contains(&"CreateOrder".to_string()),
+            "captura primera-letra: {v:?}"
+        );
+        assert!(v.iter().any(|s| s == "createOrder"));
+        assert!(v.iter().any(|s| s == "CREATEORDER"));
+        assert!(v.iter().any(|s| s == "createorder"));
+
+        // kebab en minúsculas → Title por segmento.
+        assert!(case_variants("orders-api").contains(&"Orders-Api".to_string()));
+    }
+
+    #[test]
+    fn case_variants_dedups_and_handles_empty() {
+        let v = case_variants("API"); // lower=api; upper/cap/title colapsan a "API"
+        let mut sorted = v.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), v.len(), "sin duplicados: {v:?}");
+        assert!(v.len() <= 5);
+        assert!(case_variants("").is_empty());
+    }
+
+    #[test]
+    fn case_variants_does_not_reconstruct_internal_camelcase() {
+        // Limitación documentada: minúsculas no reconstruyen `CreateOrder`.
+        assert!(!case_variants("createorder").contains(&"CreateOrder".to_string()));
+    }
+
+    #[test]
+    fn lambda_log_group_from_various_arns() {
+        assert_eq!(
+            lambda_log_group_from_arn(
+                "arn:aws:lambda:us-east-1:123456789012:function:ProcessOrder"
+            ),
+            Some("/aws/lambda/ProcessOrder".to_string())
+        );
+        // Con qualifier (alias/versión) → se descarta.
+        assert_eq!(
+            lambda_log_group_from_arn(
+                "arn:aws:lambda:us-east-1:123456789012:function:ProcessOrder:PROD"
+            ),
+            Some("/aws/lambda/ProcessOrder".to_string())
+        );
+        // ARN parcial y nombre pelado.
+        assert_eq!(
+            lambda_log_group_from_arn("123456789012:function:my-fn"),
+            Some("/aws/lambda/my-fn".to_string())
+        );
+        assert_eq!(
+            lambda_log_group_from_arn("my-fn"),
+            Some("/aws/lambda/my-fn".to_string())
+        );
+        // Vacío / espacios → None.
+        assert_eq!(lambda_log_group_from_arn(""), None);
+        assert_eq!(lambda_log_group_from_arn("   "), None);
     }
 }

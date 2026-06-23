@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::View;
-use crate::action::{Action, ConsoleTarget};
+use crate::action::{Action, ConsoleTarget, ViewContext};
 use crate::message::{LogEventDto, LogGroupDto, LogStreamDto, LogWindow, Message};
 use crate::util::{
     fmt_clock_millis, fmt_epoch_millis, fuzzy_score, parse_datetime, parse_duration, ranked,
@@ -399,6 +399,21 @@ impl LogsView {
         }
     }
 
+    /// Abre el tail de un group **explícito** (handoff desde otra vista vía
+    /// `on_context`), sin depender del nivel/selección actual. Espeja `open_tail`; el
+    /// `App` ya limpió el filtro al activar la vista, así que solo dispara la consulta.
+    fn open_group_tail(&mut self, group: String, window: LogWindow) -> Vec<Action> {
+        self.level = Level::Tail { group };
+        self.set_events(Vec::new());
+        self.tail_window = window;
+        self.tail_preset = self.default_preset;
+        self.tail_token = None;
+        self.tail_live = false;
+        self.last_query = None;
+        self.state.select(Some(0));
+        self.tail_query(None)
+    }
+
     /// `w`/`W`: cicla la ventana entre presets y re-consulta (solo en `Tail`).
     fn cycle_window(&mut self, forward: bool) -> Vec<Action> {
         if !matches!(self.level, Level::Tail { .. }) {
@@ -663,6 +678,16 @@ impl View for LogsView {
         self.tail_window = LogWindow::Last(WINDOW_PRESETS[self.default_preset].1);
         self.state.select(Some(0));
         vec![Action::LoadLogGroups { query: None }]
+    }
+
+    /// Handoff desde otra vista (p. ej. `sfn` → logs de una Lambda): abre directo el tail
+    /// del group indicado en la ventana dada, sin pasar por la lista de groups.
+    fn on_context(&mut self, context: &ViewContext) -> Vec<Action> {
+        match context {
+            ViewContext::LogGroupTail { group, window } => {
+                self.open_group_tail(group.clone(), *window)
+            }
+        }
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -1180,6 +1205,42 @@ mod tests {
             other => panic!("se esperaba ClearFilter+LoadLogTail, llegó {other:?}"),
         }
         assert!(matches!(v.level, Level::Tail { .. }));
+    }
+
+    #[test]
+    fn on_context_opens_group_tail_directly() {
+        // Handoff (p. ej. desde sfn): abre el tail del group indicado en la ventana dada,
+        // sin pasar por la lista de groups.
+        let mut v = LogsView::new();
+        let window = LogWindow::Range {
+            from: 1_700_000_000_000,
+            to: Some(1_700_000_060_000),
+        };
+        let ctx = ViewContext::LogGroupTail {
+            group: "/aws/lambda/ProcessOrder".to_string(),
+            window,
+        };
+        match v.on_context(&ctx).as_slice() {
+            [
+                Action::LoadLogTail {
+                    group,
+                    window: w,
+                    token,
+                    generation,
+                    ..
+                },
+            ] => {
+                assert_eq!(group, "/aws/lambda/ProcessOrder");
+                assert_eq!(*w, window, "respeta la ventana del contexto");
+                assert!(token.is_none(), "consulta fresca");
+                assert_eq!(*generation, 1, "sube la generación (fresca)");
+            }
+            other => panic!("se esperaba LoadLogTail, llegó {other:?}"),
+        }
+        match &v.level {
+            Level::Tail { group } => assert_eq!(group, "/aws/lambda/ProcessOrder"),
+            _ => panic!("debe quedar en Tail"),
+        }
     }
 
     #[test]

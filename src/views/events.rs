@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::View;
-use crate::action::Action;
+use crate::action::{Action, ConsoleTarget};
 use crate::message::{EventBusDto, Message, RuleDetailDto, RuleDto, RuleState, TargetDto};
 use crate::util::{fuzzy_score, ranked};
 
@@ -145,6 +145,26 @@ impl EventsView {
                 let idx = *self.filtered_target_indices().get(self.state.selected()?)?;
                 Some(self.targets[idx].arn.clone())
             }
+        }
+    }
+
+    /// Recurso del nivel actual a abrir en la consola de EventBridge (bus / rule).
+    fn console_target(&self) -> Option<ConsoleTarget> {
+        match &self.level {
+            Level::Buses => self
+                .selected_bus()
+                .map(|b| ConsoleTarget::EventBus { name: b.name }),
+            Level::Rules { event_bus_name } => self.selected_rule().map(|r| ConsoleTarget::Rule {
+                event_bus: event_bus_name.clone(),
+                name: r.name,
+            }),
+            Level::Detail {
+                event_bus_name,
+                rule_name,
+            } => Some(ConsoleTarget::Rule {
+                event_bus: event_bus_name.clone(),
+                name: rule_name.clone(),
+            }),
         }
     }
 
@@ -369,9 +389,9 @@ impl View for EventsView {
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         match self.level {
             // `S` envía un evento de prueba al bus (gated por modo escritura + confirm).
-            Level::Buses => vec![("y", "copiar ARN"), ("S", "enviar evento")],
-            Level::Rules { .. } => vec![("y", "copiar nombre")],
-            Level::Detail { .. } => vec![("y", "copiar ARN target")],
+            Level::Buses => vec![("y", "copiar ARN"), ("O", "consola"), ("S", "enviar evento")],
+            Level::Rules { .. } => vec![("y", "copiar nombre"), ("O", "consola")],
+            Level::Detail { .. } => vec![("y", "copiar ARN target"), ("O", "consola")],
         }
     }
 
@@ -423,6 +443,11 @@ impl View for EventsView {
             KeyCode::Char('y') => self
                 .copy_text()
                 .map(|text| Action::CopyToClipboard { text })
+                .into_iter()
+                .collect(),
+            KeyCode::Char('O') => self
+                .console_target()
+                .map(|target| Action::OpenConsole { target })
                 .into_iter()
                 .collect(),
             _ => vec![],
@@ -816,6 +841,20 @@ mod tests {
         match v.on_key(key(KeyCode::Char('y'))).as_slice() {
             [Action::CopyToClipboard { text }] => assert!(text.contains("event-bus/default")),
             other => panic!("se esperaba CopyToClipboard, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn o_opens_bus_in_console() {
+        let mut v = EventsView::new();
+        v.on_message(&buses_msg(vec![bus("default")]));
+        match v.on_key(key(KeyCode::Char('O'))).as_slice() {
+            [
+                Action::OpenConsole {
+                    target: ConsoleTarget::EventBus { name },
+                },
+            ] => assert_eq!(name, "default"),
+            other => panic!("se esperaba OpenConsole EventBus, llegó {other:?}"),
         }
     }
 

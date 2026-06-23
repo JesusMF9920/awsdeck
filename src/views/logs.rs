@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::View;
-use crate::action::Action;
+use crate::action::{Action, ConsoleTarget};
 use crate::message::{LogEventDto, LogGroupDto, LogStreamDto, LogWindow, Message};
 use crate::util::{
     fmt_clock_millis, fmt_epoch_millis, fuzzy_score, parse_datetime, parse_duration, ranked,
@@ -573,10 +573,12 @@ impl View for LogsView {
         match self.level {
             // `t` abre el tail (todos los streams del group por rango): es el feature
             // que cuesta descubrir, así que se anuncia donde aplica.
-            Level::Groups | Level::Streams { .. } => vec![("t", "logs por tiempo"), ("y", "copiar")],
+            Level::Groups | Level::Streams { .. } => {
+                vec![("t", "logs por tiempo"), ("y", "copiar"), ("O", "consola")]
+            }
             // Dentro del tail: cómo cambiar la ventana / paginar / fijar rango.
             Level::Tail { .. } => vec![("w", "ventana"), ("o", "más"), (":since", "rango")],
-            Level::Events { .. } => vec![("y", "copiar línea")],
+            Level::Events { .. } => vec![("y", "copiar línea"), ("O", "consola")],
         }
     }
 
@@ -637,6 +639,14 @@ impl View for LogsView {
             KeyCode::Enter => self.drill(),
             KeyCode::Esc => self.back(),
             KeyCode::Char('r') => self.refresh(),
+            // Abrir el group actual en la consola de CloudWatch.
+            KeyCode::Char('O') => self
+                .current_group()
+                .map(|name| Action::OpenConsole {
+                    target: ConsoleTarget::LogGroup { name },
+                })
+                .into_iter()
+                .collect(),
             // Logs del group (todos sus streams) por rango de tiempo.
             KeyCode::Char('t') => self.tail(),
             // En el tail: `w`/`W` ciclan la ventana, `o` carga más (paginación).
@@ -1407,6 +1417,20 @@ mod tests {
             // `group()` no trae ARN → cae al nombre.
             [Action::CopyToClipboard { text }] => assert_eq!(text, "/svc"),
             other => panic!("se esperaba CopyToClipboard, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn o_opens_group_in_console() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        match v.on_key(key(KeyCode::Char('O'))).as_slice() {
+            [
+                Action::OpenConsole {
+                    target: ConsoleTarget::LogGroup { name },
+                },
+            ] => assert_eq!(name, "/svc"),
+            other => panic!("se esperaba OpenConsole LogGroup, llegó {other:?}"),
         }
     }
 

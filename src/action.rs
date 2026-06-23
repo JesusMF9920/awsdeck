@@ -30,6 +30,10 @@ pub enum Action {
     /// identificador del item seleccionado copiar; el `App` lo copia y avisa en la
     /// status bar. No es un efecto del SDK (no va a `effects`).
     CopyToClipboard { text: String },
+    /// Abrir el recurso seleccionado en la consola web de AWS. La vista arma el
+    /// `ConsoleTarget`; `effects` construye la URL con la región activa y abre el
+    /// navegador (el `App` la reenvía sin inspeccionarla).
+    OpenConsole { target: ConsoleTarget },
 
     // --- Efectos: `App` los reenvía a `effects::dispatch` (específicos de servicio) ---
     /// Pedir todos los log groups del ambiente (paginados hasta un tope). El filtrado
@@ -76,4 +80,17 @@ pub enum Action {
     RedriveExecution { execution_arn: String },
     /// Publicar un evento de prueba (canned) contra un bus de EventBridge.
     SendEvent { event_bus_name: String },
+}
+
+/// Recurso a abrir en la consola de AWS. Service-shaped (vive en `action.rs`, frontera
+/// permitida); `effects` lo traduce a una URL con la región activa. El `App` no lo
+/// inspecciona.
+#[derive(Clone, Debug)]
+pub enum ConsoleTarget {
+    LogGroup { name: String },
+    SqsQueue { url: String },
+    StateMachine { arn: String },
+    Execution { arn: String },
+    EventBus { name: String },
+    Rule { event_bus: String, name: String },
 }

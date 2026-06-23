@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::View;
-use crate::action::Action;
+use crate::action::{Action, ConsoleTarget};
 use crate::message::{Message, QueueAttrsDto, QueueDto, QueueMessageDto};
 use crate::util::{fmt_epoch_millis, fuzzy_score, ranked};
 
@@ -118,6 +118,15 @@ impl SqsView {
                 .as_ref()
                 .and_then(|a| a.arn.clone())
                 .or_else(|| Some(queue_url.clone())),
+        }
+    }
+
+    /// URL de la cola del nivel actual (seleccionada o la del detalle), para abrir en
+    /// la consola.
+    fn queue_url(&self) -> Option<String> {
+        match &self.level {
+            Level::Queues => self.selected_queue().map(|q| q.url),
+            Level::Detail { queue_url } => Some(queue_url.clone()),
         }
     }
 
@@ -252,8 +261,8 @@ impl View for SqsView {
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         match self.level {
             // En el detalle de una cola, `p` purga (gated por modo escritura + confirm).
-            Level::Detail { .. } => vec![("y", "copiar ARN"), ("p", "purgar")],
-            Level::Queues => vec![("y", "copiar URL")],
+            Level::Detail { .. } => vec![("y", "copiar ARN"), ("O", "consola"), ("p", "purgar")],
+            Level::Queues => vec![("y", "copiar URL"), ("O", "consola")],
         }
     }
 
@@ -298,6 +307,13 @@ impl View for SqsView {
             KeyCode::Char('y') => self
                 .copy_text()
                 .map(|text| Action::CopyToClipboard { text })
+                .into_iter()
+                .collect(),
+            KeyCode::Char('O') => self
+                .queue_url()
+                .map(|url| Action::OpenConsole {
+                    target: ConsoleTarget::SqsQueue { url },
+                })
                 .into_iter()
                 .collect(),
             _ => vec![],
@@ -590,6 +606,20 @@ mod tests {
         match v.on_key(key(KeyCode::Char('y'))).as_slice() {
             [Action::CopyToClipboard { text }] => assert!(text.ends_with("/orders")),
             other => panic!("se esperaba CopyToClipboard, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn o_opens_queue_in_console() {
+        let mut v = SqsView::new();
+        v.on_message(&Message::QueuesLoaded(vec![queue("orders")]));
+        match v.on_key(key(KeyCode::Char('O'))).as_slice() {
+            [
+                Action::OpenConsole {
+                    target: ConsoleTarget::SqsQueue { url },
+                },
+            ] => assert!(url.ends_with("/orders")),
+            other => panic!("se esperaba OpenConsole SqsQueue, llegó {other:?}"),
         }
     }
 

@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::View;
-use crate::action::Action;
+use crate::action::{Action, ConsoleTarget};
 use crate::message::{
     ExecStatus, ExecutionDetailDto, ExecutionDto, MachineType, Message, StateMachineDto,
     StateSpanDto,
@@ -145,6 +145,21 @@ impl SfnView {
             Level::Machines => self.selected_machine().map(|m| m.arn),
             Level::Executions { .. } => self.selected_execution().map(|e| e.arn),
             Level::Detail { execution_arn, .. } => Some(execution_arn.clone()),
+        }
+    }
+
+    /// Recurso del nivel actual a abrir en la consola de Step Functions.
+    fn console_target(&self) -> Option<ConsoleTarget> {
+        match &self.level {
+            Level::Machines => self
+                .selected_machine()
+                .map(|m| ConsoleTarget::StateMachine { arn: m.arn }),
+            Level::Executions { .. } => self
+                .selected_execution()
+                .map(|e| ConsoleTarget::Execution { arn: e.arn }),
+            Level::Detail { execution_arn, .. } => Some(ConsoleTarget::Execution {
+                arn: execution_arn.clone(),
+            }),
         }
     }
 
@@ -447,7 +462,7 @@ impl View for SfnView {
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
-        let mut hints = vec![("y", "copiar ARN")];
+        let mut hints = vec![("y", "copiar ARN"), ("O", "consola")];
         // `R` solo se ofrece sobre una ejecución redrivable (FAILED/TIMED_OUT/ABORTED),
         // igual que `redrive_intent`. Gated por modo escritura + confirm en el App.
         if matches!(self.level, Level::Detail { .. })
@@ -511,6 +526,11 @@ impl View for SfnView {
             KeyCode::Char('y') => self
                 .copy_text()
                 .map(|text| Action::CopyToClipboard { text })
+                .into_iter()
+                .collect(),
+            KeyCode::Char('O') => self
+                .console_target()
+                .map(|target| Action::OpenConsole { target })
                 .into_iter()
                 .collect(),
             _ => vec![],
@@ -1075,6 +1095,20 @@ mod tests {
         match v.on_key(key(KeyCode::Char('y'))).as_slice() {
             [Action::CopyToClipboard { text }] => assert!(text.contains(":stateMachine:m1")),
             other => panic!("se esperaba CopyToClipboard, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn o_opens_machine_in_console() {
+        let mut v = SfnView::new();
+        v.on_message(&machines_msg(vec![machine("m1", MachineType::Standard)]));
+        match v.on_key(key(KeyCode::Char('O'))).as_slice() {
+            [
+                Action::OpenConsole {
+                    target: ConsoleTarget::StateMachine { arn },
+                },
+            ] => assert!(arn.contains(":stateMachine:m1")),
+            other => panic!("se esperaba OpenConsole StateMachine, llegó {other:?}"),
         }
     }
 

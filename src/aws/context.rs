@@ -62,6 +62,11 @@ impl AwsContext {
         }
     }
 
+    /// Región del ambiente activo (para construir URLs de la consola, etc.).
+    pub fn region(&self) -> &str {
+        &self.env.region
+    }
+
     /// `SdkConfig` del ambiente (profile + región), resuelto una sola vez vía
     /// `aws-config` y compartido por todos los clients. Credenciales/SSO los
     /// resuelve `aws-config`; nunca se hardcodea nada.

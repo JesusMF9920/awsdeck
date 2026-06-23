@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 
-use crate::action::Action;
+use crate::action::{Action, ConsoleTarget};
 use crate::aws::context::{AwsContext, Env};
 use crate::message::{
     Envelope, EventBusDto, ExecStatus, ExecutionDetailDto, ExecutionDto, LogEventDto, LogGroupDto,
@@ -60,6 +60,28 @@ impl Effects {
         };
     }
 
+    /// Región del ambiente activo (mock o real), para construir URLs de la consola.
+    fn region(&self) -> String {
+        match &self.backend {
+            Backend::Mock(env) => env.region.clone(),
+            Backend::Real(ctx) => ctx.region().to_string(),
+        }
+    }
+
+    /// Abre el recurso en la consola de AWS: construye la URL con la región activa y
+    /// lanza el navegador en un task (sin tocar el SDK). Reporta error si no se pudo.
+    fn open_console(&self, target: ConsoleTarget, epoch: u64) {
+        let url = console_url(&self.region(), &target);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let opened = tokio::task::spawn_blocking(move || open::that(url)).await;
+            if !matches!(opened, Ok(Ok(()))) {
+                let msg = Message::Error("no se pudo abrir el navegador".into());
+                let _ = tx.send(Envelope::new(epoch, msg)).await;
+            }
+        });
+    }
+
     /// Despacha una `Action` de efecto: lanza la task y retorna de inmediato (no
     /// bloquea el render). Las `Action` core las maneja el `App`.
     pub fn dispatch(&self, action: Action, epoch: u64) {
@@ -92,6 +114,7 @@ impl Effects {
                 rule_name,
             } => self.load_rule_detail(event_bus_name, rule_name, epoch),
             Action::SendEvent { event_bus_name } => self.send_event(event_bus_name, epoch),
+            Action::OpenConsole { target } => self.open_console(target, epoch),
             Action::Quit
             | Action::ActivateView(_)
             | Action::Back
@@ -550,6 +573,62 @@ impl Effects {
             }
         }
     }
+}
+
+// --- Consola AWS (URLs) -------------------------------------------------------
+
+/// URL (best-effort) de la consola web de AWS para `target`, en `region`. Los
+/// deep-links pueden cambiar entre versiones de la consola; el objetivo es aterrizar
+/// en el recurso/región correctos.
+fn console_url(region: &str, target: &ConsoleTarget) -> String {
+    let base = format!("https://{region}.console.aws.amazon.com");
+    match target {
+        ConsoleTarget::LogGroup { name } => format!(
+            "{base}/cloudwatch/home?region={region}#logsV2:log-groups/log-group/{}",
+            cw_encode(name)
+        ),
+        ConsoleTarget::SqsQueue { url } => format!(
+            "{base}/sqs/v3/home?region={region}#/queues/{}",
+            pct_encode(url)
+        ),
+        ConsoleTarget::StateMachine { arn } => format!(
+            "{base}/states/home?region={region}#/statemachines/view/{}",
+            pct_encode(arn)
+        ),
+        ConsoleTarget::Execution { arn } => format!(
+            "{base}/states/home?region={region}#/executions/details/{}",
+            pct_encode(arn)
+        ),
+        ConsoleTarget::EventBus { name } => format!(
+            "{base}/events/home?region={region}#/eventbus/{}",
+            pct_encode(name)
+        ),
+        ConsoleTarget::Rule { event_bus, name } => format!(
+            "{base}/events/home?region={region}#/eventbus/{}/rules/{}",
+            pct_encode(event_bus),
+            pct_encode(name)
+        ),
+    }
+}
+
+/// Percent-encoding RFC 3986 (deja sin tocar los *unreserved*: ALPHA/DIGIT/`-._~`).
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Codificación del fragment de la consola de CloudWatch Logs: como `pct_encode` pero
+/// con `%` → `$25` (así `/` queda `$252F`, que la consola decodifica).
+fn cw_encode(s: &str) -> String {
+    pct_encode(s).replace('%', "$25")
 }
 
 // --- SDK real -----------------------------------------------------------------
@@ -1653,6 +1732,43 @@ mod tests {
             }
             other => panic!("mensaje inesperado: {other:?}"),
         }
+    }
+
+    #[test]
+    fn console_urls_encode_region_and_resource() {
+        // CloudWatch: el `/` del log group queda como $252F en el fragment.
+        let u = console_url(
+            "us-east-1",
+            &ConsoleTarget::LogGroup {
+                name: "/aws/lambda/foo".into(),
+            },
+        );
+        assert!(u.contains("us-east-1.console.aws.amazon.com/cloudwatch"));
+        assert!(
+            u.contains("$252Faws$252Flambda$252Ffoo"),
+            "log group codificado: {u}"
+        );
+
+        // SFN: el ARN va percent-encoded (`:` → %3A).
+        let u = console_url(
+            "eu-west-1",
+            &ConsoleTarget::Execution {
+                arn: "arn:aws:states:eu-west-1:0:execution:m:e1".into(),
+            },
+        );
+        assert!(u.contains("/states/home?region=eu-west-1"));
+        assert!(u.contains("arn%3Aaws%3Astates"), "arn percent-encoded: {u}");
+
+        // EventBridge rule.
+        let u = console_url(
+            "us-east-1",
+            &ConsoleTarget::Rule {
+                event_bus: "default".into(),
+                name: "my-rule".into(),
+            },
+        );
+        assert!(u.contains("/events/home"));
+        assert!(u.contains("/eventbus/default/rules/my-rule"));
     }
 
     #[tokio::test]

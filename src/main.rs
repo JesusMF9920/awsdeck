@@ -115,6 +115,7 @@ mod tests {
         let state = State {
             last_profile: Some("state-prof".into()),
             last_region: Some("state-region".into()),
+            favorites: vec![],
         };
         // El entorno gana sobre todo.
         let e = pick_env(
@@ -135,6 +136,7 @@ mod tests {
         let state = State {
             last_profile: Some("last".into()),
             last_region: None,
+            favorites: vec![],
         };
         // Sin entorno ni config: recuerda el último profile; región cae al default.
         let e = pick_env(None, None, &config, &state);

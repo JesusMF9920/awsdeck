@@ -223,6 +223,7 @@ impl App {
         crate::config::State {
             last_profile: Some(self.env.profile.clone()),
             last_region: Some(self.env.region.clone()),
+            favorites: vec![],
         }
         .save();
         Ok(())

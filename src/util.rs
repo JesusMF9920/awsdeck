@@ -99,6 +99,12 @@ pub fn parse_datetime(s: &str) -> Option<i64> {
     }
 
     let days = days_from_civil(y, mo, d);
+    // Rechaza días fuera del mes (p. ej. 2026-02-30, 2026-04-31): `days_from_civil` es
+    // aritmético y los desplazaría en silencio a otro día, haciendo que el tail consulte
+    // un rango distinto al tecleado. El inverso confirma que el día sobrevivió el round-trip.
+    if civil_from_days(days) != (y, mo as u32, d as u32) {
+        return None;
+    }
     Some((days * 86_400 + h * 3600 + mi * 60 + se) * 1000)
 }
 
@@ -256,6 +262,17 @@ mod tests {
             "hora inválida"
         );
         assert!(parse_datetime("not-a-date").is_none());
+        // Días fuera del mes: no se desplazan en silencio, se rechazan.
+        assert!(parse_datetime("2026-02-30").is_none(), "feb no tiene 30");
+        assert!(parse_datetime("2026-04-31").is_none(), "abr no tiene 31");
+        assert!(
+            parse_datetime("2026-02-29").is_none(),
+            "2026 no es bisiesto"
+        );
+        assert!(
+            parse_datetime("2024-02-29").is_some(),
+            "2024 sí es bisiesto"
+        );
     }
 
     #[test]

@@ -177,7 +177,7 @@ Entregado: 3 niveles (state machines → ejecuciones → detalle). L1 `list_stat
 ### v3 — Vista `events` (EventBridge) — ✅ hecho
 Listar event buses, rules y targets; inspeccionar el patrón de cada rule; `SendEvent` de prueba (gated) para disparar un evento contra un bus.
 
-Entregado: 3 niveles (event buses → rules → detalle). L1 `list_event_buses` (paginado). L2 `list_rules` con estado coloreado (`[enabled]`/`[disabled]`) + descripción; guard de bus en `on_message`. L3 `describe_rule` + `list_targets_by_rule` combinados en un Message: render partido **meta / patrón / targets** con el `event_pattern` (pretty, truncado) inspeccionable y los targets como lista navegable/filtrable. `/` filtra en los 3 niveles; `ClearFilter` al cambiar de nivel; señal `· parcial`. `SendEvent` (`S` sobre el bus) gated por el mismo gate prod-safe de v1/v2 (modo escritura + confirm); `put_events` con `failed_entry_count>0` → error a la status bar. **(P2)** `S` ahora abre un **form editable** (`ui::form`: source/detail-type/detail JSON) que valida el JSON antes de enviar, en vez del evento canned. Mock (`AWSDECK_MOCK=1`) y SDK real (`aws-sdk-eventbridge`).
+Entregado: 3 niveles (event buses → rules → detalle). L1 `list_event_buses` (paginado). L2 `list_rules` con estado coloreado (`[enabled]`/`[disabled]`) + descripción; guard de bus en `on_message`. L3 `describe_rule` + `list_targets_by_rule` combinados en un Message: render partido **meta / patrón / targets** con el `event_pattern` (pretty, truncado) inspeccionable y los targets como lista navegable/filtrable. `/` filtra en los 3 niveles; `ClearFilter` al cambiar de nivel; señal `· parcial`. `SendEvent` (`S` sobre el bus) gated por el mismo gate prod-safe de v1/v2 (modo escritura + confirm); `put_events` con `failed_entry_count>0` → error a la status bar. **(P2)** `S` ahora abre un **form editable** (`ui::form`: source/detail-type/detail JSON) que valida el JSON antes de enviar, en vez del evento canned. **(P3)** el form suma `time` (UTC, opcional) y `resources` (ARNs por coma) → `PutEventsRequestEntry.time/.resources`. Mock (`AWSDECK_MOCK=1`) y SDK real (`aws-sdk-eventbridge`).
 
 ---
 
@@ -238,8 +238,16 @@ ejecuciones por estado) y `l` (logs de la Lambda del estado). Mutantes gated: `p
   el JSON; nuevo hook agnóstico `View::wants_raw_input` para teclas crudas); **config persistente** —
   el último ambiente se recuerda en `state.toml` (aparte del `config.toml` hand-editado, `pick_env`
   con precedencia entorno > config > último > default).
-- `SendEvent` con `time`/`resources` o presets; load-more del history de `sfn`; profiles favoritos /
-  recientes; escribir de vuelta el `config.toml` hand-editado.
+- **Hecho (más usabilidad diaria, P3):** **`SendEvent` con `time`/`resources`** (dos campos opcionales
+  del form; `time` reusa `util::parse_datetime` UTC sin `chrono`, `resources` = ARNs por coma; el
+  confirm los muestra); **load-more del history de `sfn`** (`o` en el detalle: `LoadMoreExecutionHistory`
+  re-fetchea con `page_budget` creciente y **re-parsea todo** —`parse_history` necesita un prefijo
+  cronológico contiguo—, conservando la selección por nombre); **favoritos + recientes** desde el menú
+  principal — `*` marca un recurso, los recientes se trackean solos al drillear; agnóstico vía el hook
+  `View::selected_favorite` + `Action::RecordRecent` + `ViewContext::Favorite` (abre por `on_context`),
+  persistidos en `state.toml` (`Favorite`, LRU por orden, `CAP=50`).
+- Presets de evento; persistir favoritos al instante (hoy al salir); favoritos en niveles profundos;
+  escribir de vuelta el `config.toml` hand-editado.
 - Más vistas: Lambda (invoke + config), DynamoDB (scan/query), ECS (services/tasks), RDS (estado), S3.
 - Temas / paleta, y modo "denso" para pantallas chicas.
 

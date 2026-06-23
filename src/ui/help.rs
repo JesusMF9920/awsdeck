@@ -21,7 +21,10 @@ const KEYS: &[(&str, &str)] = &[
         "esc",
         "descarta el error; con filtro lo limpia; si no, volver (raíz → menú)",
     ),
-    (":menu / bksp", "volver al menú principal"),
+    (
+        ":menu / bksp",
+        "volver al menú principal (lista herramientas + ★ favoritos + recientes)",
+    ),
     ("r", "refresh"),
     ("y", "copiar ARN/URL/línea del item al portapapeles"),
     ("O", "abrir el recurso en la consola web de AWS"),
@@ -32,7 +35,11 @@ const KEYS: &[(&str, &str)] = &[
     ("w / W", "logs: ciclar la ventana de tiempo (15m…7d)"),
     (
         "o",
-        "cargar más (tail: ventana · Events: líneas viejas · sfn: ejecuciones)",
+        "cargar más (tail: ventana · Events: líneas · sfn: ejecuciones / history del detalle)",
+    ),
+    (
+        "*",
+        "marcar/quitar favorito del recurso seleccionado (★ en el menú · recientes auto)",
     ),
     (
         "f",
@@ -57,7 +64,10 @@ const KEYS: &[(&str, &str)] = &[
     ("p", "purgar cola SQS — gated por modo escritura"),
     ("d", "redrive DLQ (sqs, sobre un dead-letter) — gated"),
     ("R", "redrive ejecución sfn — gated por modo escritura"),
-    ("S", "enviar evento (events): abre form editable — gated"),
+    (
+        "S",
+        "enviar evento (events): form editable (source/detail-type/detail/time/resources) — gated",
+    ),
     (":write", "alternar modo escritura (acciones mutantes)"),
     ("ctrl-e", "cambiar de ambiente (picker de profiles)"),
     (

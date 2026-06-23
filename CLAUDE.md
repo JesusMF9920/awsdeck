@@ -83,12 +83,16 @@ la consola AWS · `ctrl-e` cambiar ambiente (profiles) · `:region <código>` ca
 `?` ayuda · `q` salir. `enter` también **expande** el contenido completo (línea de log, cuerpo de
 mensaje `sqs`, `input` de target `events`, **input/output de un estado `sfn`**) en un panel
 scrolleable; `o` **carga más** (tail: ventana ·
-Events: líneas viejas · `sfn`: ejecuciones). En `logs`: `t` tail del group, `w/W` ventana, `f` tail en
+Events: líneas viejas · `sfn`: ejecuciones o **history del detalle**). En `logs`: `t` tail del group,
+`w/W` ventana, `f` tail en
 vivo. En `events` detalle: `P` expande el `event_pattern`. En `sfn`: `:status failed|all` filtra
-ejecuciones por estado y `l` (detalle) abre los logs de la Lambda del estado. Acciones mutantes gated
+ejecuciones por estado y `l` (detalle) abre los logs de la Lambda del estado. `*` **marca/quita
+favorito** del recurso seleccionado del nivel raíz (★ en el menú; los recientes se trackean solos al
+drillear). Acciones mutantes gated
 por modo escritura (`:write`)
 + confirm: `p` purgar cola (`sqs`), `d` redrive de DLQ (`sqs`, sobre un dead-letter), `R` redrive
-ejecución (`sfn`), `S` enviar evento a un bus (`events`, abre un **form editable**). Las teclas
+ejecución (`sfn`), `S` enviar evento a un bus (`events`, abre un **form editable** con
+source/detail-type/detail/`time`/`resources`). Las teclas
 propias de cada vista se **anuncian** en el footer según el contexto
 (`View::hints`): no hay que memorizar la tabla ni abrir `?`.
 
@@ -304,8 +308,37 @@ list/describe).
   - **Config persistente** (`config.rs`): nuevo `State { last_profile, last_region }` que la app
     escribe sola al salir en `state.toml` (aparte del `config.toml` hand-editado, **no-destructivo**).
     `initial_env` cae: entorno > `default_*` del config > último usado > defaults (`pick_env`, pura).
+- **Backlog P3 (más usabilidad diaria)**:
+  - **`events`: `SendEvent` con `time`/`resources`**: el form gana dos campos opcionales (vacío =
+    omitir). `time` reusa `util::parse_datetime` (UTC, sin `chrono`); `resources` = ARNs separados por
+    coma. `Action::SendEvent` += `time: Option<i64>` + `resources: Vec<String>`; `send_event_real`
+    arma el `PutEventsRequestEntry` condicional (`.time(DateTime::from_millis)`/`.set_resources`); el
+    confirm los muestra (prod-safe). Mock los ignora.
+  - **`sfn`: load-more del history** (`o` en Detail): `Action::LoadMoreExecutionHistory { page_budget }`
+    re-pide describe+history con un presupuesto de páginas mayor y **re-parsea todo** (effects es
+    stateless y `parse_history` empareja entry/exit con una pila por nombre → solo un prefijo
+    cronológico contiguo es correcto; acumular páginas sueltas rompería el borde). Reusa
+    `ExecutionDetailLoaded`; `fetch_execution_detail` toma `page_budget`. La vista sube `history_pages`
+    por `HISTORY_PAGE_STEP` y **preserva la selección por nombre** (ya no salta al `failed_state` en el
+    load-more). Mock: ejecución `big` con history contiguo que crece con el budget.
+  - **Favoritos + recientes** (acceso desde el **menú principal**, recientes **auto-trackeados**):
+    máximo agnosticismo — el core trata `view_id`/`key`/`label` como strings opacos y la recencia se
+    modela por **posición en un `Vec`** (frente = más reciente, sin reloj). Hook agnóstico
+    **`View::selected_favorite() -> Option<(key, label)>`** (default `None`): el `App` lo usa para la
+    tecla **`*`** (marca/desmarca) y le pone el `view_id`. **`Action::RecordRecent { key, label }`**
+    (core): la vista la emite al drillear a un recurso raíz; el `App` la guarda con el id activo.
+    Abrir un favorito reusa el handoff: nueva variante **`ViewContext::Favorite { key }`** →
+    `ActivateViewWithContext` → `on_context` de la vista destino (drill directo). Persistido en
+    `state.toml` (`State.favorites: Vec<Favorite{view_id,key,label,is_favorite}>`, `#[serde(default)]`
+    = compat v1; `toggle_favorite`/`record_recent`/`prune` puros, `CAP=50` recientes). El `App` guarda
+    un `store: State` (inyectado con `load_state`, reescrito al salir). El **menú** lista, bajo las
+    herramientas, **★ favoritos** y **recientes** (`MenuRow::{Tool,Header,Favorite}`; la navegación
+    salta los headers); `enter` sobre uno lo sube al frente y lo abre por contexto. Hint `* favorito`
+    cuando la vista expone un recurso. Cada vista implementa el getter + `on_context(Favorite)` +
+    `RecordRecent` al drillear (`logs` group→tail, `sqs` cola→detalle, `sfn` máquina→ejecuciones —
+    EXPRESS abierto así muestra el error del SDK—, `events` bus→rules).
 
-233 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive, send y **redrive de DLQ**—, búsqueda de
+251 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive, send y **redrive de DLQ**—, búsqueda de
 groups server-side por subcadena + fuzzy local + fan-out de casing ("createOrder" → "CreateOrderV3") +
 "latest wins", menú, drill x3 en `sfn`/`events` y
 eventos/tail de `logs`, back→menú de dos etapas,
@@ -326,9 +359,14 @@ líneas viejas conservando la selección), **input/output por estado** (`sfn`: e
 **paginación** (`streams`/`history` señalan `· parcial`), **redrive de DLQ** (`is_dlq` por
 `ListDeadLetterSourceQueues`, `d` gated, mock), **form de envío** (`ui::form`: tab/enter/esc, valida
 JSON, `wants_raw_input` reenvía teclas crudas), **config persistente** (`State` round-trip,
-`pick_env` precedencia entorno > config > último > default)). `AWSDECK_MOCK=1 cargo run` lo abre sin
-credenciales.
+`pick_env` precedencia entorno > config > último > default), **SendEvent time/resources** (submit
+parsea/valida time + resources, confirm los muestra), **load-more del history `sfn`** (`o` sube el
+budget, mock `big` crece contiguo, selección preservada por nombre), **favoritos/recientes**
+(`toggle`/`record_recent`/`prune` LRU + round-trip + compat v1, `*` marca/quita, `RecordRecent` con id
+activo, menú lista fav+recientes y `enter` abre por `ViewContext::Favorite`, getter + `on_context` por
+vista)). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
 
-Pendiente: `SendEvent` con campos `time`/`resources` o presets; load-more del `history` de `sfn`
-(hoy solo señala `· parcial`); favoritos/recientes; escribir de vuelta `config.toml` (queda
-hand-editado). Backlog de vistas: Lambda, DynamoDB, ECS…
+Pendiente: presets de evento (`SendEvent`); persistir favoritos al instante (hoy al salir);
+favoritos en niveles profundos (hoy solo el recurso raíz de cada vista); abrir un favorito EXPRESS de
+`sfn` sin el error del SDK; escribir de vuelta `config.toml` (queda hand-editado). Backlog de vistas:
+Lambda, DynamoDB, ECS…

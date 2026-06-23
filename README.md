@@ -46,14 +46,15 @@ data fresca). Nunca crashea.
 | `/` | buscar (en `logs` consulta al server por subcadena + fuzzy local, tolerante a mayús/minús; `↑`/`↓` navegan sin salir; `enter` entra directo) |
 | `enter` | drill al detalle (en `logs`: group → stream → **eventos**); **expande** completo: una línea de log, el cuerpo de un mensaje (`sqs`), el `input` de un target (`events`) o el **input/output de un estado** (`sfn`) en un panel scrolleable (JSON pretty, `y` copia) |
 | `esc` | con filtro aplicado lo limpia (1er `esc`); si no, vuelve un nivel (drill back; en la raíz, al menú) |
-| `:menu` · `backspace` | volver al menú principal |
+| `:menu` · `backspace` | volver al menú principal (lista las herramientas + **★ favoritos** + **recientes**; `enter` salta directo al recurso) |
 | `j` / `k` · `↑` / `↓` · `g` / `G` | navegar (y scrollear el panel de detalle) |
 | `r` | refrescar |
 | `y` | copiar el ARN/URL/línea del item seleccionado al portapapeles |
 | `O` | abrir el recurso seleccionado en la consola web de AWS |
 | `t` | **logs del group** (`logs`): todos sus streams **por rango de tiempo** |
 | `w` / `W` | `logs`: ciclar la **ventana de tiempo** (15m · 1h · 6h · 24h · 3d · 7d) |
-| `o` | **cargar más** — tail: paginar la ventana · Events: líneas más viejas del stream · `sfn`: más ejecuciones |
+| `o` | **cargar más** — tail: paginar la ventana · Events: líneas más viejas del stream · `sfn`: más ejecuciones, o más **history** en el detalle |
+| `*` | marcar/quitar **favorito** del recurso seleccionado (★ en el menú; los **recientes** se trackean solos al drillear) |
 | `f` | `logs`: **tail en vivo** (`tail -f`) — auto-refresca **sin arrastrarte al fondo** si estás leyendo arriba |
 | `:since` · `:from`/`to` | `logs`: rango — `:since 2d` · `:from 2026-06-19 [to 2026-06-20]` (UTC) |
 | `P` | `events` (detalle): expandir el **event_pattern** completo (scroll + copia) |
@@ -62,22 +63,22 @@ data fresca). Nunca crashea.
 | `p` | purgar cola SQS (gated: modo escritura + confirm) |
 | `d` | `sqs` (detalle de un **DLQ**): redrive — reenvía los mensajes a sus colas origen (gated) |
 | `R` | redrive ejecución `sfn` fallida (gated: modo escritura + confirm) |
-| `S` | `events`: abre un **form editable** (source/detail-type/detail JSON) y publica el evento (gated) |
+| `S` | `events`: abre un **form editable** (source/detail-type/detail JSON + `time`/`resources` opcionales) y publica el evento (gated) |
 | `:write` | alternar modo escritura (habilita acciones mutantes) |
 | `ctrl-e` | cambiar de ambiente (picker de profiles) |
 | `:region` | cambiar **solo la región** del ambiente actual (mismo profile), p. ej. `:region eu-west-1` |
 | `?` | ayuda |
 | `q` | salir |
 
-> Las teclas específicas de cada vista (`t`/`w`/`o`/`f` en `logs`, `y`/`O`, `p`/`d`/`R`/`S` gated) se
-> **anuncian solas** en el footer según dónde estés, y `logs` además recuerda `t` en el título del
+> Las teclas específicas de cada vista (`t`/`w`/`o`/`f` en `logs`, `y`/`O`/`*`, `p`/`d`/`R`/`S` gated)
+> se **anuncian solas** en el footer según dónde estés, y `logs` además recuerda `t` en el título del
 > group: no hace falta memorizar esta tabla ni abrir `?`.
 
 ## Cómo probar los cambios
 
 ```bash
 AWSDECK_MOCK=1 cargo run    # ver el TUI con datos, sin tocar AWS
-cargo test                  # 233 tests, sin red
+cargo test                  # 251 tests, sin red
 cargo clippy --all-targets  # lint
 cargo fmt --check           # formato
 ```
@@ -177,9 +178,14 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
   payload editable** (`events`, `S` abre un form multi-campo que valida el JSON; nuevo hook agnóstico
   `View::wants_raw_input`); **config persistente** (recuerda el último ambiente en `state.toml`, sin
   tocar el `config.toml` hand-editado).
+- **Más usabilidad diaria (P3)** ✅ **`SendEvent` con `time`/`resources`** (campos opcionales del form,
+  fechas UTC sin `chrono`); **load-more del history de `sfn`** (`o` en el detalle: re-fetch + re-parse
+  con presupuesto creciente, conservando la selección); **favoritos + recientes** desde el menú
+  principal (`*` marca un recurso, los recientes se trackean solos al drillear; agnóstico vía
+  `View::selected_favorite` + `ViewContext::Favorite`; persistidos en `state.toml`).
 
-Backlog: `SendEvent` con `time`/`resources` o presets; load-more del history de `sfn`;
-favoritos/recientes; más vistas (Lambda, DynamoDB, ECS…).
+Backlog: presets de evento; persistir favoritos al instante (hoy al salir); favoritos en niveles
+profundos; más vistas (Lambda, DynamoDB, ECS…).
 
 ## Stack
 

@@ -15,7 +15,7 @@ const KEYS: &[(&str, &str)] = &[
     ),
     (
         "enter",
-        "drill (group → stream → eventos) · en una línea, expandir",
+        "drill · expandir (línea de log / cuerpo de msg sqs / input de target events)",
     ),
     (
         "esc",
@@ -30,11 +30,25 @@ const KEYS: &[(&str, &str)] = &[
         "logs: ver TODOS los streams del group juntos, por rango de tiempo",
     ),
     ("w / W", "logs: ciclar la ventana de tiempo (15m…7d)"),
-    ("o", "logs: cargar más líneas (paginación de la ventana)"),
-    ("f", "logs: seguir el tail en vivo (tail -f)"),
+    (
+        "o",
+        "cargar más (tail: ventana · Events: líneas viejas · sfn: ejecuciones)",
+    ),
+    (
+        "f",
+        "logs: seguir el tail en vivo (tail -f, no te arrastra al fondo)",
+    ),
     (
         ":since/:from",
         "logs: rango — :since 2d · :from 2026-06-19 [to …] (UTC)",
+    ),
+    (
+        "P",
+        "events: expandir el event_pattern completo (scroll + copia)",
+    ),
+    (
+        ":status",
+        "sfn: filtrar ejecuciones por estado (:status failed / all)",
     ),
     (
         "l",

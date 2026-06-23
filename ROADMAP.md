@@ -198,9 +198,12 @@ Entregado: 3 niveles (event buses → rules → detalle). L1 `list_event_buses` 
 | `?` | ayuda |
 | `q` | salir |
 
-`logs` añade: `t` tail del group, `w`/`W` ventana, `o` paginar, `f` tail en vivo (`tail -f`),
-`:since`/`:from` rango. `sfn` añade `l` (logs de la Lambda del estado). Mutantes gated: `p` (sqs),
-`R` (sfn), `S` (events).
+`enter` también **expande** el contenido completo en un panel scrolleable (línea de log, cuerpo de
+mensaje `sqs`, `input` de target `events`). `o` **carga más** (tail: ventana · Events: líneas viejas ·
+`sfn`: ejecuciones). `logs` añade: `t` tail del group, `w`/`W` ventana, `f` tail en vivo (`tail -f`),
+`:since`/`:from` rango. `events` añade `P` (expande el `event_pattern`). `sfn` añade `:status` (filtra
+ejecuciones por estado) y `l` (logs de la Lambda del estado). Mutantes gated: `p` (sqs), `R` (sfn),
+`S` (events).
 
 ### Reglas de código
 - El core nunca conoce servicios concretos: solo el registry los conecta.
@@ -223,6 +226,11 @@ Entregado: 3 niveles (event buses → rules → detalle). L1 `list_event_buses` 
   (SSO/credenciales caducadas, AccessDenied, throttling) + **hint accionable pegajoso** y `[re-auth]`
   en el header; **cuenta confirmada por STS** en el header (prod-safe); **`:region`** (cambiar región
   sin editar `~/.aws/config`); **retry adaptativo + timeouts** en el `SdkConfig`.
+- **Hecho (lectura/navegación a fondo, P1):** **panel de detalle reusable** (`ui::detail`) para
+  expandir contenido completo (línea de log, cuerpo de mensaje `sqs`, `input`/`event_pattern` de
+  `events`) con scroll + JSON pretty + copia; **load-more** sin dejar nada inalcanzable (ejecuciones
+  `sfn` con `o`, líneas viejas por stream en `logs`); **filtro de ejecuciones por estado** (`:status`);
+  y el **tail en vivo ya no arrastra la selección** mientras lees.
 - Escribir la config en disco (hoy solo se lee); profiles favoritos, modo escritura por ambiente.
 - Más vistas: Lambda (invoke + config), DynamoDB (scan/query), ECS (services/tasks), RDS (estado), S3.
 - Temas / paleta, y modo "denso" para pantallas chicas.

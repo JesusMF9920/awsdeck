@@ -80,9 +80,12 @@ por subcadena; con `↑/↓` navegas sin salir; `enter` entra directo, sin doble
 `esc` back de dos etapas (con filtro lo limpia;
 si no, un nivel; desde la raíz, al menú) · `r` refresh · `y` copiar ARN/URL/línea · `O` abrir en
 la consola AWS · `ctrl-e` cambiar ambiente (profiles) · `:region <código>` cambiar solo la región ·
-`?` ayuda · `q` salir. En `logs`: `t` tail del group,
-`w/W` ventana, `o` paginar, `f` tail en vivo. En `sfn` detalle: `l` abre los logs de la Lambda del
-estado seleccionado. Acciones mutantes gated por modo escritura (`:write`)
+`?` ayuda · `q` salir. `enter` también **expande** el contenido completo (línea de log, cuerpo de
+mensaje `sqs`, `input` de target `events`) en un panel scrolleable; `o` **carga más** (tail: ventana ·
+Events: líneas viejas · `sfn`: ejecuciones). En `logs`: `t` tail del group, `w/W` ventana, `f` tail en
+vivo. En `events` detalle: `P` expande el `event_pattern`. En `sfn`: `:status failed|all` filtra
+ejecuciones por estado y `l` (detalle) abre los logs de la Lambda del estado. Acciones mutantes gated
+por modo escritura (`:write`)
 + confirm: `p` purgar cola (`sqs`), `R` redrive ejecución (`sfn`), `S` enviar evento a un bus
 (`events`). Las teclas propias de cada vista se **anuncian** en el footer según el contexto
 (`View::hints`): no hay que memorizar la tabla ni abrir `?`.
@@ -264,8 +267,24 @@ list/describe).
   - **Retry adaptativo + timeouts** en el `SdkConfig` (`aws/context.rs`): mitiga throttling del fan-out;
     un endpoint colgado falla como `Network` (reintentable con `r`) en vez de congelar la TUI.
   - **Nudge** al arrancar sin profiles en `~/.aws/config` (antes caía a default en silencio).
+- **Lectura y navegación a fondo (P1)**: cerrar los dead-ends de lectura/paginación.
+  - **Panel de detalle reusable** (`ui::detail::DetailPanel`): extraído de `logs`, lo usan también
+    `events` (input de target con `enter`, `event_pattern` con `P`) y `sqs` (cuerpo de mensaje con
+    `enter`). Snapshot del texto al abrir (una recarga detrás no lo invalida), scroll `j/k/g/G`, JSON
+    pretty, `y` copia el crudo, `esc` cierra (sin subir de nivel). Cada vista guarda un
+    `Option<DetailPanel>` y le delega teclas/render/hints mientras está abierto.
+  - **Load-more sin dejar nada inalcanzable**: `sfn` pagina ejecuciones con `o`
+    (`Message::ExecutionsLoaded` pasa de `more` a `{ next_token, append }`); `logs` Events trae
+    **líneas más viejas** con `o` (`fetch_log_events` devuelve el `next_backward_token`;
+    `prepend_events` las antepone y conserva la línea leída). Espeja el load-more del tail.
+  - **Filtro de ejecuciones por estado** (`sfn`): `:status failed|all|…` vía `View::on_command` →
+    `list_executions().status_filter` server-side (más allá del top-50). Título `· solo FAILED`.
+  - **Tail en vivo no arrebata la selección** (`logs`): `on_tick` marca su consulta como `live_refresh`;
+    la respuesta respeta la posición del usuario salvo que ya estuviera al fondo (una carga manual sí
+    salta al fondo). Antes cada tick (~3s) lo expulsaba al final y leer en vivo era inviable.
+  - **Bug**: `parse_datetime` rechaza días fuera del mes (round-trip de `civil_from_days`).
 
-201 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, búsqueda de
+213 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, búsqueda de
 groups server-side por subcadena + fuzzy local + fan-out de casing ("createOrder" → "CreateOrderV3") +
 "latest wins", menú, drill x3 en `sfn`/`events` y
 eventos/tail de `logs`, back→menú de dos etapas,
@@ -279,7 +298,10 @@ footer, render con `TestBackend`, **errores tipados** (`ErrorKind::classify`/`hi
 pegajoso** (sobrevive navegación, se limpia con data fresca, `esc` lo descarta), **`:region`**
 (cambia región conservando profile), **STS** (mock `VerifyIdentity`, `IdentityLoaded` puebla la
 cuenta, `switch_env` la resetea, header pinta cuenta + `[re-auth]`), `parse_datetime` rechaza días
-fuera del mes). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
+fuera del mes, **panel de detalle** (`DetailPanel`: cierra con esc/enter, `content()` crudo, JSON
+pretty), **expandir en `events`/`sqs`** (input/patrón/cuerpo), **tail en vivo conserva la posición**
+salvo al fondo, **load-more** (`sfn` ejecuciones append + `:status` server-side; `logs` Events antepone
+líneas viejas conservando la selección)). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
 
 Pendiente: `SendEvent` con payload editable (form multi-campo; v3 envía un evento canned),
 input/output por estado en el timeline de `sfn`, escribir config en disco (hoy load-only). Backlog de

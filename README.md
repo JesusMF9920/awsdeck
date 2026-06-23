@@ -44,7 +44,7 @@ data fresca). Nunca crashea.
 |-------|--------|
 | `:` | command bar (saltar de herramienta, p. ej. `:logs`, `:sqs`, `:sfn`, `:events`) |
 | `/` | buscar (en `logs` consulta al server por subcadena + fuzzy local, tolerante a mayús/minús; `↑`/`↓` navegan sin salir; `enter` entra directo) |
-| `enter` | drill al detalle (en `logs`: group → stream → **eventos**); sobre una **línea**, la **expande** completa |
+| `enter` | drill al detalle (en `logs`: group → stream → **eventos**); **expande** completo: una línea de log, el cuerpo de un mensaje (`sqs`) o el `input` de un target (`events`) en un panel scrolleable (JSON pretty, `y` copia) |
 | `esc` | con filtro aplicado lo limpia (1er `esc`); si no, vuelve un nivel (drill back; en la raíz, al menú) |
 | `:menu` · `backspace` | volver al menú principal |
 | `j` / `k` · `↑` / `↓` · `g` / `G` | navegar (y scrollear el panel de detalle) |
@@ -53,9 +53,11 @@ data fresca). Nunca crashea.
 | `O` | abrir el recurso seleccionado en la consola web de AWS |
 | `t` | **logs del group** (`logs`): todos sus streams **por rango de tiempo** |
 | `w` / `W` | `logs`: ciclar la **ventana de tiempo** (15m · 1h · 6h · 24h · 3d · 7d) |
-| `o` | `logs`: **cargar más** líneas (paginación de la ventana) |
-| `f` | `logs`: **tail en vivo** (`tail -f`) — auto-refresca el tail |
+| `o` | **cargar más** — tail: paginar la ventana · Events: líneas más viejas del stream · `sfn`: más ejecuciones |
+| `f` | `logs`: **tail en vivo** (`tail -f`) — auto-refresca **sin arrastrarte al fondo** si estás leyendo arriba |
 | `:since` · `:from`/`to` | `logs`: rango — `:since 2d` · `:from 2026-06-19 [to 2026-06-20]` (UTC) |
+| `P` | `events` (detalle): expandir el **event_pattern** completo (scroll + copia) |
+| `:status` | `sfn`: filtrar ejecuciones por estado server-side (`:status failed` · `:status all`) |
 | `l` | `sfn` (detalle): abrir los **logs de la Lambda** del estado seleccionado (cross-link a `logs`) |
 | `p` | purgar cola SQS (gated: modo escritura + confirm) |
 | `R` | redrive ejecución `sfn` fallida (gated: modo escritura + confirm) |
@@ -74,7 +76,7 @@ data fresca). Nunca crashea.
 
 ```bash
 AWSDECK_MOCK=1 cargo run    # ver el TUI con datos, sin tocar AWS
-cargo test                  # 201 tests, sin red
+cargo test                  # 213 tests, sin red
 cargo clippy --all-targets  # lint
 cargo fmt --check           # formato
 ```
@@ -89,18 +91,21 @@ Recorrido rápido (con `AWSDECK_MOCK=1 cargo run`):
    `esc` regresa un nivel (y desde la raíz de la vista, al menú). En `logs`, `enter` en un stream
    abre sus **líneas** (`get_log_events`, newest abajo, `ERROR` en rojo) y `t` sobre un group abre
    los **logs del group por rango de tiempo** (todos sus streams): `w`/`W` ciclan la ventana
-   (15m…7d), `:since 2d` / `:from … [to …]` la fijan (UTC), `o` carga más y `/` filtra server-side.
-   `enter` sobre una **línea** la **expande** completa (wrap + scroll, JSON pretty); `esc` cierra.
+   (15m…7d), `:since 2d` / `:from … [to …]` la fijan (UTC), `o` carga más, `f` sigue en vivo (sin
+   arrastrarte al fondo) y `/` filtra server-side. En un stream, `o` trae **líneas más viejas**.
+   `enter` sobre una **línea** la **expande** completa (wrap + scroll, JSON pretty, `y` copia); `esc` cierra.
+   En `sqs`, `enter` sobre un mensaje del peek expande su **cuerpo completo** (no los 60 chars de la fila).
 3. En `sfn`, `enter` entra a una state machine → sus **ejecuciones con status coloreado** y duración;
+   `o` trae **más ejecuciones** (ninguna queda inalcanzable) y `:status failed` filtra server-side.
    `enter` en una FAILED → detalle con input/output, error/cause y el **timeline de estados** (el que
    reventó va resaltado y preseleccionado). Sobre un estado de tipo Lambda, `l` salta a **`logs`** y
    abre el tail de la Lambda en la ventana del estado. En una máquina `[express]` se muestra una nota
    (sus ejecuciones viven en CloudWatch Logs). Con `:write`, `R` hace **redrive** de una ejecución
    fallida (confirm modal).
 4. En `events`, `enter` entra a un event bus → sus **rules** con estado `[enabled]`/`[disabled]`;
-   `enter` en una rule → detalle partido **meta / patrón / targets** (el `event_pattern` queda visible
-   y los targets se filtran con `/`). Con `:write`, `S` sobre un bus **envía un evento de prueba**
-   (confirm modal).
+   `enter` en una rule → detalle partido **meta / patrón / targets**. `enter` sobre un target expande
+   su `input` completo y `P` el **event_pattern** completo (panel scrolleable, `y` copia); los targets
+   se filtran con `/`. Con `:write`, `S` sobre un bus **envía un evento de prueba** (confirm modal).
 5. `ctrl-e` abre el picker; elige otro profile → el ambiente y la lista cambian.
 6. `?` muestra la ayuda; `q` sale y la terminal queda limpia.
 
@@ -160,6 +165,11 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
   (SSO/credenciales caducadas, AccessDenied, throttling) y **pista accionable pegajosa** + `[re-auth]`
   en el header; **cuenta confirmada por STS** en el header (prod-safe); **`:region`** para cambiar de
   región sin tocar `~/.aws/config`; **retry adaptativo + timeouts** en el `SdkConfig`.
+- **Lectura y navegación a fondo (P1)** ✅ **panel de detalle reusable** (`ui::detail`) para expandir
+  contenido completo (línea de log, cuerpo de mensaje `sqs`, `input`/`event_pattern` de `events`) con
+  scroll + JSON pretty + copia; **load-more** sin dejar nada inalcanzable (ejecuciones `sfn`, líneas
+  viejas por stream en `logs`); **filtro de ejecuciones por estado** (`:status`); y el **tail en vivo
+  ya no arrastra la selección** al fondo mientras lees.
 
 Backlog: `SendEvent` con payload editable,
 input/output por estado en el timeline de `sfn`, escribir config en disco, más vistas (Lambda,

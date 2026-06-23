@@ -653,6 +653,18 @@ impl App {
             "q" | "quit" => self.dispatch(Action::Quit),
             "w" | "write" => self.toggle_write_mode(),
             "menu" | "home" => self.go_home(),
+            // `:region <código>` — cambia SOLO la región del ambiente actual (mismo
+            // profile), reusando toda la maquinaria de `switch_env` (epoch + clients +
+            // recarga). Core agnóstico: no nombra ningún servicio. Cumple la promesa de
+            // "ambiente (cuenta + región) cambiable al instante" sin editar ~/.aws/config.
+            cmd if cmd == "region" || cmd.starts_with("region ") => {
+                let code = cmd.strip_prefix("region").unwrap_or("").trim();
+                if code.is_empty() {
+                    self.set_error("uso: :region <código>  (p. ej. :region eu-west-1)");
+                } else {
+                    self.dispatch(Action::SwitchEnv(Env::new(self.env.profile.clone(), code)));
+                }
+            }
             // No es core: ofrécelo a la vista activa (p. ej. `logs` con `:since 2d`).
             // Si la vista no lo reclama (Vec vacío), trátalo como id de vista.
             other => {
@@ -1412,6 +1424,26 @@ mod tests {
         app.dispatch(Action::SwitchEnv(Env::new("prod", "eu-west-1")));
         assert_eq!(app.epoch, 1);
         assert_eq!(app.env, Env::new("prod", "eu-west-1"));
+    }
+
+    #[test]
+    fn region_command_switches_region_keeping_profile() {
+        let mut app = test_app(); // dev · us-east-1
+        type_command(&mut app, "region eu-west-1");
+        assert_eq!(app.epoch, 1, "reusa switch_env (sube epoch)");
+        assert_eq!(
+            app.env,
+            Env::new("dev", "eu-west-1"),
+            "mismo profile, otra región"
+        );
+    }
+
+    #[test]
+    fn region_command_without_arg_is_a_usage_error() {
+        let mut app = test_app();
+        type_command(&mut app, "region");
+        assert_eq!(app.epoch, 0, "no cambia de ambiente");
+        assert!(app.status.as_ref().is_some_and(|s| s.error), "muestra uso");
     }
 
     #[test]

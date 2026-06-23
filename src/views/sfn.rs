@@ -667,7 +667,7 @@ impl View for SfnView {
                     self.loading = true;
                 }
             }
-            Message::Error(_) => self.loading = false,
+            Message::Error { .. } => self.loading = false,
             // Mensajes de otras vistas: se ignoran.
             _ => {}
         }

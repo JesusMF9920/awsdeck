@@ -828,7 +828,7 @@ impl View for LogsView {
                 }
             }
             // El App ya muestra el error en la status bar; aquí cortamos el loading.
-            Message::Error(_) => self.loading = false,
+            Message::Error { .. } => self.loading = false,
             // Mensajes de otras vistas (p. ej. SQS): se ignoran.
             _ => {}
         }

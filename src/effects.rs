@@ -15,9 +15,9 @@ use tokio::sync::mpsc;
 use crate::action::{Action, ConsoleTarget};
 use crate::aws::context::{AwsContext, Env};
 use crate::message::{
-    Envelope, EventBusDto, ExecStatus, ExecutionDetailDto, ExecutionDto, LogEventDto, LogGroupDto,
-    LogStreamDto, LogWindow, MachineType, Message, QueueAttrsDto, QueueDto, QueueMessageDto,
-    RuleDetailDto, RuleDto, RuleState, StateMachineDto, StateSpanDto, TargetDto,
+    Envelope, ErrorKind, EventBusDto, ExecStatus, ExecutionDetailDto, ExecutionDto, LogEventDto,
+    LogGroupDto, LogStreamDto, LogWindow, MachineType, Message, QueueAttrsDto, QueueDto,
+    QueueMessageDto, RuleDetailDto, RuleDto, RuleState, StateMachineDto, StateSpanDto, TargetDto,
 };
 use crate::util::case_variants;
 
@@ -77,7 +77,7 @@ impl Effects {
         tokio::spawn(async move {
             let opened = tokio::task::spawn_blocking(move || open::that(url)).await;
             if !matches!(opened, Ok(Ok(()))) {
-                let msg = Message::Error("no se pudo abrir el navegador".into());
+                let msg = Message::err("no se pudo abrir el navegador");
                 let _ = tx.send(Envelope::new(epoch, msg)).await;
             }
         });
@@ -152,7 +152,7 @@ impl Effects {
                             query,
                             more,
                         },
-                        Err(e) => Message::Error(format!("describe_log_groups: {e}")),
+                        Err(e) => sdk_error("describe_log_groups", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -176,7 +176,7 @@ impl Effects {
                 tokio::spawn(async move {
                     let msg = match fetch_log_streams(&ctx, &group).await {
                         Ok(streams) => Message::LogStreamsLoaded { group, streams },
-                        Err(e) => Message::Error(format!("describe_log_streams: {e}")),
+                        Err(e) => sdk_error("describe_log_streams", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -210,7 +210,7 @@ impl Effects {
                             events,
                             more,
                         },
-                        Err(e) => Message::Error(format!("get_log_events: {e}")),
+                        Err(e) => sdk_error("get_log_events", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -258,7 +258,7 @@ impl Effects {
                             append,
                             generation,
                         },
-                        Err(e) => Message::Error(format!("filter_log_events: {e}")),
+                        Err(e) => sdk_error("filter_log_events", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -282,7 +282,7 @@ impl Effects {
                 tokio::spawn(async move {
                     let msg = match fetch_queues(&ctx).await {
                         Ok(queues) => Message::QueuesLoaded(queues),
-                        Err(e) => Message::Error(format!("list_queues: {e}")),
+                        Err(e) => sdk_error("list_queues", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -314,7 +314,7 @@ impl Effects {
                             attrs,
                             messages,
                         },
-                        Err(e) => Message::Error(format!("queue detail: {e}")),
+                        Err(e) => sdk_error("queue detail", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -337,7 +337,7 @@ impl Effects {
                 tokio::spawn(async move {
                     let msg = match purge_queue_real(&ctx, &queue_url).await {
                         Ok(()) => Message::QueuePurged { queue_url },
-                        Err(e) => Message::Error(format!("purge_queue: {e}")),
+                        Err(e) => sdk_error("purge_queue", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -366,7 +366,7 @@ impl Effects {
                 tokio::spawn(async move {
                     let msg = match fetch_state_machines(&ctx).await {
                         Ok((machines, more)) => Message::StateMachinesLoaded { machines, more },
-                        Err(e) => Message::Error(format!("list_state_machines: {e}")),
+                        Err(e) => sdk_error("list_state_machines", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -398,7 +398,7 @@ impl Effects {
                             executions,
                             more,
                         },
-                        Err(e) => Message::Error(format!("list_executions: {e}")),
+                        Err(e) => sdk_error("list_executions", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -432,7 +432,7 @@ impl Effects {
                             history,
                             failed_state,
                         },
-                        Err(e) => Message::Error(format!("execution detail: {e}")),
+                        Err(e) => sdk_error("execution detail", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -455,7 +455,7 @@ impl Effects {
                 tokio::spawn(async move {
                     let msg = match redrive_execution_real(&ctx, &execution_arn).await {
                         Ok(()) => Message::ExecutionRedriven { execution_arn },
-                        Err(e) => Message::Error(format!("redrive_execution: {e}")),
+                        Err(e) => sdk_error("redrive_execution", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -484,7 +484,7 @@ impl Effects {
                 tokio::spawn(async move {
                     let msg = match fetch_event_buses(&ctx).await {
                         Ok((buses, more)) => Message::EventBusesLoaded { buses, more },
-                        Err(e) => Message::Error(format!("list_event_buses: {e}")),
+                        Err(e) => sdk_error("list_event_buses", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -516,7 +516,7 @@ impl Effects {
                             rules,
                             more,
                         },
-                        Err(e) => Message::Error(format!("list_rules: {e}")),
+                        Err(e) => sdk_error("list_rules", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -550,7 +550,7 @@ impl Effects {
                             detail,
                             targets,
                         },
-                        Err(e) => Message::Error(format!("rule detail: {e}")),
+                        Err(e) => sdk_error("rule detail", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -573,13 +573,34 @@ impl Effects {
                 tokio::spawn(async move {
                     let msg = match send_event_real(&ctx, &event_bus_name).await {
                         Ok(()) => Message::EventSent { event_bus_name },
-                        Err(e) => Message::Error(format!("put_events: {e}")),
+                        Err(e) => sdk_error("put_events", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
             }
         }
     }
+}
+
+/// Traduce un error del SDK (ya aplanado a `Report` por el `?`) en un
+/// `Message::Error` **clasificado y accionable**. Recorre toda la cadena de causas
+/// —el `SdkError` esconde el code/message reales (ExpiredToken, AccessDenied,
+/// Throttling…) en `source()`, no en su `Display` de tope— y la pasa por
+/// `ErrorKind::classify`. Con hint (Auth/AccessDenied/Throttle/Network) se muestra
+/// la pista accionable; sin hint, el detalle crudo. Única frontera con el SDK: el
+/// resto de la app solo ve el `Message` plano.
+fn sdk_error(op: &str, e: &color_eyre::eyre::Report) -> Message {
+    let chain = e
+        .chain()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(": ");
+    let kind = ErrorKind::classify(&chain);
+    let detail = match kind.hint() {
+        Some(hint) => format!("{op}: {hint}"),
+        None => format!("{op}: {chain}"),
+    };
+    Message::Error { kind, detail }
 }
 
 // --- Consola AWS (URLs) -------------------------------------------------------

@@ -226,6 +226,88 @@ pub struct TargetDto {
     pub input: Option<String>,
 }
 
+/// Clase de un error, derivada del fallo del SDK en `effects`. **No nombra
+/// servicios**: el core (`app.rs`) puede ramificar sobre ella sin dejar de ser
+/// agnóstico (mostrar un hint de re-auth, marcar un transitorio como reintentable…).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// Credenciales/sesión caducadas o ausentes (SSO/STS). Acción: re-autenticar.
+    Auth,
+    /// Permiso IAM faltante para la operación.
+    AccessDenied,
+    /// El servicio está limitando la tasa (throttling). Transitorio.
+    Throttle,
+    /// Fallo de red/conexión/timeout. Transitorio.
+    Network,
+    /// Cualquier otro fallo.
+    Other,
+}
+
+impl ErrorKind {
+    /// Clasifica por palabras clave a partir de la **cadena de causas** del error
+    /// del SDK (que aplana code/message en `source()`). Insensible a mayúsculas.
+    /// Heurística a propósito: el `SdkError` ya viene aplanado a `String` cuando
+    /// llega aquí, así que no hay tipo sobre el cual hacer match exacto.
+    pub fn classify(chain: &str) -> Self {
+        let c = chain.to_ascii_lowercase();
+        let has = |needles: &[&str]| needles.iter().any(|n| c.contains(n));
+        if has(&[
+            "expiredtoken",
+            "expired",
+            "the sso session",
+            "session associated",
+            "unrecognizedclient",
+            "invalidclienttokenid",
+            "no credentials",
+            "credentials were not",
+            "could not load credentials",
+            "unable to load credentials",
+        ]) {
+            Self::Auth
+        } else if has(&[
+            "accessdenied",
+            "not authorized",
+            "is not authorized to perform",
+        ]) {
+            Self::AccessDenied
+        } else if has(&["throttl", "toomanyrequests", "rate exceeded", "slowdown"]) {
+            Self::Throttle
+        } else if has(&[
+            "dispatch failure",
+            "timeout",
+            "timed out",
+            "connect",
+            "dns",
+            "io error",
+        ]) {
+            Self::Network
+        } else {
+            Self::Other
+        }
+    }
+
+    /// Pista accionable para la status bar (lo no-obvio de cómo recuperarse).
+    /// `None` = sin pista; se muestra el detalle crudo del SDK.
+    pub fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::Auth => Some(
+                "sesión/credenciales caducadas — corre `aws sso login` o cambia de perfil con ctrl-e",
+            ),
+            Self::AccessDenied => Some("falta permiso IAM para esta operación"),
+            Self::Throttle => Some("throttling del servicio — reintenta con r"),
+            Self::Network => Some("problema de red — reintenta con r"),
+            Self::Other => None,
+        }
+    }
+
+    /// Transitorios: tiene sentido reintentar (`r`) sin cambiar nada. Reservado para
+    /// el reintento automático de transitorios (P1); hoy el hint ya invita a `r`.
+    #[allow(dead_code)]
+    pub fn retryable(self) -> bool {
+        matches!(self, Self::Throttle | Self::Network)
+    }
+}
+
 /// Resultado de una operación async. Específico de servicio a propósito
 /// (`message.rs` es frontera permitida para nombrar servicios).
 #[derive(Clone, Debug)]
@@ -324,8 +406,21 @@ pub enum Message {
     /// Se publicó un evento de prueba en un bus (acción mutante confirmada).
     EventSent { event_bus_name: String },
 
-    /// Algo falló: se muestra en la status bar, nunca hace panic.
-    Error(String),
+    /// Algo falló: se muestra en la status bar, nunca hace panic. `kind` clasifica
+    /// el fallo (para que el core ofrezca recuperación —p. ej. una pista de re-auth—
+    /// sin nombrar servicios) y `detail` es el texto ya listo para pintar (incluye el
+    /// hint si aplica). Si es transitorio se deriva de `kind.retryable()`.
+    Error { kind: ErrorKind, detail: String },
+}
+
+impl Message {
+    /// Error genérico no-SDK (clipboard, navegador, …): `ErrorKind::Other`.
+    pub fn err(detail: impl Into<String>) -> Self {
+        Self::Error {
+            kind: ErrorKind::Other,
+            detail: detail.into(),
+        }
+    }
 }
 
 /// Sobre con el que viaja cada `Message`: lleva el `epoch` del `Env` que lanzó la
@@ -339,5 +434,79 @@ pub struct Envelope {
 impl Envelope {
     pub fn new(epoch: u64, message: Message) -> Self {
         Self { epoch, message }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_maps_common_sdk_failures() {
+        use ErrorKind::*;
+        // Cadenas representativas de la causa real (lo que vive en source()).
+        assert_eq!(
+            ErrorKind::classify(
+                "ExpiredTokenException: the security token included in the request is expired"
+            ),
+            Auth
+        );
+        assert_eq!(
+            ErrorKind::classify("the SSO session associated with this profile has expired"),
+            Auth
+        );
+        assert_eq!(
+            ErrorKind::classify(
+                "UnrecognizedClientException: The security token included in the request is invalid"
+            ),
+            Auth
+        );
+        assert_eq!(
+            ErrorKind::classify("dispatch failure: could not load credentials"),
+            Auth
+        );
+        assert_eq!(
+            ErrorKind::classify(
+                "AccessDeniedException: User is not authorized to perform: logs:DescribeLogGroups"
+            ),
+            AccessDenied
+        );
+        assert_eq!(
+            ErrorKind::classify("ThrottlingException: Rate exceeded"),
+            Throttle
+        );
+        assert_eq!(ErrorKind::classify("TooManyRequestsException"), Throttle);
+        assert_eq!(
+            ErrorKind::classify("dispatch failure: timeout while connecting"),
+            Network
+        );
+        assert_eq!(
+            ErrorKind::classify("ValidationException: invalid pattern"),
+            Other
+        );
+    }
+
+    #[test]
+    fn hint_and_retryable_are_consistent() {
+        assert!(ErrorKind::Auth.hint().is_some());
+        assert!(ErrorKind::AccessDenied.hint().is_some());
+        assert!(ErrorKind::Other.hint().is_none());
+        // Solo los transitorios invitan a reintentar.
+        assert!(ErrorKind::Throttle.retryable());
+        assert!(ErrorKind::Network.retryable());
+        assert!(!ErrorKind::Auth.retryable());
+        assert!(!ErrorKind::Other.retryable());
+    }
+
+    #[test]
+    fn err_constructor_is_other() {
+        match Message::err("boom") {
+            Message::Error { kind, detail } => {
+                assert_eq!(kind, ErrorKind::Other);
+                assert_eq!(detail, "boom");
+                assert!(!kind.retryable());
+            }
+            _ => panic!("debe ser Error"),
+        }
     }
 }

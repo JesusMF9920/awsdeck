@@ -11,16 +11,28 @@ use crate::aws::context::Env;
 
 /// Dibuja la barra superior: `awsdeck · <título>` a la izquierda y el ambiente
 /// activo a la derecha, separados por relleno calculado al ancho del área.
-pub fn render(frame: &mut Frame, area: Rect, env: &Env, title: &str, write_mode: bool) {
+/// `auth_warning` añade una pista persistente `[re-auth]` cuando la sesión/credenciales
+/// caducaron (el `App` la deriva del último error sin nombrar ningún servicio).
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    env: &Env,
+    title: &str,
+    write_mode: bool,
+    auth_warning: bool,
+) {
+    let auth = if auth_warning { "[re-auth] " } else { "" };
     let badge = if write_mode { "[ESCRITURA] " } else { "" };
     let left = format!(" awsdeck · {title}");
     let right = format!("{env} ");
 
     let width = area.width as usize;
-    let used = badge.chars().count() + left.chars().count() + right.chars().count();
+    let used =
+        auth.chars().count() + badge.chars().count() + left.chars().count() + right.chars().count();
     let pad = width.saturating_sub(used);
 
     let line = Line::from(vec![
+        Span::styled(auth, Style::new().red().bold()),
         Span::styled(badge, Style::new().red().bold()),
         Span::styled(left, Style::new().bold()),
         Span::raw(" ".repeat(pad)),

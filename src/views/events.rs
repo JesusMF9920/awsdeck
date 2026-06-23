@@ -504,7 +504,7 @@ impl View for EventsView {
                 }
             }
             // El App muestra el error en la status bar; aquí cortamos el loading.
-            Message::Error(_) => self.loading = false,
+            Message::Error { .. } => self.loading = false,
             // EventSent y mensajes de otras vistas: el App ya muestra la info.
             _ => {}
         }

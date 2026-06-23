@@ -23,7 +23,7 @@ use tui_input::backend::crossterm::EventHandler;
 use crate::action::{Action, ViewContext};
 use crate::aws::context::{Env, ProfileEntry, list_profiles};
 use crate::effects::Effects;
-use crate::message::{Envelope, Message};
+use crate::message::{Envelope, ErrorKind, Message};
 use crate::ui::{command_bar, confirm, header, help, picker};
 use crate::views::Registry;
 
@@ -115,6 +115,11 @@ pub struct App {
     /// Filtro aplicado a la vista activa (espejo, para mostrarlo en modo normal).
     filter: String,
     status: Option<StatusLine>,
+    /// Clase del último error mostrado (lo puebla `Message::Error`). Habilita una
+    /// pista persistente de recuperación en el header (p. ej. `[re-auth]` ante una
+    /// sesión SSO caducada) sin que el core nombre ningún servicio. `None` = no hay
+    /// error vigente; se limpia al llegar data fresca o al cambiar de ambiente.
+    error_kind: Option<ErrorKind>,
     show_help: bool,
     picker: Option<Picker>,
     /// Modal de confirmación de una acción mutante (gate prod-safe).
@@ -148,6 +153,7 @@ impl App {
             input: Input::default(),
             filter: String::new(),
             status: None,
+            error_kind: None,
             show_help: false,
             picker: None,
             confirm: None,
@@ -223,8 +229,12 @@ impl App {
     // --- Routing --------------------------------------------------------------
 
     fn on_key(&mut self, key: KeyEvent) {
-        // Cualquier tecla limpia el estado transitorio.
-        self.status = None;
+        // El info transitorio se limpia con cualquier tecla; un **error sí persiste**
+        // (hay que poder leerlo y guía la recuperación). Se descarta con `esc`, con
+        // data fresca (`on_envelope`) o al cambiar de ambiente.
+        if !self.status.as_ref().is_some_and(|s| s.error) {
+            self.status = None;
+        }
         // Los overlays interceptan primero; el confirm tiene máxima precedencia.
         if self.confirm.is_some() {
             self.on_confirm_key(key);
@@ -263,6 +273,7 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => self.menu_select_edge(false),
             KeyCode::Char('G') | KeyCode::End => self.menu_select_edge(true),
             KeyCode::Enter => self.menu_activate(),
+            KeyCode::Esc if self.status.as_ref().is_some_and(|s| s.error) => self.clear_error(),
             _ => {}
         }
     }
@@ -310,6 +321,11 @@ impl App {
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('e') if ctrl => self.open_picker(),
             KeyCode::Backspace => self.go_home(),
+            // Etapa 0 de `esc`: si hay un error pegajoso en pantalla, el primer `esc`
+            // solo lo descarta (y se queda donde estás). La vista no ve este esc.
+            KeyCode::Esc if self.status.as_ref().is_some_and(|s| s.error) => {
+                self.clear_error();
+            }
             // Primera etapa (estilo k9s): `esc` con filtro aplicado lo limpia y se
             // queda en la vista; un segundo `esc` (ya sin filtro) deja que la vista
             // suba de nivel y, desde la raíz, vuelva al menú. La vista no ve este esc.
@@ -489,6 +505,12 @@ impl App {
     pub fn start_with_env_picker(&mut self) {
         let profiles = list_profiles();
         if profiles.is_empty() {
+            // Sin profiles caemos al default; avísalo (si no, el primer load falla con
+            // un error opaco y el usuario no sabe que falta configurar `~/.aws/config`).
+            self.set_info(format!(
+                "sin profiles en ~/.aws/config — usando {} · ctrl-e para cambiar",
+                self.env
+            ));
             return;
         }
         let mut picker = Picker::new(profiles);
@@ -583,8 +605,16 @@ impl App {
         if envelope.epoch != self.epoch {
             return;
         }
+        // Data o confirmación fresca: descarta cualquier error pegajoso anterior (el
+        // ambiente respondió, la pista de recuperación ya no aplica).
+        if !matches!(envelope.message, Message::Error { .. }) {
+            self.clear_error();
+        }
         match &envelope.message {
-            Message::Error(e) => self.set_error(e.clone()),
+            Message::Error { detail, kind } => {
+                self.set_error(detail.clone());
+                self.error_kind = Some(*kind);
+            }
             Message::QueuePurged { .. } => self.set_info("cola purgada — refrescando…"),
             Message::ExecutionRedriven { .. } => self.set_info("redrive enviado — refrescando…"),
             Message::EventSent { event_bus_name } => {
@@ -707,6 +737,9 @@ impl App {
             error: true,
             text: text.into(),
         });
+        // Por defecto un error no es específicamente de auth; el path tipado
+        // (`Message::Error`) sobreescribe `error_kind` con la clase real.
+        self.error_kind = Some(ErrorKind::Other);
     }
 
     fn set_info(&mut self, text: impl Into<String>) {
@@ -714,6 +747,15 @@ impl App {
             error: false,
             text: text.into(),
         });
+        self.error_kind = None;
+    }
+
+    /// Descarta el error pegajoso vigente (si lo hay) y su pista de recuperación.
+    fn clear_error(&mut self) {
+        if self.status.as_ref().is_some_and(|s| s.error) {
+            self.status = None;
+        }
+        self.error_kind = None;
     }
 
     // --- Render ---------------------------------------------------------------
@@ -735,7 +777,15 @@ impl App {
                 .map(|v| v.title())
                 .unwrap_or_else(|| "—".to_string()),
         };
-        header::render(frame, header_area, &self.env, &title, self.write_mode);
+        let auth_warning = self.error_kind == Some(ErrorKind::Auth);
+        header::render(
+            frame,
+            header_area,
+            &self.env,
+            &title,
+            self.write_mode,
+            auth_warning,
+        );
 
         match self.screen {
             Screen::Menu => self.render_menu(frame, body_area),
@@ -1307,6 +1357,55 @@ mod tests {
     }
 
     #[test]
+    fn sticky_error_survives_navigation_and_clears_on_fresh_data() {
+        let (mut app, _act, _keys) = app_with_counting_view();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // entra a la vista
+        // Error tipado de auth (epoch vigente 0).
+        app.on_envelope(Envelope::new(
+            0,
+            Message::Error {
+                kind: ErrorKind::Auth,
+                detail: "list_queues: sesión caducada".into(),
+            },
+        ));
+        assert!(app.status.as_ref().is_some_and(|s| s.error));
+        assert_eq!(app.error_kind, Some(ErrorKind::Auth));
+
+        // Una tecla de navegación NO borra el error (debe poder leerse).
+        app.on_key(ch('j'));
+        assert!(
+            app.status.as_ref().is_some_and(|s| s.error),
+            "el error persiste tras navegar"
+        );
+        assert_eq!(
+            app.error_kind,
+            Some(ErrorKind::Auth),
+            "y la pista de re-auth del header también"
+        );
+
+        // Data fresca del ambiente lo descarta (ya respondió; el hint no aplica).
+        app.on_envelope(Envelope::new(0, Message::QueuesLoaded(vec![])));
+        assert!(app.status.is_none(), "data fresca limpia el error pegajoso");
+        assert_eq!(app.error_kind, None);
+    }
+
+    #[test]
+    fn esc_dismisses_sticky_error_without_forwarding() {
+        let (mut app, _act, keys) = app_with_counting_view();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // entra a la vista
+        app.on_envelope(Envelope::new(0, Message::err("boom")));
+        let keys_before = keys.get();
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.status.is_none(), "el primer esc descarta el error");
+        assert_eq!(
+            keys.get(),
+            keys_before,
+            "y NO reenvía ese esc a la vista (etapa 0)"
+        );
+    }
+
+    #[test]
     fn switch_env_bumps_epoch_and_updates_env() {
         let mut app = test_app();
         assert_eq!(app.epoch, 0);
@@ -1322,14 +1421,14 @@ mod tests {
         app.status = None;
 
         // Respuesta con epoch viejo (0): se descarta, no pinta nada.
-        app.on_envelope(Envelope::new(0, Message::Error("cuenta anterior".into())));
+        app.on_envelope(Envelope::new(0, Message::err("cuenta anterior")));
         assert!(
             app.status.is_none(),
             "el envelope stale no debe pintar nada"
         );
 
         // Respuesta con el epoch vigente (1): sí se muestra.
-        app.on_envelope(Envelope::new(1, Message::Error("error real".into())));
+        app.on_envelope(Envelope::new(1, Message::err("error real")));
         let status = app.status.as_ref().expect("el envelope vigente sí pinta");
         assert!(status.error && status.text.contains("error real"));
     }

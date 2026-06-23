@@ -354,7 +354,7 @@ impl View for SqsView {
                     self.loading = true;
                 }
             }
-            Message::Error(_) => self.loading = false,
+            Message::Error { .. } => self.loading = false,
             // Mensajes de otras vistas (p. ej. logs): se ignoran.
             _ => {}
         }

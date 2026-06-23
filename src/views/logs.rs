@@ -65,8 +65,9 @@ pub struct LogsView {
     filtered: Vec<usize>,
     filter: String,
     loading: bool,
-    /// Patrón server-side activo del **tail** (`filter_pattern`); `None` = sin filtro.
-    /// (Los groups filtran 100% local, no usan este campo.)
+    /// Última query server-side enviada: subcadena de groups (`logGroupNamePattern`) o
+    /// `filter_pattern` del tail. `None` = sin filtro. Guard "latest wins": se descartan
+    /// respuestas cuya query no coincide.
     last_query: Option<String>,
     /// `true` si el servidor tiene más groups que los traídos (next_token).
     partial: bool,
@@ -454,16 +455,22 @@ impl LogsView {
                 self.loading = false;
                 vec![]
             }
-            // Streams/Tail → Groups. Los groups ya están completos en cache (carga
-            // sin filtro server-side), así que volver no recarga: solo cambia de nivel.
+            // Streams/Tail → Groups. Si veníamos de una búsqueda server-side, la cache
+            // de groups está acotada a esa query → recargamos la 1ª página completa.
+            // Sin búsqueda previa, los groups siguen en cache.
             Level::Streams { .. } | Level::Tail { .. } => {
                 self.level = Level::Groups;
                 self.tail_live = false; // salir del tail apaga el seguimiento
                 self.recompute_filtered();
                 self.state.select(Some(0));
                 self.clamp_selection();
-                self.loading = false;
-                vec![]
+                if self.last_query.take().is_some() {
+                    self.loading = true;
+                    vec![Action::LoadLogGroups { query: None }]
+                } else {
+                    self.loading = false;
+                    vec![]
+                }
             }
             Level::Groups => vec![Action::Back],
         }
@@ -479,8 +486,10 @@ impl LogsView {
         }
         self.loading = true;
         match &self.level {
-            // Recargar la lista completa de groups.
-            Level::Groups => vec![Action::LoadLogGroups],
+            // Recargar la página actual (misma query si hay una búsqueda activa).
+            Level::Groups => vec![Action::LoadLogGroups {
+                query: self.last_query.clone(),
+            }],
             Level::Streams { group } => vec![Action::LoadLogStreams {
                 group: group.clone(),
             }],
@@ -523,7 +532,7 @@ impl LogsView {
             ""
         } else {
             match self.level {
-                Level::Groups => " · parcial (tope de páginas)",
+                Level::Groups => " · parcial (/ busca server-side)",
                 Level::Events { .. } => " · parcial (más viejas arriba)",
                 Level::Tail { .. } => " · parcial · o: cargar más",
                 Level::Streams { .. } => "",
@@ -653,7 +662,7 @@ impl View for LogsView {
         self.tail_preset = self.default_preset;
         self.tail_window = LogWindow::Last(WINDOW_PRESETS[self.default_preset].1);
         self.state.select(Some(0));
-        vec![Action::LoadLogGroups]
+        vec![Action::LoadLogGroups { query: None }]
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -712,7 +721,15 @@ impl View for LogsView {
 
     fn on_message(&mut self, message: &Message) {
         match message {
-            Message::LogGroupsLoaded { groups, more } => {
+            Message::LogGroupsLoaded {
+                groups,
+                query,
+                more,
+            } => {
+                // Guard "latest wins": descartar respuestas de búsquedas viejas.
+                if query != &self.last_query {
+                    return;
+                }
                 // Capturar la selección ANTES de reemplazar, para preservarla por
                 // nombre y no pisar la navegación del usuario con la recarga async.
                 let keep = self.selected_group_name();
@@ -800,12 +817,17 @@ impl View for LogsView {
     }
 
     fn search(&mut self, query: &str) -> Vec<Action> {
-        // Solo el tail busca server-side (filter_pattern). Groups (y los demás
-        // niveles) filtran local: groups con fuzzy sobre el cache completo.
+        // Búsqueda server-side por subcadena: en groups (`logGroupNamePattern`) y en el
+        // tail del group (`filter_pattern`). El fuzzy local rankea lo devuelto. En los
+        // demás niveles, `/` filtra local.
         match &self.level {
-            // Groups filtra 100% local (fuzzy sobre el cache completo): no consulta al
-            // server. El tail sí busca server-side (filter_pattern).
-            Level::Groups => Vec::new(),
+            Level::Groups => {
+                self.last_query = (!query.is_empty()).then(|| query.to_string());
+                self.loading = true;
+                vec![Action::LoadLogGroups {
+                    query: self.last_query.clone(),
+                }]
+            }
             Level::Tail { .. } => {
                 self.last_query = (!query.is_empty()).then(|| query.to_string());
                 self.set_events(Vec::new());
@@ -1057,10 +1079,11 @@ mod tests {
         }
     }
 
-    /// Construye un `LogGroupsLoaded` para los tests.
+    /// Construye un `LogGroupsLoaded` sin query (página inicial), para los tests.
     fn loaded(groups: Vec<LogGroupDto>) -> Message {
         Message::LogGroupsLoaded {
             groups,
+            query: None,
             more: false,
         }
     }
@@ -1672,7 +1695,10 @@ mod tests {
     fn activate_requests_log_groups() {
         let mut v = LogsView::new();
         let actions = v.on_activate();
-        assert!(matches!(actions.as_slice(), [Action::LoadLogGroups]));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::LoadLogGroups { query: None }]
+        ));
     }
 
     #[test]
@@ -1712,30 +1738,56 @@ mod tests {
     }
 
     #[test]
-    fn groups_search_is_local_not_server_side() {
+    fn groups_search_is_server_side() {
         let mut v = LogsView::new();
         v.on_message(&loaded(vec![group("/svc")]));
-        // En groups, `search` ya no consulta al server: el filtrado es 100% local.
-        assert!(
-            v.search("xy").is_empty(),
-            "groups filtra local; no emite LoadLogGroups"
-        );
+        // En groups, `/` busca server-side por subcadena (sin cargar todo): emite
+        // LoadLogGroups con la query (la trae sin el prefijo, p. ej. `CreateOrder`).
+        match v.search("CreateOrder").as_slice() {
+            [Action::LoadLogGroups { query: Some(q) }] => assert_eq!(q, "CreateOrder"),
+            other => panic!("se esperaba LoadLogGroups server-side, llegó {other:?}"),
+        }
     }
 
     #[test]
-    fn local_fuzzy_finds_substring_without_prefix() {
+    fn discards_stale_search_results() {
         let mut v = LogsView::new();
+        // La vista pide la búsqueda "xy" (last_query = Some("xy")).
+        let actions = v.search("xy");
+        assert!(
+            matches!(actions.as_slice(), [Action::LoadLogGroups { query: Some(q) }] if q == "xy")
+        );
+        // Llega una respuesta de una búsqueda VIEJA ("x") → se descarta (latest wins).
+        v.on_message(&Message::LogGroupsLoaded {
+            groups: vec![group("/vieja")],
+            query: Some("x".into()),
+            more: false,
+        });
+        assert_eq!(v.visible_len(), 0, "respuesta de búsqueda vieja descartada");
+        // Llega la respuesta de la búsqueda vigente ("xy") → se acepta.
+        v.on_message(&Message::LogGroupsLoaded {
+            groups: vec![group("/aws/xy-thing")],
+            query: Some("xy".into()),
+            more: true,
+        });
+        assert_eq!(v.visible_len(), 1);
+        assert!(v.partial, "more=true marca la lista como parcial");
+    }
+
+    #[test]
+    fn local_fuzzy_ranks_returned_page() {
+        let mut v = LogsView::new();
+        // El server ya devolvió los matches por subcadena; el fuzzy local rankea/refina
+        // sobre esa página (case-insensitive), sin necesidad del prefijo.
         v.on_message(&loaded(vec![
             group("/aws/lambda/orders-service-staging-CreateOrderV3"),
             group("/aws/lambda/payments-worker"),
             group("/ecs/checkout"),
         ]));
-        // El caso del usuario: teclear `CreateOrder` (subcadena, sin el prefijo largo).
         v.set_filter("CreateOrder");
-        assert_eq!(v.visible_len(), 1, "encuentra el group por subcadena");
+        assert_eq!(v.visible_len(), 1, "rankea por subcadena sobre lo cargado");
         let first = v.filtered_group_indices()[0];
         assert!(v.groups[first].name.ends_with("CreateOrderV3"));
-        // Y case-insensitive: lo mismo en minúsculas.
         v.set_filter("createorder");
         assert_eq!(v.visible_len(), 1, "el fuzzy local es case-insensitive");
     }

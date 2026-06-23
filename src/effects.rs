@@ -86,7 +86,7 @@ impl Effects {
     /// bloquea el render). Las `Action` core las maneja el `App`.
     pub fn dispatch(&self, action: Action, epoch: u64) {
         match action {
-            Action::LoadLogGroups => self.load_log_groups(epoch),
+            Action::LoadLogGroups { query } => self.load_log_groups(query, epoch),
             Action::LoadLogStreams { group } => self.load_log_streams(group, epoch),
             Action::LoadLogEvents { group, stream } => self.load_log_events(group, stream, epoch),
             Action::LoadLogTail {
@@ -124,7 +124,7 @@ impl Effects {
         }
     }
 
-    fn load_log_groups(&self, epoch: u64) {
+    fn load_log_groups(&self, query: Option<String>, epoch: u64) {
         let tx = self.tx.clone();
         match &self.backend {
             Backend::Mock(env) => {
@@ -134,7 +134,8 @@ impl Effects {
                     // epoch guard (cambiar de ambiente con un request en vuelo).
                     tokio::time::sleep(Duration::from_millis(600)).await;
                     let msg = Message::LogGroupsLoaded {
-                        groups: mock_log_groups(&env),
+                        groups: mock_log_groups(&env, query.as_deref()),
+                        query,
                         more: false,
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
@@ -143,8 +144,12 @@ impl Effects {
             Backend::Real(ctx) => {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    let msg = match fetch_log_groups(&ctx).await {
-                        Ok((groups, more)) => Message::LogGroupsLoaded { groups, more },
+                    let msg = match fetch_log_groups(&ctx, query.as_deref()).await {
+                        Ok((groups, more)) => Message::LogGroupsLoaded {
+                            groups,
+                            query,
+                            more,
+                        },
                         Err(e) => Message::Error(format!("describe_log_groups: {e}")),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
@@ -636,38 +641,31 @@ fn cw_encode(s: &str) -> String {
 /// Tope de páginas de `describe_log_groups` que juntamos por carga (auto-paginación).
 /// Espeja `MAX_MACHINE_PAGES`: 20 × 50 = 1000 groups, todos alcanzables por el fuzzy
 /// local. Si se topa, `more=true` (la vista muestra `· parcial`).
-const MAX_LOG_GROUP_PAGES: usize = 20;
-
-/// Todos los log groups del ambiente (paginados hasta `MAX_LOG_GROUP_PAGES`). Sin
-/// `logGroupNamePattern`: el filtrado es 100% local en la vista (fuzzy case-insensitive),
-/// como `sfn`/`events`. Devuelve `(groups, hay_más)`.
-async fn fetch_log_groups(ctx: &AwsContext) -> color_eyre::Result<(Vec<LogGroupDto>, bool)> {
+/// Una página acotada (≤50) de log groups. Con `pattern`, busca server-side por
+/// subcadena (`logGroupNamePattern`, infix, case-sensitive — NO lowercasear). La vista
+/// rankea con fuzzy local lo devuelto. Un solo round-trip (rápido a cualquier escala);
+/// `more=true` si el servidor tiene más (`next_token`). Nota: con pattern el SDK no
+/// devuelve `storedBytes`.
+async fn fetch_log_groups(
+    ctx: &AwsContext,
+    pattern: Option<&str>,
+) -> color_eyre::Result<(Vec<LogGroupDto>, bool)> {
     let client = ctx.logs().await;
-    let mut groups: Vec<LogGroupDto> = Vec::new();
-    let mut next: Option<String> = None;
-    let mut more = false;
-    for page in 0..MAX_LOG_GROUP_PAGES {
-        let out = client
-            .describe_log_groups()
-            .limit(50)
-            .set_next_token(next)
-            .send()
-            .await?;
-        groups.extend(out.log_groups().iter().map(|g| LogGroupDto {
+    let mut req = client.describe_log_groups().limit(50);
+    if let Some(p) = pattern {
+        req = req.log_group_name_pattern(p);
+    }
+    let out = req.send().await?;
+    let groups = out
+        .log_groups()
+        .iter()
+        .map(|g| LogGroupDto {
             name: g.log_group_name().unwrap_or_default().to_string(),
             stored_bytes: g.stored_bytes(),
             arn: g.arn().map(str::to_string),
-        }));
-        next = out.next_token().map(str::to_string);
-        if next.is_none() {
-            break;
-        }
-        // Última iteración con token aún presente: hay más de las que trajimos.
-        if page == MAX_LOG_GROUP_PAGES - 1 {
-            more = true;
-        }
-    }
-    Ok((groups, more))
+        })
+        .collect();
+    Ok((groups, out.next_token().is_some()))
 }
 
 async fn fetch_log_streams(ctx: &AwsContext, group: &str) -> color_eyre::Result<Vec<LogStreamDto>> {
@@ -1323,12 +1321,12 @@ fn is_failure_event(ev: &aws_sdk_sfn::types::HistoryEvent) -> bool {
 
 /// Log groups falsos del ambiente. Un par de nombres llevan el `profile` activo
 /// para que un cambio de ambiente sea visible en la lista.
-fn mock_log_groups(env: &Env) -> Vec<LogGroupDto> {
+fn mock_log_groups(env: &Env, query: Option<&str>) -> Vec<LogGroupDto> {
     let names = [
         format!("/aws/lambda/{}-orders-api", env.profile),
         format!("/aws/lambda/{}-payments-worker", env.profile),
-        // Nombre largo con prefijo: el fuzzy local debe encontrarlo tecleando solo
-        // `CreateOrder` (subcadena, sin el prefijo `orders-service-staging-`).
+        // Nombre largo con prefijo: la búsqueda server-side (substring) debe encontrarlo
+        // tecleando solo `CreateOrder` (sin el prefijo `orders-service-staging-`).
         "/aws/lambda/orders-service-staging-CreateOrderV3".to_string(),
         "/aws/lambda/notifications".to_string(),
         "/aws/apigateway/public-edge".to_string(),
@@ -1341,6 +1339,8 @@ fn mock_log_groups(env: &Env) -> Vec<LogGroupDto> {
     ];
     names
         .into_iter()
+        // Mimetiza el filtro server-side por subcadena (logGroupNamePattern).
+        .filter(|name| query.is_none_or(|q| name.contains(q)))
         .map(|name| {
             let stored = (name.len() as i64) * 7_919 % 5_000_000;
             let arn = format!(
@@ -1717,12 +1717,17 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
 
-        fx.dispatch(Action::LoadLogGroups, 7);
+        fx.dispatch(Action::LoadLogGroups { query: None }, 7);
 
         let envelope = rx.recv().await.expect("debe llegar un envelope");
         assert_eq!(envelope.epoch, 7, "el epoch se propaga al resultado");
         match envelope.message {
-            Message::LogGroupsLoaded { groups, more } => {
+            Message::LogGroupsLoaded {
+                groups,
+                query,
+                more,
+            } => {
+                assert!(query.is_none());
                 assert!(!more);
                 assert!(!groups.is_empty());
                 assert!(
@@ -1772,23 +1777,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mock_log_groups_returns_full_set_for_local_filtering() {
+    async fn mock_log_groups_search_filters_by_substring() {
         let (tx, mut rx) = mpsc::channel(8);
         let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
 
-        // Ya no hay filtro server-side: el mock devuelve TODO el set (la vista filtra
-        // local). Debe incluir el group de nombre largo del caso del usuario.
-        fx.dispatch(Action::LoadLogGroups, 9);
+        // Búsqueda server-side por subcadena: `CreateOrder` (sin el prefijo) trae el
+        // group de nombre largo, y el `query` se ecoa para el guard "latest wins".
+        fx.dispatch(
+            Action::LoadLogGroups {
+                query: Some("CreateOrder".into()),
+            },
+            9,
+        );
 
         let envelope = rx.recv().await.expect("debe llegar un envelope");
         assert_eq!(envelope.epoch, 9);
         match envelope.message {
-            Message::LogGroupsLoaded { groups, more } => {
+            Message::LogGroupsLoaded {
+                groups,
+                query,
+                more,
+            } => {
+                assert_eq!(query.as_deref(), Some("CreateOrder"), "el query se ecoa");
                 assert!(!more);
                 assert!(
-                    groups.iter().any(|g| g.name.contains("CreateOrderV3")),
-                    "el set completo incluye el group con prefijo largo"
+                    groups.iter().all(|g| g.name.contains("CreateOrder")),
+                    "el mock filtra por subcadena como el server"
                 );
+                assert!(groups.iter().any(|g| g.name.contains("CreateOrderV3")));
             }
             other => panic!("mensaje inesperado: {other:?}"),
         }

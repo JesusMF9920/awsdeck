@@ -386,12 +386,14 @@ pub enum Message {
     },
     /// Detalle de una ejecución (`describe_execution` + history ya parseado).
     /// `execution_arn` permite a la vista confirmar el drill actual; `failed_state`
-    /// es el estado que reventó (si lo hay), para saltar/resaltar.
+    /// es el estado que reventó (si lo hay), para saltar/resaltar. `history_more` = se
+    /// topó el tope de paginación del history (>~10k eventos): la vista muestra `· parcial`.
     ExecutionDetailLoaded {
         execution_arn: String,
         detail: ExecutionDetailDto,
         history: Vec<StateSpanDto>,
         failed_state: Option<String>,
+        history_more: bool,
     },
     /// Se relanzó una ejecución vía redrive (acción mutante confirmada).
     ExecutionRedriven { execution_arn: String },

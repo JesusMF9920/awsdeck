@@ -54,6 +54,8 @@ pub struct SfnView {
     loading: bool,
     /// Se alcanzó el tope de paginación de máquinas (hay más sin traer).
     machines_partial: bool,
+    /// Se topó el tope de paginación del history de la ejecución (>~10k eventos).
+    history_partial: bool,
     /// El servidor tiene más ejecuciones (`next_token`): se muestran las recientes.
     executions_partial: bool,
     /// `next_token` de las ejecuciones para `o` (load-more, append). `None` = no hay más.
@@ -76,6 +78,7 @@ impl SfnView {
             filter: String::new(),
             loading: false,
             machines_partial: false,
+            history_partial: false,
             executions_partial: false,
             exec_token: None,
             exec_status: None,
@@ -271,6 +274,7 @@ impl SfnView {
                     self.detail = None;
                     self.history.clear();
                     self.failed_state = None;
+                    self.history_partial = false;
                     self.loading = true;
                     self.state.select(Some(0));
                     vec![
@@ -312,6 +316,7 @@ impl SfnView {
             self.detail = None;
             self.history.clear();
             self.failed_state = None;
+            self.history_partial = false;
             self.loading = false;
             self.state.select(Some(0));
             self.clamp_selection();
@@ -531,12 +536,17 @@ impl SfnView {
         } else {
             ""
         };
+        let partial = if self.history_partial {
+            " · parcial"
+        } else {
+            ""
+        };
         if self.filter.is_empty() {
-            format!(" timeline · {total} estados{redrive} ")
+            format!(" timeline · {total} estados{partial}{redrive} ")
         } else {
             let shown = self.filtered_history_indices().len();
             format!(
-                " timeline · {shown}/{total} estados · filtro: {}{redrive} ",
+                " timeline · {shown}/{total} estados · filtro: {}{partial}{redrive} ",
                 self.filter
             )
         }
@@ -681,6 +691,7 @@ impl View for SfnView {
         self.detail_panel = None;
         self.loading = true;
         self.machines_partial = false;
+        self.history_partial = false;
         self.executions_partial = false;
         self.state.select(Some(0));
         vec![Action::LoadStateMachines]
@@ -795,6 +806,7 @@ impl View for SfnView {
                 detail,
                 history,
                 failed_state,
+                history_more,
             } => {
                 if let Level::Detail {
                     execution_arn: current,
@@ -805,6 +817,7 @@ impl View for SfnView {
                     self.detail = Some(detail.clone());
                     self.history = history.clone();
                     self.failed_state = failed_state.clone();
+                    self.history_partial = *history_more;
                     self.loading = false;
                     // Saltar al estado que reventó (si lo hay), sobre la lista visible
                     // (filtrada). Tras el drill el filtro está vacío → es la identidad.
@@ -1099,6 +1112,7 @@ mod tests {
                 },
             ],
             failed_state: status.is_redrivable().then(|| "ProcessOrder".into()),
+            history_more: false,
         });
         v
     }
@@ -1408,6 +1422,7 @@ mod tests {
             },
             history: vec![],
             failed_state: None,
+            history_more: false,
         });
         assert!(
             v.detail.is_none(),
@@ -1541,6 +1556,37 @@ mod tests {
         assert!(
             v.hints().iter().any(|(k, _)| *k == "enter"),
             "el detalle anuncia enter: in/out cuando el estado expone io"
+        );
+    }
+
+    #[test]
+    fn history_partial_shows_in_timeline_title() {
+        let mut v = view_in_detail(ExecStatus::Succeeded);
+        assert!(!v.timeline_title().contains("parcial"));
+        // Reenvía el detalle de la MISMA ejecución marcando el history como parcial.
+        let arn = match &v.level {
+            Level::Detail { execution_arn, .. } => execution_arn.clone(),
+            _ => unreachable!(),
+        };
+        v.on_message(&Message::ExecutionDetailLoaded {
+            execution_arn: arn,
+            detail: ExecutionDetailDto {
+                status: ExecStatus::Succeeded,
+                start_ts: None,
+                stop_ts: None,
+                input: None,
+                output: None,
+                error: None,
+                cause: None,
+                redrive_count: None,
+            },
+            history: vec![],
+            failed_state: None,
+            history_more: true,
+        });
+        assert!(
+            v.timeline_title().contains("parcial"),
+            "history_more=true → timeline parcial"
         );
     }
 

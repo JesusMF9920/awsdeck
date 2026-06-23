@@ -16,6 +16,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use super::View;
 use crate::action::{Action, ConsoleTarget};
 use crate::message::{EventBusDto, Message, RuleDetailDto, RuleDto, RuleState, TargetDto};
+use crate::ui::detail::DetailPanel;
 use crate::util::{fuzzy_score, ranked};
 
 /// Nivel de drill actual. Cada nivel carga los identificadores que `back()`
@@ -37,6 +38,9 @@ pub struct EventsView {
     rules: Vec<RuleDto>,
     detail: Option<RuleDetailDto>,
     targets: Vec<TargetDto>,
+    /// Panel de detalle abierto (el `event_pattern` con `P`, o el `input` de un target
+    /// con `enter`): contenido completo scrolleable/copiable. `None` = vista normal.
+    detail_panel: Option<DetailPanel>,
     filter: String,
     loading: bool,
     /// Se alcanzó el tope de paginación de buses (hay más sin traer).
@@ -54,6 +58,7 @@ impl EventsView {
             rules: Vec::new(),
             detail: None,
             targets: Vec::new(),
+            detail_panel: None,
             filter: String::new(),
             loading: false,
             buses_partial: false,
@@ -133,6 +138,40 @@ impl EventsView {
         let sel = self.state.selected()?;
         let idx = *self.filtered_rule_indices().get(sel)?;
         Some(self.rules[idx].clone())
+    }
+
+    fn selected_target(&self) -> Option<TargetDto> {
+        let sel = self.state.selected()?;
+        let idx = *self.filtered_target_indices().get(sel)?;
+        self.targets.get(idx).cloned()
+    }
+
+    /// Abre el panel con el `input` completo del target seleccionado (la fila lo colapsa
+    /// a ~40 chars). `enter` sobre un target en el detalle.
+    fn open_target_detail(&mut self) {
+        if let Some(t) = self.selected_target() {
+            let body = t
+                .input
+                .unwrap_or_else(|| "(este target no define input)".to_string());
+            self.detail_panel = Some(DetailPanel::new(format!("target {}", t.id), body));
+        }
+    }
+
+    /// Abre el panel con el `event_pattern` completo de la rule (el pane lo trunca/corta).
+    /// `P` en el detalle; cae al `schedule_expression` si la rule es de agenda.
+    fn open_pattern_detail(&mut self) {
+        if let Some(d) = &self.detail {
+            let body = d
+                .event_pattern
+                .clone()
+                .or_else(|| {
+                    d.schedule_expression
+                        .clone()
+                        .map(|s| format!("schedule: {s}"))
+                })
+                .unwrap_or_else(|| "(esta rule no tiene event_pattern)".to_string());
+            self.detail_panel = Some(DetailPanel::new("event_pattern", body));
+        }
     }
 
     /// Texto a copiar con `y`: ARN del bus / nombre de la rule / ARN del target
@@ -226,6 +265,7 @@ impl EventsView {
 
     /// `esc`: despoja un nivel; en la raíz (buses) emite `Back` (→ menú).
     fn back(&mut self) -> Vec<Action> {
+        self.detail_panel = None; // cerrar cualquier panel al subir de nivel
         let bus = if let Level::Detail { event_bus_name, .. } = &self.level {
             Some(event_bus_name.clone())
         } else {
@@ -387,6 +427,10 @@ impl View for EventsView {
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        // Con el panel abierto, sus teclas (scroll/copiar/cerrar) mandan.
+        if let Some(p) = &self.detail_panel {
+            return p.hints();
+        }
         match self.level {
             // `S` envía un evento de prueba al bus (gated por modo escritura + confirm).
             Level::Buses => vec![
@@ -395,7 +439,12 @@ impl View for EventsView {
                 ("S", "enviar evento"),
             ],
             Level::Rules { .. } => vec![("y", "copiar nombre"), ("O", "consola")],
-            Level::Detail { .. } => vec![("y", "copiar ARN target"), ("O", "consola")],
+            Level::Detail { .. } => vec![
+                ("enter", "ver input"),
+                ("P", "ver patrón"),
+                ("y", "copiar ARN target"),
+                ("O", "consola"),
+            ],
         }
     }
 
@@ -414,6 +463,7 @@ impl View for EventsView {
         self.level = Level::Buses;
         self.rules.clear();
         self.detail = None;
+        self.detail_panel = None;
         self.targets.clear();
         self.loading = true;
         self.buses_partial = false;
@@ -423,6 +473,25 @@ impl View for EventsView {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        // Panel de detalle abierto: `y` copia su contenido, el resto scrollea/cierra.
+        if self.detail_panel.is_some() {
+            if key.code == KeyCode::Char('y') {
+                return self
+                    .detail_panel
+                    .as_ref()
+                    .map(|p| Action::CopyToClipboard {
+                        text: p.content().to_string(),
+                    })
+                    .into_iter()
+                    .collect();
+            }
+            if let Some(p) = self.detail_panel.as_mut()
+                && p.on_key(key)
+            {
+                self.detail_panel = None;
+            }
+            return vec![];
+        }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.move_selection(1);
@@ -440,7 +509,18 @@ impl View for EventsView {
                 self.select_edge(true);
                 vec![]
             }
+            // En el detalle, `enter` expande el input del target (la lista navegable son
+            // los targets); en los demás niveles, drillea.
+            KeyCode::Enter if matches!(self.level, Level::Detail { .. }) => {
+                self.open_target_detail();
+                vec![]
+            }
             KeyCode::Enter => self.drill(),
+            // `P` expande el event_pattern completo (scroll + copia).
+            KeyCode::Char('P') if matches!(self.level, Level::Detail { .. }) => {
+                self.open_pattern_detail();
+                vec![]
+            }
             KeyCode::Esc => self.back(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('S') => self.send_intent(),
@@ -517,6 +597,11 @@ impl View for EventsView {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect) {
+        // Panel de detalle: ocupa el cuerpo entero con el contenido completo.
+        if let Some(p) = self.detail_panel.as_mut() {
+            p.render(frame, area);
+            return;
+        }
         match &self.level {
             Level::Buses => {
                 let block = Block::bordered().title(self.buses_title());
@@ -546,7 +631,7 @@ impl View for EventsView {
 
                 frame.render_widget(self.detail_meta(), meta);
 
-                let pat_block = Block::bordered().title(" patrón ");
+                let pat_block = Block::bordered().title(" patrón · P expande ");
                 let pat = self
                     .detail
                     .as_ref()
@@ -693,6 +778,60 @@ mod tests {
             ],
         });
         v
+    }
+
+    #[test]
+    fn enter_on_target_opens_input_panel() {
+        let mut v = view_in_detail(); // sel 0 = to-lambda (input None)
+        let actions = v.on_key(key(KeyCode::Enter));
+        assert!(
+            actions.is_empty(),
+            "enter en el detalle abre panel, no drillea"
+        );
+        let p = v.detail_panel.as_ref().expect("panel abierto");
+        assert!(p.content().contains("no define input"), "target sin input");
+
+        // Cierra y baja al target con input.
+        v.on_key(key(KeyCode::Esc));
+        v.on_key(key(KeyCode::Char('j'))); // → to-sqs (input Some)
+        v.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            v.detail_panel.as_ref().expect("panel").content(),
+            r#"{"x":1}"#
+        );
+    }
+
+    #[test]
+    fn capital_p_opens_pattern_panel_copies_and_esc_closes() {
+        let mut v = view_in_detail();
+        v.on_key(key(KeyCode::Char('P')));
+        assert!(
+            v.detail_panel
+                .as_ref()
+                .is_some_and(|p| p.content().contains("my.app")),
+            "P expande el event_pattern completo"
+        );
+        // `y` copia el patrón mostrado.
+        match v.on_key(key(KeyCode::Char('y'))).as_slice() {
+            [Action::CopyToClipboard { text }] => assert!(text.contains("my.app")),
+            other => panic!("se esperaba copiar el patrón, llegó {other:?}"),
+        }
+        // `esc` cierra el panel pero NO sube de nivel.
+        let actions = v.on_key(key(KeyCode::Esc));
+        assert!(actions.is_empty());
+        assert!(v.detail_panel.is_none());
+        assert!(
+            matches!(v.level, Level::Detail { .. }),
+            "sigue en el detalle"
+        );
+    }
+
+    #[test]
+    fn detail_hints_offer_input_and_pattern() {
+        let v = view_in_detail();
+        let hints = v.hints();
+        assert!(hints.iter().any(|(k, _)| *k == "enter"), "enter: ver input");
+        assert!(hints.iter().any(|(k, _)| *k == "P"), "P: ver patrón");
     }
 
     #[test]

@@ -158,8 +158,9 @@ vía `View::on_tick`). `/` filtra server-side (`filter_pattern`). **Expandir una
 un evento abre el mensaje completo (wrap + scroll, JSON pretty; `esc` cierra). `LogWindow` plano (el
 reloj solo en `effects`); mock + real, sin gate (lectura). El tail y su selector de tiempo se
 **anuncian** en el footer y en el título del group (`View::hints`). Los **log groups** se buscan
-**fuzzy local sin prefijo** (cache completo paginado, case-insensitive) y el tail con rango amplio
-navega fluido (cache de filtrado + display precomputado).
+**server-side por subcadena** sin prefijo (`logGroupNamePattern`, infix; 1 página por request — no
+carga todo, escala a miles) + ranking fuzzy local; el tail con rango amplio navega fluido (cache de
+filtrado + display precomputado).
 
 ### v1 — Vista `sqs` — ✅ hecho
 Listar colas del ambiente; ver attributes (mensajes visibles, in-flight, DLQ); *peek* de mensajes (receive sin borrar). Acción mutante `PurgeQueue` detrás de confirm + modo escritura.
@@ -207,8 +208,9 @@ Entregado: 3 niveles (event buses → rules → detalle). L1 `list_event_buses` 
 
 ## 8. Backlog / futuro
 
-- **Hecho (transversal):** copiar ARN/URL (`y`), abrir en consola AWS (`O`), búsqueda fuzzy local sin
-  prefijo, un solo `enter` desde el filtro, tail en vivo (`f`, `tail -f`), y config **load-only** en
+- **Hecho (transversal):** copiar ARN/URL (`y`), abrir en consola AWS (`O`), búsqueda de groups por
+  subcadena sin prefijo (server-side + fuzzy local, sin cargar todo — escala a miles), un solo
+  `enter` desde el filtro, tail en vivo (`f`, `tail -f`), y config **load-only** en
   `~/.config/awsdeck/config.toml` (`default_profile`/`default_region`/`default_tail_window`).
 - Vínculo a CloudWatch Logs desde otras vistas (del Lambda de un estado de SFN → sus logs): diseñado
   (`ViewContext`/`View::on_context`, ARN del SDK ya verificado), diferido a un PR aparte.

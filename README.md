@@ -39,7 +39,7 @@ se muestra en la **status bar** (no crashea).
 | Tecla | Acción |
 |-------|--------|
 | `:` | command bar (saltar de herramienta, p. ej. `:logs`, `:sqs`, `:sfn`, `:events`) |
-| `/` | buscar (fuzzy local; `↑`/`↓` navegan los resultados sin salir; `enter` entra directo) |
+| `/` | buscar (en `logs` consulta al server por subcadena + fuzzy local; `↑`/`↓` navegan sin salir; `enter` entra directo) |
 | `enter` | drill al detalle (en `logs`: group → stream → **eventos**); sobre una **línea**, la **expande** completa |
 | `esc` | con filtro aplicado lo limpia (1er `esc`); si no, vuelve un nivel (drill back; en la raíz, al menú) |
 | `:menu` · `backspace` | volver al menú principal |
@@ -68,7 +68,7 @@ se muestra en la **status bar** (no crashea).
 
 ```bash
 AWSDECK_MOCK=1 cargo run    # ver el TUI con datos, sin tocar AWS
-cargo test                  # 178 tests, sin red
+cargo test                  # 179 tests, sin red
 cargo clippy --all-targets  # lint
 cargo fmt --check           # formato
 ```
@@ -100,13 +100,14 @@ Recorrido rápido (con `AWSDECK_MOCK=1 cargo run`):
 **Epoch guard:** al cambiar de ambiente con un request en vuelo, nunca se pintan datos de la
 cuenta anterior (probado en `app::tests::epoch_guard_discards_stale_and_accepts_fresh`).
 
-**Escala (logs):** los log groups se **paginan completos** a un cache local (tope de páginas, como
-`sfn`/`events`) y `/` filtra **100% local con fuzzy** (subsecuencia, case-insensitive): teclear
-`CreateOrder` encuentra `…-CreateOrderV3` sin escribir el prefijo. El título marca `· parcial` si se
-topó el tope. Los **logs del group** se traen por **rango de tiempo** (`w`/`:since`/`:from-to`), se
-paginan en demanda (`o`) y siguen en vivo con `f` (`tail -f`); el reloj vive solo en `effects`. El
-tail no recomputa el filtro por tecla ni reconstruye la lista por frame (cache + display
-precomputado), así que un rango amplio (p. ej. 14 días) navega fluido.
+**Escala (logs):** con miles de log groups **no se cargan todos** (eso bloqueaba segundos). Se trae
+**una página** (≤50, 1 round-trip) y `/` **busca server-side por subcadena** (`logGroupNamePattern`,
+infix, debounced ~280ms): teclear `CreateOrder` trae `…-CreateOrderV3` sin escribir el prefijo. El
+`fuzzy` local rankea/refina lo devuelto; el título marca `· parcial` si hay más en el server. Los
+**logs del group** se traen por **rango de tiempo** (`w`/`:since`/`:from-to`), se paginan en demanda
+(`o`) y siguen en vivo con `f` (`tail -f`); el reloj vive solo en `effects`. El tail no recomputa el
+filtro por tecla ni reconstruye la lista por frame (cache + display precomputado), así que un rango
+amplio (p. ej. 14 días) navega fluido.
 
 **Escala (sfn):** las state machines se **paginan** (se traen todas, alcanzables por el fuzzy);
 las ejecuciones muestran las 50 más recientes y marcan `· parcial (recientes)` si hay más. El
@@ -133,7 +134,7 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
 
 ## Roadmap
 
-- **v0** ✅ shell + `logs` (CloudWatch): groups (fuzzy local) → streams → **eventos**
+- **v0** ✅ shell + `logs` (CloudWatch): groups (búsqueda server-side + fuzzy local) → streams → **eventos**
   (`get_log_events`) + **logs del group por rango de tiempo** (`filter_log_events`, `t`;
   `w`/`:since`/`:from-to`, paginación `o`, **tail en vivo** `f`) + **expandir una línea** (`enter`,
   JSON pretty).
@@ -143,7 +144,8 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
 - **v3** ✅ `events` — event buses, rules (estado coloreado), detalle con patrón + targets,
   `SendEvent` (gated).
 - **Transversal** ✅ copiar ARN/URL (`y`), abrir en consola AWS (`O`), config en disco
-  (`~/.config/awsdeck/config.toml`), búsqueda local sin prefijo, un solo `enter` desde el filtro.
+  (`~/.config/awsdeck/config.toml`), búsqueda de groups por subcadena sin prefijo (server-side +
+  fuzzy local, sin cargar todo), un solo `enter` desde el filtro.
 
 Backlog: cross-link `sfn` → logs de la Lambda de una ejecución, `SendEvent` con payload editable,
 input/output por estado en el timeline de `sfn`, escribir config en disco, más vistas (Lambda,

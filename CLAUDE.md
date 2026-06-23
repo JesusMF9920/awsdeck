@@ -75,8 +75,9 @@ concretas se cablean en `main.rs`; `effects.rs` es la frontera deliberada con el
 
 ## Keybindings (iguales en todas las vistas)
 
-`:` command bar · `/` filtro (fuzzy local; con `↑/↓` navegas los resultados sin salir; `enter`
-entra directo, sin doble enter) · `enter` drill · `esc` back de dos etapas (con filtro lo limpia;
+`:` command bar · `/` filtro/buscar (fuzzy con ranking; en `logs` groups y tail consulta al server
+por subcadena; con `↑/↓` navegas sin salir; `enter` entra directo, sin doble enter) · `enter` drill ·
+`esc` back de dos etapas (con filtro lo limpia;
 si no, un nivel; desde la raíz, al menú) · `r` refresh · `y` copiar ARN/URL/línea · `O` abrir en
 la consola AWS · `ctrl-e` cambiar ambiente · `?` ayuda · `q` salir. En `logs`: `t` tail del group,
 `w/W` ventana, `o` paginar, `f` tail en vivo. Acciones mutantes gated por modo escritura (`:write`)
@@ -199,11 +200,13 @@ list/describe).
   en el tail y `esc` en el detalle de línea; `sqs`/`sfn`/`events` anuncian sus teclas gated
   (`p`/`R`/`S`, `R` solo si la ejecución es redrivable). Hace **descubrible** el tail por tiempo de
   `logs` (antes solo vivía en `?` con texto críptico, ya reescrito).
-- **Búsqueda de groups 100% local (sin prefijo)**: `logs` deja de buscar server-side; pagina
-  **todos** los groups a cache (tope `MAX_LOG_GROUP_PAGES`, como `sfn`/`events`) y filtra con
-  `fuzzy_score` (subsecuencia, case-insensitive). `Action::LoadLogGroups`/`Message::LogGroupsLoaded`
-  pierden `query`; `last_query` queda solo para el `filter_pattern` del tail. Teclear `CreateOrder`
-  encuentra `…-CreateOrderV3`.
+- **Búsqueda de groups: híbrida (rápida a escala)**: con miles de groups **no se cargan todos**
+  (eso bloqueaba segundos). `fetch_log_groups` trae **una página** (≤50, 1 round-trip); `/` busca
+  **server-side por subcadena** (`logGroupNamePattern`, infix → `CreateOrder` trae
+  `…-CreateOrderV3` sin el prefijo) y el `fuzzy_score` local rankea/refina esos resultados
+  (case-insensitive). `last_query` + guard "latest wins" en `LogGroupsLoaded`; `back()` recarga la
+  1ª página al volver de una búsqueda. (Caveat: el server pattern es case-sensitive; el fuzzy local
+  sobre la página sí es case-insensitive.)
 - **Performance del tail (rangos amplios)**: `logs` cachea los índices filtrados (`filtered`) y
   precomputa por evento lowercase/preview/severidad (`event_rows`), en sync vía
   `set_events`/`extend_events` (únicos puntos de mutación) + `recompute_filtered` (solo al cambiar
@@ -224,8 +227,9 @@ list/describe).
   `default_tail_window` (preset del tail, vía `LogsView::with_default_window`). Si no existe/no parsea,
   defaults. Escribir queda como follow-up.
 
-178 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, fuzzy local sin
-prefijo, menú, drill x3 en `sfn`/`events` y eventos/tail de `logs`, back→menú de dos etapas,
+179 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, búsqueda de
+groups server-side por subcadena + fuzzy local + "latest wins", menú, drill x3 en `sfn`/`events` y
+eventos/tail de `logs`, back→menú de dos etapas,
 navegación en filtro + `enter` que drillea, preservación de selección, `ClearFilter` al cambiar de
 nivel, señal `· parcial`, rango de tiempo del tail —`w`/`o`/`:since`/`:from-to`, staleness por gen,
 append—, cache de filtrado invariante, copiar (`y`) y abrir consola (`O`) por vista + URLs de consola,

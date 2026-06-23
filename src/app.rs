@@ -1798,6 +1798,8 @@ mod tests {
             source: "awsdeck.manual".to_string(),
             detail_type: "test".to_string(),
             detail: "{}".to_string(),
+            time: None,
+            resources: vec![],
         }
     }
 

@@ -128,7 +128,17 @@ impl Effects {
                 source,
                 detail_type,
                 detail,
-            } => self.send_event(event_bus_name, source, detail_type, detail, epoch),
+                time,
+                resources,
+            } => self.send_event(
+                event_bus_name,
+                source,
+                detail_type,
+                detail,
+                time,
+                resources,
+                epoch,
+            ),
             Action::OpenConsole { target } => self.open_console(target, epoch),
             Action::VerifyIdentity => self.verify_identity(epoch),
             Action::Quit
@@ -620,16 +630,20 @@ impl Effects {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn send_event(
         &self,
         event_bus_name: String,
         source: String,
         detail_type: String,
         detail: String,
+        time: Option<i64>,
+        resources: Vec<String>,
         epoch: u64,
     ) {
         let tx = self.tx.clone();
         match &self.backend {
+            // El mock ignora el payload (incluidos time/resources): solo ecoa EventSent.
             Backend::Mock(_) => {
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -646,6 +660,8 @@ impl Effects {
                         &source,
                         &detail_type,
                         &detail,
+                        time,
+                        &resources,
                     )
                     .await
                     {
@@ -1508,14 +1524,24 @@ async fn send_event_real(
     source: &str,
     detail_type: &str,
     detail: &str,
+    time: Option<i64>,
+    resources: &[String],
 ) -> color_eyre::Result<()> {
+    use aws_sdk_eventbridge::primitives::DateTime;
     use aws_sdk_eventbridge::types::PutEventsRequestEntry;
-    let entry = PutEventsRequestEntry::builder()
+    let mut builder = PutEventsRequestEntry::builder()
         .source(source)
         .detail_type(detail_type)
         .detail(detail)
-        .event_bus_name(event_bus_name)
-        .build();
+        .event_bus_name(event_bus_name);
+    // Campos opcionales de PutEvents: timestamp del evento y ARNs de recursos.
+    if let Some(ms) = time {
+        builder = builder.time(DateTime::from_millis(ms));
+    }
+    if !resources.is_empty() {
+        builder = builder.set_resources(Some(resources.to_vec()));
+    }
+    let entry = builder.build();
     let out = ctx
         .eventbridge()
         .await
@@ -2719,6 +2745,8 @@ mod tests {
                 source: "awsdeck.manual".into(),
                 detail_type: "test".into(),
                 detail: "{}".into(),
+                time: None,
+                resources: vec![],
             },
             1,
         );

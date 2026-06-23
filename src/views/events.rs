@@ -328,6 +328,11 @@ impl EventsView {
                     ("source", "awsdeck.manual"),
                     ("detail-type", "awsdeck test event"),
                     ("detail", r#"{"sentBy":"awsdeck"}"#),
+                    // Opcionales (vacío = omitir): timestamp UTC y ARNs de recursos.
+                    // (El form es de una línea por campo — `enter` envía —, así que los
+                    // resources van separados por coma.)
+                    ("time (UTC, vacío=ahora)", ""),
+                    ("resources (ARNs, coma)", ""),
                 ],
             );
             self.event_form = Some((b.name, form));
@@ -344,18 +349,43 @@ impl EventsView {
         let source = vals.first().cloned().unwrap_or_default();
         let detail_type = vals.get(1).cloned().unwrap_or_default();
         let detail = vals.get(2).cloned().unwrap_or_default();
+        let time_str = vals.get(3).cloned().unwrap_or_default();
+        let resources_str = vals.get(4).cloned().unwrap_or_default();
         if serde_json::from_str::<serde_json::Value>(detail.trim()).is_err() {
             if let Some((_, f)) = self.event_form.as_mut() {
                 f.set_error("detail no es JSON válido (revisá comillas/llaves)");
             }
             return vec![];
         }
+        // `time` opcional: vacío = ahora; si no, parsea UTC (mismo parser que `:since`).
+        let time = if time_str.trim().is_empty() {
+            None
+        } else {
+            match crate::util::parse_datetime(time_str.trim()) {
+                Some(ms) => Some(ms),
+                None => {
+                    if let Some((_, f)) = self.event_form.as_mut() {
+                        f.set_error("time inválido: usa YYYY-MM-DD[THH:MM] (UTC)");
+                    }
+                    return vec![];
+                }
+            }
+        };
+        // `resources` opcional: ARNs separados por coma (se ignoran los vacíos).
+        let resources: Vec<String> = resources_str
+            .split(',')
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect();
         let event_bus_name = self.event_form.take().map(|(b, _)| b).unwrap_or_default();
         vec![Action::SendEvent {
             event_bus_name,
             source,
             detail_type,
             detail,
+            time,
+            resources,
         }]
     }
 
@@ -1112,6 +1142,7 @@ mod tests {
         v.on_key(key(KeyCode::Char('S'))); // abre el form (defaults JSON válidos)
 
         // JSON por defecto válido → enter emite SendEvent con el payload tecleado.
+        // time/resources vacíos por defecto → None / [].
         match v.on_key(key(KeyCode::Enter)).as_slice() {
             [
                 Action::SendEvent {
@@ -1119,16 +1150,68 @@ mod tests {
                     source,
                     detail_type,
                     detail,
+                    time,
+                    resources,
                 },
             ] => {
                 assert_eq!(event_bus_name, "default");
                 assert_eq!(source, "awsdeck.manual");
                 assert_eq!(detail_type, "awsdeck test event");
                 assert!(detail.contains("sentBy"));
+                assert_eq!(*time, None, "time vacío → None (ahora)");
+                assert!(resources.is_empty(), "resources vacío → []");
             }
             other => panic!("se esperaba SendEvent con payload, llegó {other:?}"),
         }
         assert!(v.event_form.is_none(), "tras enviar, el form se cierra");
+    }
+
+    #[test]
+    fn submit_parses_time_and_resources_when_present() {
+        let mut v = EventsView::new();
+        v.on_message(&buses_msg(vec![bus("default")]));
+        v.on_key(key(KeyCode::Char('S'))); // abre el form
+
+        // Tab al campo time (4º) y teclear una fecha UTC válida.
+        v.on_key(key(KeyCode::Tab)); // source → detail-type
+        v.on_key(key(KeyCode::Tab)); // detail-type → detail
+        v.on_key(key(KeyCode::Tab)); // detail → time
+        for c in "2026-06-23T15:30".chars() {
+            v.on_key(key(KeyCode::Char(c)));
+        }
+        // Tab a resources (5º) y teclear dos ARNs separados por coma.
+        v.on_key(key(KeyCode::Tab)); // time → resources
+        for c in "arn:aws:s3:::a, arn:aws:s3:::b".chars() {
+            v.on_key(key(KeyCode::Char(c)));
+        }
+        // `enter` envía el form (en el form Enter = Submit).
+        match v.on_key(key(KeyCode::Enter)).as_slice() {
+            [
+                Action::SendEvent {
+                    time, resources, ..
+                },
+            ] => {
+                assert_eq!(*time, crate::util::parse_datetime("2026-06-23T15:30"));
+                assert_eq!(resources, &vec!["arn:aws:s3:::a", "arn:aws:s3:::b"]);
+            }
+            other => panic!("se esperaba SendEvent con time/resources, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_with_invalid_time_keeps_form_open_without_emitting() {
+        let mut v = EventsView::new();
+        v.on_message(&buses_msg(vec![bus("default")]));
+        v.on_key(key(KeyCode::Char('S')));
+        // Ir al campo time (4º) y teclear basura.
+        v.on_key(key(KeyCode::Tab));
+        v.on_key(key(KeyCode::Tab));
+        v.on_key(key(KeyCode::Tab));
+        for c in "no-es-fecha".chars() {
+            v.on_key(key(KeyCode::Char(c)));
+        }
+        assert!(v.submit_form().is_empty(), "time inválido no emite");
+        assert!(v.event_form.is_some(), "el form sigue abierto");
     }
 
     #[test]

@@ -104,12 +104,15 @@ pub enum Action {
     RedriveExecution { execution_arn: String },
     /// Publicar un evento contra un bus de EventBridge con el payload que el usuario
     /// editó en el form (`source` / `detail-type` / `detail` JSON). La vista valida que
-    /// `detail` sea JSON antes de emitirla.
+    /// `detail` sea JSON antes de emitirla. `time` (epoch millis UTC; `None` = ahora) y
+    /// `resources` (ARNs; vacío = ninguno) son los campos opcionales de `PutEvents`.
     SendEvent {
         event_bus_name: String,
         source: String,
         detail_type: String,
         detail: String,
+        time: Option<i64>,
+        resources: Vec<String>,
     },
 }
 

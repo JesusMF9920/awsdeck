@@ -22,6 +22,7 @@ use tui_input::backend::crossterm::EventHandler;
 
 use crate::action::{Action, ViewContext};
 use crate::aws::context::{Env, ProfileEntry, list_profiles};
+use crate::config::State;
 use crate::effects::Effects;
 use crate::message::{Envelope, ErrorKind, Message};
 use crate::ui::{command_bar, confirm, header, help, picker};
@@ -98,6 +99,23 @@ struct Confirm {
     action: Action,
 }
 
+/// Una fila del menú principal: una herramienta (vista), un encabezado de sección
+/// (no seleccionable) o un favorito/reciente. El core trata `view_id`/`key`/`label`
+/// como opacos (no nombra servicios). `Header` se omite en la navegación.
+enum MenuRow {
+    Tool {
+        id: &'static str,
+        desc: &'static str,
+    },
+    Header(&'static str),
+    Favorite {
+        view_id: String,
+        key: String,
+        label: String,
+        is_fav: bool,
+    },
+}
+
 pub struct App {
     env: Env,
     epoch: u64,
@@ -139,6 +157,9 @@ pub struct App {
     awaiting_startup_env: bool,
     /// Deadline para disparar la búsqueda server-side (debounce del filtro `/`).
     search_deadline: Option<tokio::time::Instant>,
+    /// Estado persistido: último ambiente + favoritos/recientes. La app lo muta en
+    /// memoria (marcar con `*`, auto-trackear al drillear) y lo escribe al salir.
+    store: State,
     should_quit: bool,
 }
 
@@ -170,8 +191,15 @@ impl App {
             write_mode: false,
             awaiting_startup_env: false,
             search_deadline: None,
+            store: State::default(),
             should_quit: false,
         }
+    }
+
+    /// Inyecta el estado persistido (favoritos/recientes) leído del disco. Lo llama el
+    /// composition root tras `State::load`; los tests usan el default vacío.
+    pub fn load_state(&mut self, state: State) {
+        self.store = state;
     }
 
     /// Corre el loop principal hasta que el usuario sale.
@@ -218,14 +246,12 @@ impl App {
                 _ = tick.tick() => self.on_tick(),
             }
         }
-        // Persistir el último ambiente para recordarlo al reabrir. No-destructivo:
-        // escribe `state.toml` aparte, no toca el `config.toml` hand-editado. Best-effort.
-        crate::config::State {
-            last_profile: Some(self.env.profile.clone()),
-            last_region: Some(self.env.region.clone()),
-            favorites: vec![],
-        }
-        .save();
+        // Persistir el último ambiente + favoritos/recientes para recordarlos al reabrir.
+        // No-destructivo: escribe `state.toml` aparte, no toca el `config.toml`
+        // hand-editado. Best-effort.
+        self.store.last_profile = Some(self.env.profile.clone());
+        self.store.last_region = Some(self.env.region.clone());
+        self.store.save();
         Ok(())
     }
 
@@ -299,31 +325,100 @@ impl App {
         }
     }
 
-    fn menu_len(&self) -> usize {
-        self.registry.metas().len()
+    /// Filas del menú: las herramientas (vistas) y, debajo, los favoritos (★) y los
+    /// recientes (auto), cada grupo bajo un encabezado. `view_id`/`key`/`label` son
+    /// opacos (el core no nombra servicios). El orden refleja la recencia del `store`.
+    fn menu_rows(&self) -> Vec<MenuRow> {
+        let mut rows: Vec<MenuRow> = self
+            .registry
+            .metas()
+            .into_iter()
+            .map(|(id, desc)| MenuRow::Tool { id, desc })
+            .collect();
+        let row = |f: &crate::config::Favorite| MenuRow::Favorite {
+            view_id: f.view_id.clone(),
+            key: f.key.clone(),
+            label: f.label.clone(),
+            is_fav: f.is_favorite,
+        };
+        let favs: Vec<MenuRow> = self
+            .store
+            .favorites
+            .iter()
+            .filter(|f| f.is_favorite)
+            .map(row)
+            .collect();
+        if !favs.is_empty() {
+            rows.push(MenuRow::Header("★ favoritos"));
+            rows.extend(favs);
+        }
+        let recents: Vec<MenuRow> = self
+            .store
+            .favorites
+            .iter()
+            .filter(|f| !f.is_favorite)
+            .map(row)
+            .collect();
+        if !recents.is_empty() {
+            rows.push(MenuRow::Header("recientes"));
+            rows.extend(recents);
+        }
+        rows
+    }
+
+    /// Índices de las filas seleccionables (todo menos los `Header`).
+    fn menu_selectable(rows: &[MenuRow]) -> Vec<usize> {
+        rows.iter()
+            .enumerate()
+            .filter(|(_, r)| !matches!(r, MenuRow::Header(_)))
+            .map(|(i, _)| i)
+            .collect()
     }
 
     fn menu_move(&mut self, delta: i32) {
-        let len = self.menu_len();
-        if len == 0 {
+        let rows = self.menu_rows();
+        let selectable = Self::menu_selectable(&rows);
+        if selectable.is_empty() {
             return;
         }
-        let cur = self.menu.selected().unwrap_or(0) as i32;
-        self.menu
-            .select(Some((cur + delta).clamp(0, len as i32 - 1) as usize));
+        let cur = self.menu.selected().unwrap_or(0);
+        let pos = selectable.iter().position(|&i| i == cur).unwrap_or(0) as i32;
+        let next = (pos + delta).clamp(0, selectable.len() as i32 - 1) as usize;
+        self.menu.select(Some(selectable[next]));
     }
 
     fn menu_select_edge(&mut self, last: bool) {
-        let len = self.menu_len();
-        if len > 0 {
-            self.menu.select(Some(if last { len - 1 } else { 0 }));
+        let rows = self.menu_rows();
+        let selectable = Self::menu_selectable(&rows);
+        if let Some(&idx) = if last {
+            selectable.last()
+        } else {
+            selectable.first()
+        } {
+            self.menu.select(Some(idx));
         }
     }
 
     fn menu_activate(&mut self) {
-        let metas = self.registry.metas();
-        if let Some((id, _)) = self.menu.selected().and_then(|sel| metas.get(sel)) {
-            self.dispatch(Action::ActivateView(id.to_string()));
+        let rows = self.menu_rows();
+        match self.menu.selected().and_then(|sel| rows.get(sel)) {
+            Some(MenuRow::Tool { id, .. }) => self.dispatch(Action::ActivateView(id.to_string())),
+            // Abrir un favorito/reciente: súbelo al frente (recencia) y entrega su `key`
+            // opaca a la vista destino vía el handoff agnóstico (on_context).
+            Some(MenuRow::Favorite {
+                view_id,
+                key,
+                label,
+                ..
+            }) => {
+                let (view_id, key, label) = (view_id.clone(), key.clone(), label.clone());
+                self.store.record_recent(&view_id, &key, &label);
+                self.dispatch(Action::ActivateViewWithContext {
+                    id: view_id,
+                    context: ViewContext::Favorite { key },
+                });
+            }
+            _ => {}
         }
     }
 
@@ -352,6 +447,8 @@ impl App {
             KeyCode::Char('/') => self.enter_filter_mode(),
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('e') if ctrl => self.open_picker(),
+            // `*` marca/desmarca como favorito el recurso seleccionado de la vista activa.
+            KeyCode::Char('*') => self.toggle_favorite(),
             KeyCode::Backspace => self.go_home(),
             // Etapa 0 de `esc`: si hay un error pegajoso en pantalla, el primer `esc`
             // solo lo descarta (y se queda donde estás). La vista no ve este esc.
@@ -457,6 +554,13 @@ impl App {
             Action::SwitchEnv(env) => self.switch_env(env),
             // Copiar al portapapeles: local (no es efecto del SDK).
             Action::CopyToClipboard { text } => self.copy_to_clipboard(text),
+            // Reciente auto-trackeado: la vista lo emite al drillear; el App le pone el
+            // view_id de la vista activa y lo guarda (no es efecto del SDK).
+            Action::RecordRecent { key, label } => {
+                if let Some(id) = self.registry.active().map(|v| v.id()) {
+                    self.store.record_recent(id, &key, &label);
+                }
+            }
             // Gate prod-safe: las mutantes pasan por modo escritura + confirm.
             mutating if is_mutating(&mutating) => self.request_confirm(mutating),
             effect => self.effects.dispatch(effect, self.epoch),
@@ -823,6 +927,27 @@ impl App {
         }
     }
 
+    /// `*`: marca/desmarca como favorito el recurso seleccionado de la vista activa.
+    /// Agnóstico: el App pregunta a la vista (`selected_favorite`) y le pone el `view_id`;
+    /// nunca interpreta la `key`. Persiste al salir (junto con el resto del `store`).
+    fn toggle_favorite(&mut self) {
+        // Resolver (view_id, key, label) ANTES de mutar el store (corta el préstamo).
+        let target = self.registry.active().and_then(|v| {
+            v.selected_favorite()
+                .map(|(key, label)| (v.id(), key, label))
+        });
+        let Some((view_id, key, label)) = target else {
+            self.set_info("nada que marcar como favorito aquí");
+            return;
+        };
+        let marked = self.store.toggle_favorite(view_id, &key, &label);
+        if marked {
+            self.set_info(format!("favorito: {label}"));
+        } else {
+            self.set_info(format!("favorito quitado: {label}"));
+        }
+    }
+
     fn set_error(&mut self, text: impl Into<String>) {
         self.status = Some(StatusLine {
             error: true,
@@ -900,22 +1025,38 @@ impl App {
     }
 
     fn render_menu(&mut self, frame: &mut Frame, area: Rect) {
-        let metas = self.registry.metas();
-        let block = Block::bordered().title(" herramientas · enter para abrir ");
-        if metas.is_empty() {
+        let rows = self.menu_rows();
+        let block = Block::bordered().title(" herramientas · ★ marca con * · enter abre ");
+        if rows.is_empty() {
             frame.render_widget(
                 Paragraph::new("(sin herramientas registradas)").block(block),
                 area,
             );
             return;
         }
-        let items: Vec<ListItem> = metas
+        let items: Vec<ListItem> = rows
             .iter()
-            .map(|(id, desc)| {
-                ListItem::new(Line::from(vec![
+            .map(|r| match r {
+                MenuRow::Tool { id, desc } => ListItem::new(Line::from(vec![
                     Span::styled(format!(" {id:<10}"), Style::new().bold()),
                     Span::styled((*desc).to_string(), Style::new().dark_gray()),
-                ]))
+                ])),
+                MenuRow::Header(title) => ListItem::new(Line::from(Span::styled(
+                    format!(" {title}"),
+                    Style::new().dark_gray().bold(),
+                ))),
+                MenuRow::Favorite {
+                    view_id,
+                    label,
+                    is_fav,
+                    ..
+                } => {
+                    let mark = if *is_fav { "★ " } else { "  " };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!(" {mark}{view_id:<8} "), Style::new().yellow()),
+                        Span::raw(label.clone()),
+                    ]))
+                }
             })
             .collect();
         let list = List::new(items)
@@ -945,7 +1086,7 @@ impl App {
                 None => {
                     // Pistas contextuales de la vista activa (solo en una vista, no
                     // en el menú). El core no las interpreta: las reenvía al footer.
-                    let view = match self.screen {
+                    let mut view = match self.screen {
                         Screen::View => self
                             .registry
                             .active()
@@ -953,6 +1094,16 @@ impl App {
                             .unwrap_or_default(),
                         Screen::Menu => Vec::new(),
                     };
+                    // `*` marca favorito: se anuncia cuando la vista activa expone un
+                    // recurso favoritable (agnóstico: el App no sabe cuál).
+                    if matches!(self.screen, Screen::View)
+                        && self
+                            .registry
+                            .active()
+                            .is_some_and(|v| v.selected_favorite().is_some())
+                    {
+                        view.insert(0, ("*", "favorito"));
+                    }
                     command_bar::Footer::Hints {
                         filter: &self.filter,
                         view,
@@ -1859,6 +2010,109 @@ mod tests {
             body.contains("arn:aws:s3:::a") && body.contains("arn:aws:s3:::b"),
             "lista los resources"
         );
+    }
+
+    // --- Favoritos / recientes ------------------------------------------------
+
+    /// Vista que expone un recurso favoritable (`selected_favorite`).
+    struct FavView;
+    impl View for FavView {
+        fn id(&self) -> &'static str {
+            "logs"
+        }
+        fn title(&self) -> String {
+            "logs".to_string()
+        }
+        fn on_activate(&mut self) -> Vec<Action> {
+            Vec::new()
+        }
+        fn on_key(&mut self, _key: KeyEvent) -> Vec<Action> {
+            Vec::new()
+        }
+        fn on_message(&mut self, _message: &Message) {}
+        fn set_filter(&mut self, _filter: &str) {}
+        fn selected_favorite(&self) -> Option<(String, String)> {
+            Some(("/aws/lambda/api".to_string(), "api".to_string()))
+        }
+        fn render(&mut self, _frame: &mut Frame, _area: Rect) {}
+    }
+
+    fn app_with_fav_view() -> App {
+        let (tx, rx) = mpsc::channel(8);
+        let env = Env::new("default", "us-east-1");
+        let effects = Effects::new_mock(tx, env.clone());
+        let mut registry = Registry::new();
+        registry.register(Box::new(FavView));
+        App::new(env, registry, effects, rx)
+    }
+
+    #[test]
+    fn star_marks_and_unmarks_favorite() {
+        let mut app = app_with_fav_view();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // menú → vista
+        assert!(matches!(app.screen, Screen::View));
+        // `*` marca el recurso seleccionado como favorito.
+        app.on_key(ch('*'));
+        assert_eq!(app.store.favorites.len(), 1);
+        assert!(app.store.favorites[0].is_favorite);
+        assert_eq!(app.store.favorites[0].view_id, "logs");
+        assert_eq!(app.store.favorites[0].key, "/aws/lambda/api");
+        // `*` de nuevo lo desmarca (queda como reciente, sin estrella).
+        app.on_key(ch('*'));
+        assert!(!app.store.favorites[0].is_favorite);
+    }
+
+    #[test]
+    fn star_without_selectable_favorite_is_noop() {
+        let (mut app, _a, _k) = app_with_counting_view(); // CountingView → selected_favorite None
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(ch('*'));
+        assert!(app.store.favorites.is_empty(), "no hay nada que marcar");
+        assert!(app.status.as_ref().is_some_and(|s| !s.error));
+    }
+
+    #[test]
+    fn record_recent_action_stores_with_active_view_id() {
+        let (mut app, _a, _k) = app_with_counting_view();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // activa "logs"
+        app.dispatch(Action::RecordRecent {
+            key: "q1".to_string(),
+            label: "queue1".to_string(),
+        });
+        assert_eq!(app.store.favorites.len(), 1);
+        let f = &app.store.favorites[0];
+        assert_eq!(f.view_id, "logs");
+        assert_eq!(f.key, "q1");
+        assert!(!f.is_favorite, "un reciente no es favorito");
+    }
+
+    #[test]
+    fn menu_lists_favorites_and_enter_opens_via_context() {
+        let activated = Rc::new(Cell::new(0));
+        let contexts = Rc::new(Cell::new(0));
+        let (tx, rx) = mpsc::channel(8);
+        let env = Env::new("default", "us-east-1");
+        let effects = Effects::new_mock(tx, env.clone());
+        let mut registry = Registry::new();
+        registry.register(Box::new(ContextView {
+            activated: activated.clone(),
+            contexts: contexts.clone(),
+        }));
+        let mut app = App::new(env, registry, effects, rx);
+        app.store.toggle_favorite("logs", "/aws/lambda/api", "api");
+
+        // Menú: [Tool logs, Header ★ favoritos, Fav api]; seleccionables = índices 0 y 2.
+        let rows = app.menu_rows();
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(rows[1], MenuRow::Header(_)));
+        // `j` salta el header: 0 → 2 (la fila del favorito).
+        app.on_key(ch('j'));
+        assert_eq!(app.menu.selected(), Some(2));
+        // `enter` abre el favorito vía el handoff (on_context), no on_activate.
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.screen, Screen::View));
+        assert_eq!(contexts.get(), 1, "se abrió vía on_context");
+        assert_eq!(activated.get(), 0, "no se llamó on_activate");
     }
 
     #[tokio::test]

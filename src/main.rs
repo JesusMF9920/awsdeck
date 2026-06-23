@@ -58,6 +58,9 @@ async fn main() -> Result<()> {
     registry.register(Box::new(EventsView::new()));
 
     let mut app = App::new(env, registry, effects, rx);
+    // Inyecta los favoritos/recientes persistidos (`state.toml`); la app los muta en
+    // memoria y los reescribe al salir.
+    app.load_state(state);
 
     // Si no fijaste AWS_PROFILE, al iniciar te dejamos elegir con qué profile
     // trabajar (lee ~/.aws/config). Con AWS_PROFILE seteada, arranca directo.

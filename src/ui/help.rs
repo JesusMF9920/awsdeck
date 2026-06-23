@@ -15,7 +15,7 @@ const KEYS: &[(&str, &str)] = &[
     ),
     (
         "enter",
-        "drill · expandir (línea de log / cuerpo de msg sqs / input de target events)",
+        "drill · expandir (log / cuerpo msg sqs / input target events / in-out de estado sfn)",
     ),
     (
         "esc",
@@ -55,8 +55,9 @@ const KEYS: &[(&str, &str)] = &[
         "sfn: abrir los logs de la Lambda del estado seleccionado",
     ),
     ("p", "purgar cola SQS — gated por modo escritura"),
+    ("d", "redrive DLQ (sqs, sobre un dead-letter) — gated"),
     ("R", "redrive ejecución sfn — gated por modo escritura"),
-    ("S", "enviar evento de prueba (events) — gated"),
+    ("S", "enviar evento (events): abre form editable — gated"),
     (":write", "alternar modo escritura (acciones mutantes)"),
     ("ctrl-e", "cambiar de ambiente (picker de profiles)"),
     (

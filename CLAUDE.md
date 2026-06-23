@@ -81,13 +81,15 @@ por subcadena; con `↑/↓` navegas sin salir; `enter` entra directo, sin doble
 si no, un nivel; desde la raíz, al menú) · `r` refresh · `y` copiar ARN/URL/línea · `O` abrir en
 la consola AWS · `ctrl-e` cambiar ambiente (profiles) · `:region <código>` cambiar solo la región ·
 `?` ayuda · `q` salir. `enter` también **expande** el contenido completo (línea de log, cuerpo de
-mensaje `sqs`, `input` de target `events`) en un panel scrolleable; `o` **carga más** (tail: ventana ·
+mensaje `sqs`, `input` de target `events`, **input/output de un estado `sfn`**) en un panel
+scrolleable; `o` **carga más** (tail: ventana ·
 Events: líneas viejas · `sfn`: ejecuciones). En `logs`: `t` tail del group, `w/W` ventana, `f` tail en
 vivo. En `events` detalle: `P` expande el `event_pattern`. En `sfn`: `:status failed|all` filtra
 ejecuciones por estado y `l` (detalle) abre los logs de la Lambda del estado. Acciones mutantes gated
 por modo escritura (`:write`)
-+ confirm: `p` purgar cola (`sqs`), `R` redrive ejecución (`sfn`), `S` enviar evento a un bus
-(`events`). Las teclas propias de cada vista se **anuncian** en el footer según el contexto
++ confirm: `p` purgar cola (`sqs`), `d` redrive de DLQ (`sqs`, sobre un dead-letter), `R` redrive
+ejecución (`sfn`), `S` enviar evento a un bus (`events`, abre un **form editable**). Las teclas
+propias de cada vista se **anuncian** en el footer según el contexto
 (`View::hints`): no hay que memorizar la tabla ni abrir `?`.
 
 `esc` es navegación uniforme de **dos etapas** (estilo k9s): el `App` lo intercepta en
@@ -232,10 +234,10 @@ list/describe).
 - **Tail en vivo (`f`, `tail -f`)**: `View::on_tick` (default no-op) + un `interval` (~3s) en el loop
   del `App` (solo tickea con vista activa en modo normal, sin overlays). `logs` togglea `tail_live`
   con `f`; en cada tick re-consulta la ventana (salta al fondo). Título `[LIVE]`.
-- **Config en disco** (`config.rs`, load-only): `~/.config/awsdeck/config.toml` (respeta
-  `XDG_CONFIG_HOME`) con `default_profile`/`default_region` (fallbacks de `Env` tras el entorno) y
-  `default_tail_window` (preset del tail, vía `LogsView::with_default_window`). Si no existe/no parsea,
-  defaults. Escribir queda como follow-up.
+- **Config en disco** (`config.rs`): `~/.config/awsdeck/config.toml` (respeta `XDG_CONFIG_HOME`,
+  **load-only**, hand-editado) con `default_profile`/`default_region` (fallbacks de `Env` tras el
+  entorno) y `default_tail_window` (preset del tail, vía `LogsView::with_default_window`). Si no
+  existe/no parsea, defaults.
 - **Cross-link `sfn` → logs de la Lambda (`l`)**: en el detalle de una ejecución, `l` sobre un estado
   de tipo Lambda task salta a `logs` y abre el **tail de su log group** acotado a la ventana del
   estado. Mecanismo **agnóstico**: `effects::parse_history` cuelga el ARN de la Lambda de cada estado
@@ -283,8 +285,27 @@ list/describe).
     la respuesta respeta la posición del usuario salvo que ya estuviera al fondo (una carga manual sí
     salta al fondo). Antes cada tick (~3s) lo expulsaba al final y leer en vivo era inviable.
   - **Bug**: `parse_datetime` rechaza días fuera del mes (round-trip de `civil_from_days`).
+- **Backlog de features cerrado (P2)**: lo que faltaba para que cada vista sea "completa".
+  - **`sfn`: input/output por estado** en el timeline: `parse_history` extrae el `input`
+    (`StateEntered`) y `output` (`StateExited`) de cada estado a `StateSpanDto` (pretty + truncado);
+    `enter` sobre un estado abre el `DetailPanel` con ambos. Antes solo se veía el I/O global.
+  - **Paginación acotada + `· parcial`**: `fetch_log_streams` dejó de drenar el paginador sin tope
+    (`MAX_STREAM_PAGES`, `LogStreamsLoaded.more`, campo propio `streams_partial`); `get_execution_history`
+    dejó de ser una sola llamada de 1000 (`MAX_HISTORY_PAGES` ≈ 10k, `ExecutionDetailLoaded.history_more`,
+    `history_partial`). Ambos señalan `· parcial` (espeja `fetch_state_machines`).
+  - **`sqs`: redrive de DLQ** (`StartMessageMoveTask`): segunda mutante de sqs. Detección **nativa** —
+    `ListDeadLetterSourceQueues` (≥1 cola origen ⇒ ES un DLQ, sin heurística de nombres) → `dlq_sources`
+    / `is_dlq()`. `d` emite `Action::RedriveDlq`, reusa el gate; `effects` resuelve el `source_arn`
+    (GetQueueAttributes) y dispara `StartMessageMoveTask` (sin destino → vuelven al origen).
+  - **`events`: `SendEvent` editable** (`ui::form::Form`, genérico): `S` abre un form multi-campo
+    (source/detail-type/detail JSON con defaults); valida el JSON local y emite el payload (gated; el
+    confirm lo muestra). Nuevo hook agnóstico **`View::wants_raw_input`** → el `App` reenvía teclas
+    crudas a la vista activa (teclear `:`/`{`/`q` en el JSON sin que el core las intercepte).
+  - **Config persistente** (`config.rs`): nuevo `State { last_profile, last_region }` que la app
+    escribe sola al salir en `state.toml` (aparte del `config.toml` hand-editado, **no-destructivo**).
+    `initial_env` cae: entorno > `default_*` del config > último usado > defaults (`pick_env`, pura).
 
-213 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, búsqueda de
+233 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive, send y **redrive de DLQ**—, búsqueda de
 groups server-side por subcadena + fuzzy local + fan-out de casing ("createOrder" → "CreateOrderV3") +
 "latest wins", menú, drill x3 en `sfn`/`events` y
 eventos/tail de `logs`, back→menú de dos etapas,
@@ -301,9 +322,13 @@ cuenta, `switch_env` la resetea, header pinta cuenta + `[re-auth]`), `parse_date
 fuera del mes, **panel de detalle** (`DetailPanel`: cierra con esc/enter, `content()` crudo, JSON
 pretty), **expandir en `events`/`sqs`** (input/patrón/cuerpo), **tail en vivo conserva la posición**
 salvo al fondo, **load-more** (`sfn` ejecuciones append + `:status` server-side; `logs` Events antepone
-líneas viejas conservando la selección)). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
+líneas viejas conservando la selección), **input/output por estado** (`sfn`: enter abre el panel),
+**paginación** (`streams`/`history` señalan `· parcial`), **redrive de DLQ** (`is_dlq` por
+`ListDeadLetterSourceQueues`, `d` gated, mock), **form de envío** (`ui::form`: tab/enter/esc, valida
+JSON, `wants_raw_input` reenvía teclas crudas), **config persistente** (`State` round-trip,
+`pick_env` precedencia entorno > config > último > default)). `AWSDECK_MOCK=1 cargo run` lo abre sin
+credenciales.
 
-Pendiente: `SendEvent` con payload editable (form multi-campo; v3 envía un evento canned),
-input/output por estado en el timeline de `sfn`, escribir config en disco (hoy load-only). Backlog de
-vistas: Lambda,
-DynamoDB, ECS…
+Pendiente: `SendEvent` con campos `time`/`resources` o presets; load-more del `history` de `sfn`
+(hoy solo señala `· parcial`); favoritos/recientes; escribir de vuelta `config.toml` (queda
+hand-editado). Backlog de vistas: Lambda, DynamoDB, ECS…

@@ -44,7 +44,7 @@ data fresca). Nunca crashea.
 |-------|--------|
 | `:` | command bar (saltar de herramienta, p. ej. `:logs`, `:sqs`, `:sfn`, `:events`) |
 | `/` | buscar (en `logs` consulta al server por subcadena + fuzzy local, tolerante a mayús/minús; `↑`/`↓` navegan sin salir; `enter` entra directo) |
-| `enter` | drill al detalle (en `logs`: group → stream → **eventos**); **expande** completo: una línea de log, el cuerpo de un mensaje (`sqs`) o el `input` de un target (`events`) en un panel scrolleable (JSON pretty, `y` copia) |
+| `enter` | drill al detalle (en `logs`: group → stream → **eventos**); **expande** completo: una línea de log, el cuerpo de un mensaje (`sqs`), el `input` de un target (`events`) o el **input/output de un estado** (`sfn`) en un panel scrolleable (JSON pretty, `y` copia) |
 | `esc` | con filtro aplicado lo limpia (1er `esc`); si no, vuelve un nivel (drill back; en la raíz, al menú) |
 | `:menu` · `backspace` | volver al menú principal |
 | `j` / `k` · `↑` / `↓` · `g` / `G` | navegar (y scrollear el panel de detalle) |
@@ -60,15 +60,16 @@ data fresca). Nunca crashea.
 | `:status` | `sfn`: filtrar ejecuciones por estado server-side (`:status failed` · `:status all`) |
 | `l` | `sfn` (detalle): abrir los **logs de la Lambda** del estado seleccionado (cross-link a `logs`) |
 | `p` | purgar cola SQS (gated: modo escritura + confirm) |
+| `d` | `sqs` (detalle de un **DLQ**): redrive — reenvía los mensajes a sus colas origen (gated) |
 | `R` | redrive ejecución `sfn` fallida (gated: modo escritura + confirm) |
-| `S` | enviar evento de prueba a un bus `events` (gated: modo escritura + confirm) |
+| `S` | `events`: abre un **form editable** (source/detail-type/detail JSON) y publica el evento (gated) |
 | `:write` | alternar modo escritura (habilita acciones mutantes) |
 | `ctrl-e` | cambiar de ambiente (picker de profiles) |
 | `:region` | cambiar **solo la región** del ambiente actual (mismo profile), p. ej. `:region eu-west-1` |
 | `?` | ayuda |
 | `q` | salir |
 
-> Las teclas específicas de cada vista (`t`/`w`/`o`/`f` en `logs`, `y`/`O`, `p`/`R`/`S` gated) se
+> Las teclas específicas de cada vista (`t`/`w`/`o`/`f` en `logs`, `y`/`O`, `p`/`d`/`R`/`S` gated) se
 > **anuncian solas** en el footer según dónde estés, y `logs` además recuerda `t` en el título del
 > group: no hace falta memorizar esta tabla ni abrir `?`.
 
@@ -76,7 +77,7 @@ data fresca). Nunca crashea.
 
 ```bash
 AWSDECK_MOCK=1 cargo run    # ver el TUI con datos, sin tocar AWS
-cargo test                  # 213 tests, sin red
+cargo test                  # 233 tests, sin red
 cargo clippy --all-targets  # lint
 cargo fmt --check           # formato
 ```
@@ -170,10 +171,15 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
   scroll + JSON pretty + copia; **load-more** sin dejar nada inalcanzable (ejecuciones `sfn`, líneas
   viejas por stream en `logs`); **filtro de ejecuciones por estado** (`:status`); y el **tail en vivo
   ya no arrastra la selección** al fondo mientras lees.
+- **Backlog de features (P2)** ✅ **input/output por estado** en el timeline de `sfn` (`enter`);
+  **paginación acotada** de log streams y del history de `sfn` con señal `· parcial`; **redrive de
+  DLQ** en `sqs` (`d`, detección nativa por `ListDeadLetterSourceQueues`, gated); **`SendEvent` con
+  payload editable** (`events`, `S` abre un form multi-campo que valida el JSON; nuevo hook agnóstico
+  `View::wants_raw_input`); **config persistente** (recuerda el último ambiente en `state.toml`, sin
+  tocar el `config.toml` hand-editado).
 
-Backlog: `SendEvent` con payload editable,
-input/output por estado en el timeline de `sfn`, escribir config en disco, más vistas (Lambda,
-DynamoDB, ECS…).
+Backlog: `SendEvent` con `time`/`resources` o presets; load-more del history de `sfn`;
+favoritos/recientes; más vistas (Lambda, DynamoDB, ECS…).
 
 ## Stack
 

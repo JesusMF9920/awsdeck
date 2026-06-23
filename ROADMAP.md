@@ -177,7 +177,7 @@ Entregado: 3 niveles (state machines → ejecuciones → detalle). L1 `list_stat
 ### v3 — Vista `events` (EventBridge) — ✅ hecho
 Listar event buses, rules y targets; inspeccionar el patrón de cada rule; `SendEvent` de prueba (gated) para disparar un evento contra un bus.
 
-Entregado: 3 niveles (event buses → rules → detalle). L1 `list_event_buses` (paginado). L2 `list_rules` con estado coloreado (`[enabled]`/`[disabled]`) + descripción; guard de bus en `on_message`. L3 `describe_rule` + `list_targets_by_rule` combinados en un Message: render partido **meta / patrón / targets** con el `event_pattern` (pretty, truncado) inspeccionable y los targets como lista navegable/filtrable. `/` filtra en los 3 niveles; `ClearFilter` al cambiar de nivel; señal `· parcial`. `SendEvent` (`S` sobre el bus) publica un evento de prueba canned (`source=awsdeck.manual`) gated por el mismo gate prod-safe de v1/v2 (modo escritura + confirm); `put_events` con `failed_entry_count>0` → error a la status bar. Mock (`AWSDECK_MOCK=1`) y SDK real (`aws-sdk-eventbridge`).
+Entregado: 3 niveles (event buses → rules → detalle). L1 `list_event_buses` (paginado). L2 `list_rules` con estado coloreado (`[enabled]`/`[disabled]`) + descripción; guard de bus en `on_message`. L3 `describe_rule` + `list_targets_by_rule` combinados en un Message: render partido **meta / patrón / targets** con el `event_pattern` (pretty, truncado) inspeccionable y los targets como lista navegable/filtrable. `/` filtra en los 3 niveles; `ClearFilter` al cambiar de nivel; señal `· parcial`. `SendEvent` (`S` sobre el bus) gated por el mismo gate prod-safe de v1/v2 (modo escritura + confirm); `put_events` con `failed_entry_count>0` → error a la status bar. **(P2)** `S` ahora abre un **form editable** (`ui::form`: source/detail-type/detail JSON) que valida el JSON antes de enviar, en vez del evento canned. Mock (`AWSDECK_MOCK=1`) y SDK real (`aws-sdk-eventbridge`).
 
 ---
 
@@ -231,7 +231,15 @@ ejecuciones por estado) y `l` (logs de la Lambda del estado). Mutantes gated: `p
   `events`) con scroll + JSON pretty + copia; **load-more** sin dejar nada inalcanzable (ejecuciones
   `sfn` con `o`, líneas viejas por stream en `logs`); **filtro de ejecuciones por estado** (`:status`);
   y el **tail en vivo ya no arrastra la selección** mientras lees.
-- Escribir la config en disco (hoy solo se lee); profiles favoritos, modo escritura por ambiente.
+- **Hecho (backlog de features, P2):** **input/output por estado** en el timeline de `sfn` (`enter`
+  abre el panel); **paginación acotada** de log streams y del history de `sfn` con señal `· parcial`;
+  **redrive de DLQ** en `sqs` (`d`, detección nativa por `ListDeadLetterSourceQueues`, gated);
+  **`SendEvent` con payload editable** (`events`, `S` abre un form multi-campo —`ui::form`— que valida
+  el JSON; nuevo hook agnóstico `View::wants_raw_input` para teclas crudas); **config persistente** —
+  el último ambiente se recuerda en `state.toml` (aparte del `config.toml` hand-editado, `pick_env`
+  con precedencia entorno > config > último > default).
+- `SendEvent` con `time`/`resources` o presets; load-more del history de `sfn`; profiles favoritos /
+  recientes; escribir de vuelta el `config.toml` hand-editado.
 - Más vistas: Lambda (invoke + config), DynamoDB (scan/query), ECS (services/tasks), RDS (estado), S3.
 - Temas / paleta, y modo "denso" para pantallas chicas.
 

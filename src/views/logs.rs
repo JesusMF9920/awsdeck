@@ -363,8 +363,16 @@ impl LogsView {
                     self.loading = true;
                     self.state.select(Some(0));
                     // ClearFilter evita que el filtro de groups (server-side) se
-                    // arrastre a los streams (client-side, otro dominio).
-                    vec![Action::ClearFilter, Action::LoadLogStreams { group }]
+                    // arrastre a los streams (client-side, otro dominio). RecordRecent
+                    // recuerda el group abierto (recientes auto).
+                    vec![
+                        Action::ClearFilter,
+                        Action::RecordRecent {
+                            key: group.clone(),
+                            label: group.clone(),
+                        },
+                        Action::LoadLogStreams { group },
+                    ]
                 }
                 None => vec![],
             },
@@ -725,6 +733,14 @@ impl View for LogsView {
                 let window = LogWindow::Last(WINDOW_PRESETS[self.default_preset].1);
                 self.open_group_tail(key.clone(), window)
             }
+        }
+    }
+
+    /// Favorito = el log group seleccionado (solo en el nivel de groups).
+    fn selected_favorite(&self) -> Option<(String, String)> {
+        match self.level {
+            Level::Groups => self.selected_group_name().map(|g| (g.clone(), g)),
+            _ => None,
         }
     }
 
@@ -1354,6 +1370,27 @@ mod tests {
             Level::Tail { group } => assert_eq!(group, "/aws/lambda/ProcessOrder"),
             _ => panic!("debe quedar en Tail"),
         }
+    }
+
+    #[test]
+    fn favorite_getter_and_open_via_context() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/aws/lambda/api")]));
+        // En groups, el favorito es el group seleccionado.
+        assert_eq!(
+            v.selected_favorite(),
+            Some(("/aws/lambda/api".to_string(), "/aws/lambda/api".to_string()))
+        );
+        // Abrir el favorito via contexto → tail del group (en la ventana por defecto).
+        let actions = v.on_context(&ViewContext::Favorite {
+            key: "/aws/lambda/api".to_string(),
+        });
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, Action::LoadLogTail { group, .. } if group == "/aws/lambda/api")
+            )
+        );
+        assert!(matches!(v.level, Level::Tail { .. }));
     }
 
     #[test]
@@ -2043,10 +2080,15 @@ mod tests {
         v.on_key(key(KeyCode::Down)); // selecciona el segundo
         let actions = v.on_key(key(KeyCode::Enter));
         match actions.as_slice() {
-            [Action::ClearFilter, Action::LoadLogStreams { group }] => {
-                assert_eq!(group, "/ecs/checkout")
+            [
+                Action::ClearFilter,
+                Action::RecordRecent { key, .. },
+                Action::LoadLogStreams { group },
+            ] => {
+                assert_eq!(group, "/ecs/checkout");
+                assert_eq!(key, "/ecs/checkout", "recuerda el group abierto");
             }
-            other => panic!("se esperaba ClearFilter+LoadLogStreams, llegó {other:?}"),
+            other => panic!("se esperaba ClearFilter+RecordRecent+LoadLogStreams, llegó {other:?}"),
         }
         assert!(matches!(v.level, Level::Streams { .. }));
 

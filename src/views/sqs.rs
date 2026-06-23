@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::View;
-use crate::action::{Action, ConsoleTarget};
+use crate::action::{Action, ConsoleTarget, ViewContext};
 use crate::message::{Message, QueueAttrsDto, QueueDto, QueueMessageDto};
 use crate::ui::detail::DetailPanel;
 use crate::util::{fmt_epoch_millis, fuzzy_score, ranked};
@@ -156,8 +156,10 @@ impl SqsView {
         match self.level {
             Level::Queues => match self.selected_queue() {
                 Some(q) => {
+                    let url = q.url.clone();
+                    let label = name_from_url(&url).to_string();
                     self.level = Level::Detail {
-                        queue_url: q.url.clone(),
+                        queue_url: url.clone(),
                     };
                     self.attrs = None;
                     self.messages.clear();
@@ -165,7 +167,11 @@ impl SqsView {
                     self.state.select(Some(0));
                     vec![
                         Action::ClearFilter,
-                        Action::LoadQueueDetail { queue_url: q.url },
+                        Action::RecordRecent {
+                            key: url.clone(),
+                            label,
+                        },
+                        Action::LoadQueueDetail { queue_url: url },
                     ]
                 }
                 None => vec![],
@@ -338,6 +344,37 @@ impl View for SqsView {
         self.loading = true;
         self.state.select(Some(0));
         vec![Action::LoadQueues]
+    }
+
+    /// Abrir un favorito/reciente: la `key` es la URL de la cola → drillea directo a su
+    /// detalle. Otros contextos (LogGroupTail) no le conciernen → activación normal.
+    fn on_context(&mut self, context: &ViewContext) -> Vec<Action> {
+        match context {
+            ViewContext::Favorite { key } => {
+                self.level = Level::Detail {
+                    queue_url: key.clone(),
+                };
+                self.attrs = None;
+                self.messages.clear();
+                self.detail_panel = None;
+                self.loading = true;
+                self.state.select(Some(0));
+                vec![Action::LoadQueueDetail {
+                    queue_url: key.clone(),
+                }]
+            }
+            _ => self.on_activate(),
+        }
+    }
+
+    /// Favorito = la cola seleccionada (solo en el nivel de colas).
+    fn selected_favorite(&self) -> Option<(String, String)> {
+        match self.level {
+            Level::Queues => self
+                .selected_queue()
+                .map(|q| (q.url.clone(), name_from_url(&q.url).to_string())),
+            Level::Detail { .. } => None,
+        }
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -622,10 +659,17 @@ mod tests {
         v.on_key(key(KeyCode::Down)); // selecciona payments
         let actions = v.on_key(key(KeyCode::Enter));
         match actions.as_slice() {
-            [Action::ClearFilter, Action::LoadQueueDetail { queue_url }] => {
-                assert!(queue_url.ends_with("/payments"))
+            [
+                Action::ClearFilter,
+                Action::RecordRecent { label, .. },
+                Action::LoadQueueDetail { queue_url },
+            ] => {
+                assert!(queue_url.ends_with("/payments"));
+                assert_eq!(label, "payments", "recuerda la cola por su nombre");
             }
-            other => panic!("se esperaba ClearFilter+LoadQueueDetail, llegó {other:?}"),
+            other => {
+                panic!("se esperaba ClearFilter+RecordRecent+LoadQueueDetail, llegó {other:?}")
+            }
         }
         assert!(matches!(v.level, Level::Detail { .. }));
 
@@ -647,6 +691,27 @@ mod tests {
         v.on_key(key(KeyCode::Esc));
         assert!(matches!(v.level, Level::Queues));
         assert_eq!(v.visible_len(), 2);
+    }
+
+    #[test]
+    fn favorite_getter_and_open_via_context() {
+        let mut v = SqsView::new();
+        v.on_message(&Message::QueuesLoaded(vec![queue("payments")]));
+        // En el nivel de colas el favorito es la cola seleccionada (url + nombre).
+        let fav = v.selected_favorite().expect("hay una cola seleccionada");
+        assert!(fav.0.ends_with("/payments"), "key = url");
+        assert_eq!(fav.1, "payments", "label = nombre");
+
+        // Abrir un favorito via contexto → drillea directo al detalle de esa URL.
+        let url = queue("payments").url;
+        match v
+            .on_context(&ViewContext::Favorite { key: url.clone() })
+            .as_slice()
+        {
+            [Action::LoadQueueDetail { queue_url }] => assert_eq!(*queue_url, url),
+            other => panic!("se esperaba LoadQueueDetail, llegó {other:?}"),
+        }
+        assert!(matches!(v.level, Level::Detail { .. }));
     }
 
     #[test]

@@ -228,6 +228,10 @@ impl SfnView {
             return match self.selected_machine() {
                 Some(m) => {
                     let express = m.machine_type == MachineType::Express;
+                    let recent = Action::RecordRecent {
+                        key: m.arn.clone(),
+                        label: m.name.clone(),
+                    };
                     self.level = Level::Executions {
                         machine_arn: m.arn.clone(),
                         machine_name: m.name.clone(),
@@ -242,11 +246,12 @@ impl SfnView {
                         // EXPRESS no soporta list_executions (van a CloudWatch Logs):
                         // no se pide nada; el render muestra una nota.
                         self.loading = false;
-                        vec![Action::ClearFilter]
+                        vec![Action::ClearFilter, recent]
                     } else {
                         self.loading = true;
                         vec![
                             Action::ClearFilter,
+                            recent,
                             Action::LoadExecutions {
                                 machine_arn: m.arn,
                                 status: None,
@@ -725,6 +730,42 @@ impl View for SfnView {
         self.executions_partial = false;
         self.state.select(Some(0));
         vec![Action::LoadStateMachines]
+    }
+
+    /// Abrir un favorito/reciente: la `key` es el ARN de la máquina → drillea a sus
+    /// ejecuciones. No conocemos el tipo desde el ARN: asumimos STANDARD; si fuera
+    /// EXPRESS el SDK responde con error (status bar). Otros contextos → activación normal.
+    fn on_context(&mut self, context: &ViewContext) -> Vec<Action> {
+        match context {
+            ViewContext::Favorite { key } => {
+                let machine_name = key.rsplit(':').next().unwrap_or(key).to_string();
+                self.level = Level::Executions {
+                    machine_arn: key.clone(),
+                    machine_name,
+                    machine_type: MachineType::Standard,
+                };
+                self.executions.clear();
+                self.executions_partial = false;
+                self.exec_token = None;
+                self.exec_status = None;
+                self.loading = true;
+                self.state.select(Some(0));
+                vec![Action::LoadExecutions {
+                    machine_arn: key.clone(),
+                    status: None,
+                    token: None,
+                }]
+            }
+            _ => self.on_activate(),
+        }
+    }
+
+    /// Favorito = la state machine seleccionada (solo en el nivel de máquinas).
+    fn selected_favorite(&self) -> Option<(String, String)> {
+        match self.level {
+            Level::Machines => self.selected_machine().map(|m| (m.arn, m.name)),
+            _ => None,
+        }
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -1255,6 +1296,7 @@ mod tests {
         match actions.as_slice() {
             [
                 Action::ClearFilter,
+                Action::RecordRecent { .. },
                 Action::LoadExecutions {
                     machine_arn,
                     status: None,
@@ -1263,7 +1305,39 @@ mod tests {
             ] => {
                 assert!(machine_arn.ends_with("order-saga"))
             }
-            other => panic!("se esperaba ClearFilter+LoadExecutions, llegó {other:?}"),
+            other => {
+                panic!("se esperaba ClearFilter+RecordRecent+LoadExecutions, llegó {other:?}")
+            }
+        }
+        assert!(matches!(v.level, Level::Executions { .. }));
+    }
+
+    #[test]
+    fn favorite_getter_and_open_via_context() {
+        let mut v = SfnView::new();
+        v.on_message(&machines_msg(vec![machine(
+            "order-saga",
+            MachineType::Standard,
+        )]));
+        // En el nivel de máquinas el favorito es la máquina seleccionada (arn + nombre).
+        let fav = v.selected_favorite().expect("hay máquina seleccionada");
+        assert!(fav.0.ends_with("order-saga"), "key = arn");
+        assert_eq!(fav.1, "order-saga", "label = nombre");
+
+        // Abrir un favorito via contexto → drillea directo a sus ejecuciones.
+        let arn = "arn:aws:states:us-east-1:000:stateMachine:order-saga".to_string();
+        match v
+            .on_context(&ViewContext::Favorite { key: arn.clone() })
+            .as_slice()
+        {
+            [
+                Action::LoadExecutions {
+                    machine_arn,
+                    status: None,
+                    token: None,
+                },
+            ] => assert_eq!(*machine_arn, arn),
+            other => panic!("se esperaba LoadExecutions, llegó {other:?}"),
         }
         assert!(matches!(v.level, Level::Executions { .. }));
     }
@@ -1353,8 +1427,12 @@ mod tests {
         )]));
         let actions = v.on_key(key(KeyCode::Enter));
         assert!(
-            matches!(actions.as_slice(), [Action::ClearFilter]),
-            "EXPRESS no dispara list_executions (evita el error del SDK); solo limpia el filtro"
+            matches!(
+                actions.as_slice(),
+                [Action::ClearFilter, Action::RecordRecent { .. }]
+            ),
+            "EXPRESS no dispara list_executions (evita el error del SDK); limpia el filtro y \
+             recuerda la máquina"
         );
         assert!(matches!(
             v.level,

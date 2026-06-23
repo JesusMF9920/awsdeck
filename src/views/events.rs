@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::View;
-use crate::action::{Action, ConsoleTarget};
+use crate::action::{Action, ConsoleTarget, ViewContext};
 use crate::message::{EventBusDto, Message, RuleDetailDto, RuleDto, RuleState, TargetDto};
 use crate::ui::detail::DetailPanel;
 use crate::ui::form::{Form, FormOutcome};
@@ -220,8 +220,9 @@ impl EventsView {
         if matches!(self.level, Level::Buses) {
             return match self.selected_bus() {
                 Some(b) => {
+                    let name = b.name.clone();
                     self.level = Level::Rules {
-                        event_bus_name: b.name.clone(),
+                        event_bus_name: name.clone(),
                     };
                     self.rules.clear();
                     self.rules_partial = false;
@@ -229,8 +230,12 @@ impl EventsView {
                     self.state.select(Some(0));
                     vec![
                         Action::ClearFilter,
+                        Action::RecordRecent {
+                            key: name.clone(),
+                            label: name.clone(),
+                        },
                         Action::LoadRules {
-                            event_bus_name: b.name,
+                            event_bus_name: name,
                         },
                     ]
                 }
@@ -547,6 +552,36 @@ impl View for EventsView {
         self.rules_partial = false;
         self.state.select(Some(0));
         vec![Action::LoadEventBuses]
+    }
+
+    /// Abrir un favorito/reciente: la `key` es el nombre del bus → drillea a sus rules.
+    /// Otros contextos (LogGroupTail) no le conciernen → activación normal.
+    fn on_context(&mut self, context: &ViewContext) -> Vec<Action> {
+        match context {
+            ViewContext::Favorite { key } => {
+                self.level = Level::Rules {
+                    event_bus_name: key.clone(),
+                };
+                self.rules.clear();
+                self.rules_partial = false;
+                self.detail_panel = None;
+                self.event_form = None;
+                self.loading = true;
+                self.state.select(Some(0));
+                vec![Action::LoadRules {
+                    event_bus_name: key.clone(),
+                }]
+            }
+            _ => self.on_activate(),
+        }
+    }
+
+    /// Favorito = el event bus seleccionado (solo en el nivel de buses).
+    fn selected_favorite(&self) -> Option<(String, String)> {
+        match self.level {
+            Level::Buses => self.selected_bus().map(|b| (b.name.clone(), b.name)),
+            _ => None,
+        }
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -977,10 +1012,37 @@ mod tests {
         v.on_message(&buses_msg(vec![bus("default")]));
         let actions = v.on_key(key(KeyCode::Enter));
         match actions.as_slice() {
-            [Action::ClearFilter, Action::LoadRules { event_bus_name }] => {
-                assert_eq!(event_bus_name, "default")
+            [
+                Action::ClearFilter,
+                Action::RecordRecent { key, .. },
+                Action::LoadRules { event_bus_name },
+            ] => {
+                assert_eq!(event_bus_name, "default");
+                assert_eq!(key, "default", "recuerda el bus abierto");
             }
-            other => panic!("se esperaba ClearFilter+LoadRules, llegó {other:?}"),
+            other => panic!("se esperaba ClearFilter+RecordRecent+LoadRules, llegó {other:?}"),
+        }
+        assert!(matches!(v.level, Level::Rules { .. }));
+    }
+
+    #[test]
+    fn favorite_getter_and_open_via_context() {
+        let mut v = EventsView::new();
+        v.on_message(&buses_msg(vec![bus("default")]));
+        // En el nivel de buses el favorito es el bus seleccionado.
+        assert_eq!(
+            v.selected_favorite(),
+            Some(("default".to_string(), "default".to_string()))
+        );
+        // Abrir un favorito via contexto → drillea directo a sus rules.
+        match v
+            .on_context(&ViewContext::Favorite {
+                key: "default".to_string(),
+            })
+            .as_slice()
+        {
+            [Action::LoadRules { event_bus_name }] => assert_eq!(event_bus_name, "default"),
+            other => panic!("se esperaba LoadRules, llegó {other:?}"),
         }
         assert!(matches!(v.level, Level::Rules { .. }));
     }

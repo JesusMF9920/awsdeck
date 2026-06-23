@@ -101,7 +101,11 @@ impl Effects {
             Action::LoadQueueDetail { queue_url } => self.load_queue_detail(queue_url, epoch),
             Action::PurgeQueue { queue_url } => self.purge_queue(queue_url, epoch),
             Action::LoadStateMachines => self.load_state_machines(epoch),
-            Action::LoadExecutions { machine_arn } => self.load_executions(machine_arn, epoch),
+            Action::LoadExecutions {
+                machine_arn,
+                status,
+                token,
+            } => self.load_executions(machine_arn, status, token, epoch),
             Action::LoadExecutionDetail { execution_arn } => {
                 self.load_execution_detail(execution_arn, epoch)
             }
@@ -375,17 +379,25 @@ impl Effects {
         }
     }
 
-    fn load_executions(&self, machine_arn: String, epoch: u64) {
+    fn load_executions(
+        &self,
+        machine_arn: String,
+        status: Option<ExecStatus>,
+        token: Option<String>,
+        epoch: u64,
+    ) {
         let tx = self.tx.clone();
+        let append = token.is_some();
         match &self.backend {
             Backend::Mock(_) => {
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(450)).await;
-                    let executions = mock_executions(&machine_arn);
+                    let executions = mock_executions(&machine_arn, status);
                     let msg = Message::ExecutionsLoaded {
                         machine_arn,
                         executions,
-                        more: false,
+                        next_token: None,
+                        append,
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -393,11 +405,12 @@ impl Effects {
             Backend::Real(ctx) => {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    let msg = match fetch_executions(&ctx, &machine_arn).await {
-                        Ok((executions, more)) => Message::ExecutionsLoaded {
+                    let msg = match fetch_executions(&ctx, &machine_arn, status, token).await {
+                        Ok((executions, next_token)) => Message::ExecutionsLoaded {
                             machine_arn,
                             executions,
-                            more,
+                            next_token,
+                            append,
                         },
                         Err(e) => sdk_error("list_executions", &e),
                     };
@@ -1137,13 +1150,17 @@ async fn fetch_state_machines(
 async fn fetch_executions(
     ctx: &AwsContext,
     machine_arn: &str,
-) -> color_eyre::Result<(Vec<ExecutionDto>, bool)> {
+    status: Option<ExecStatus>,
+    token: Option<String>,
+) -> color_eyre::Result<(Vec<ExecutionDto>, Option<String>)> {
     let out = ctx
         .sfn()
         .await
         .list_executions()
         .state_machine_arn(machine_arn)
         .max_results(50)
+        .set_status_filter(status.and_then(exec_status_filter))
+        .set_next_token(token)
         .send()
         .await?;
     let executions = out
@@ -1157,7 +1174,21 @@ async fn fetch_executions(
             stop_ts: opt_dt_millis(e.stop_date()),
         })
         .collect();
-    Ok((executions, out.next_token().is_some()))
+    Ok((executions, out.next_token().map(str::to_string)))
+}
+
+/// `ExecStatus` propio → el `ExecutionStatus` del SDK para `status_filter`. `None` para
+/// `PendingRedrive` (no es un valor de filtro del API).
+fn exec_status_filter(status: ExecStatus) -> Option<aws_sdk_sfn::types::ExecutionStatus> {
+    use aws_sdk_sfn::types::ExecutionStatus as S;
+    Some(match status {
+        ExecStatus::Running => S::Running,
+        ExecStatus::Succeeded => S::Succeeded,
+        ExecStatus::Failed => S::Failed,
+        ExecStatus::TimedOut => S::TimedOut,
+        ExecStatus::Aborted => S::Aborted,
+        ExecStatus::PendingRedrive => return None,
+    })
 }
 
 /// Combina `describe_execution` (status/tiempos/input/output/error) +
@@ -1652,7 +1683,7 @@ fn mock_state_machines(env: &Env) -> Vec<StateMachineDto> {
 /// Ejecuciones falsas de una máquina, deterministas por el arn. Incluye al menos
 /// una FAILED y una RUNNING (sin `stop_ts`). Los `tag`s (`fail`/`run`/…) los lee
 /// `mock_execution_detail` para producir un detalle coherente.
-fn mock_executions(machine_arn: &str) -> Vec<ExecutionDto> {
+fn mock_executions(machine_arn: &str, status: Option<ExecStatus>) -> Vec<ExecutionDto> {
     let specs: [(&str, ExecStatus); 6] = [
         ("fail", ExecStatus::Failed),
         ("ok-1", ExecStatus::Succeeded),
@@ -1665,6 +1696,8 @@ fn mock_executions(machine_arn: &str) -> Vec<ExecutionDto> {
     specs
         .into_iter()
         .enumerate()
+        // Espeja el `status_filter` server-side del SDK real.
+        .filter(|(_, (_, s))| status.is_none_or(|want| *s == want))
         .map(|(i, (tag, status))| {
             let name = format!("exec-{tag}-{i}");
             let start = base_ts - (i as i64) * 3_600_000;
@@ -2254,6 +2287,8 @@ mod tests {
         fx.dispatch(
             Action::LoadExecutions {
                 machine_arn: "arn:aws:states:us-east-1:000:stateMachine:dev-order-saga".into(),
+                status: None,
+                token: None,
             },
             6,
         );
@@ -2264,9 +2299,11 @@ mod tests {
             Message::ExecutionsLoaded {
                 machine_arn,
                 executions,
-                more,
+                next_token,
+                append,
             } => {
-                assert!(!more, "el mock cabe en una página");
+                assert!(next_token.is_none(), "el mock cabe en una página");
+                assert!(!append, "primera página no es append");
                 assert!(machine_arn.contains("order-saga"));
                 assert!(executions.iter().any(|e| e.status == ExecStatus::Failed));
                 assert!(
@@ -2274,6 +2311,31 @@ mod tests {
                         .iter()
                         .any(|e| e.status == ExecStatus::Running && e.stop_ts.is_none()),
                     "una RUNNING no tiene stop_ts"
+                );
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_executions_status_filter_narrows() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+        fx.dispatch(
+            Action::LoadExecutions {
+                machine_arn: "arn:aws:states:us-east-1:000:stateMachine:dev-order-saga".into(),
+                status: Some(ExecStatus::Failed),
+                token: None,
+            },
+            1,
+        );
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        match envelope.message {
+            Message::ExecutionsLoaded { executions, .. } => {
+                assert!(!executions.is_empty());
+                assert!(
+                    executions.iter().all(|e| e.status == ExecStatus::Failed),
+                    "el filtro de estado solo trae FAILED"
                 );
             }
             other => panic!("mensaje inesperado: {other:?}"),

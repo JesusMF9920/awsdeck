@@ -366,12 +366,13 @@ pub enum Message {
         more: bool,
     },
     /// Ejecuciones de una máquina (`machine_arn` para confirmar el drill actual).
-    /// `more` indica que el servidor tiene más (`next_token`): se muestran las 50
-    /// más recientes.
+    /// `next_token` = el servidor tiene más (para `o` cargar más); `append` = es
+    /// continuación de una página previa (la vista la APPENDea, como el tail de logs).
     ExecutionsLoaded {
         machine_arn: String,
         executions: Vec<ExecutionDto>,
-        more: bool,
+        next_token: Option<String>,
+        append: bool,
     },
     /// Detalle de una ejecución (`describe_execution` + history ya parseado).
     /// `execution_arn` permite a la vista confirmar el drill actual; `failed_state`

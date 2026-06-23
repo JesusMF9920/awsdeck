@@ -51,6 +51,10 @@ pub struct SfnView {
     machines_partial: bool,
     /// El servidor tiene más ejecuciones (`next_token`): se muestran las recientes.
     executions_partial: bool,
+    /// `next_token` de las ejecuciones para `o` (load-more, append). `None` = no hay más.
+    exec_token: Option<String>,
+    /// Filtro server-side por estado (`:status failed`); `None` = todas.
+    exec_status: Option<ExecStatus>,
     state: ListState,
 }
 
@@ -67,6 +71,8 @@ impl SfnView {
             loading: false,
             machines_partial: false,
             executions_partial: false,
+            exec_token: None,
+            exec_status: None,
             state: ListState::default().with_selected(Some(0)),
         }
     }
@@ -194,6 +200,8 @@ impl SfnView {
                     };
                     self.executions.clear();
                     self.executions_partial = false;
+                    self.exec_token = None;
+                    self.exec_status = None; // cada máquina arranca sin filtro de estado
                     self.state.select(Some(0));
                     if express {
                         // EXPRESS no soporta list_executions (van a CloudWatch Logs):
@@ -204,7 +212,11 @@ impl SfnView {
                         self.loading = true;
                         vec![
                             Action::ClearFilter,
-                            Action::LoadExecutions { machine_arn: m.arn },
+                            Action::LoadExecutions {
+                                machine_arn: m.arn,
+                                status: None,
+                                token: None,
+                            },
                         ]
                     }
                 }
@@ -301,8 +313,11 @@ impl SfnView {
                 if *machine_type == MachineType::Express {
                     vec![]
                 } else {
+                    self.exec_token = None;
                     vec![Action::LoadExecutions {
                         machine_arn: machine_arn.clone(),
+                        status: self.exec_status,
+                        token: None,
                     }]
                 }
             }
@@ -312,6 +327,63 @@ impl SfnView {
         };
         self.loading = !actions.is_empty();
         actions
+    }
+
+    /// `o`: trae la siguiente página de ejecuciones (append) si hay `next_token`. Así
+    /// ninguna ejecución (p. ej. un fallo de ayer fuera del top-50) queda inalcanzable.
+    fn load_more_executions(&mut self) -> Vec<Action> {
+        let Some(token) = self.exec_token.clone() else {
+            return vec![];
+        };
+        if let Level::Executions {
+            machine_arn,
+            machine_type,
+            ..
+        } = &self.level
+            && *machine_type != MachineType::Express
+        {
+            let machine_arn = machine_arn.clone();
+            self.loading = true;
+            return vec![Action::LoadExecutions {
+                machine_arn,
+                status: self.exec_status,
+                token: Some(token),
+            }];
+        }
+        vec![]
+    }
+
+    /// `:status <estado|all>` (solo en Executions): fija el filtro server-side por estado
+    /// y recarga desde la primera página. Permite "ver solo las fallidas" más allá del top-50.
+    fn set_exec_status(&mut self, arg: &str) -> Vec<Action> {
+        let machine_arn = match &self.level {
+            Level::Executions {
+                machine_arn,
+                machine_type,
+                ..
+            } if *machine_type != MachineType::Express => machine_arn.clone(),
+            _ => return vec![],
+        };
+        let status = match arg.to_ascii_lowercase().as_str() {
+            "all" | "todas" | "todos" | "*" => None,
+            "failed" | "fail" => Some(ExecStatus::Failed),
+            "running" | "run" => Some(ExecStatus::Running),
+            "succeeded" | "ok" | "success" => Some(ExecStatus::Succeeded),
+            "aborted" | "abort" => Some(ExecStatus::Aborted),
+            "timedout" | "timed_out" | "timeout" => Some(ExecStatus::TimedOut),
+            _ => return vec![], // arg inválido → no-op (el App avisa "comando desconocido")
+        };
+        self.exec_status = status;
+        self.exec_token = None;
+        self.executions.clear();
+        self.executions_partial = false;
+        self.state.select(Some(0));
+        self.loading = true;
+        vec![Action::LoadExecutions {
+            machine_arn,
+            status,
+            token: None,
+        }]
     }
 
     /// `R` en el detalle: emite la intención de redrive SOLO si la ejecución es
@@ -405,15 +477,19 @@ impl SfnView {
         let total = self.executions.len();
         let shown = self.filtered_execution_indices().len();
         let partial = if self.executions_partial {
-            " · parcial (recientes)"
+            " · parcial · o: más"
         } else {
             ""
         };
+        let status = match self.exec_status {
+            Some(s) => format!(" · solo {}", s.label()),
+            None => String::new(),
+        };
         if self.filter.is_empty() {
-            format!(" {name} · {total} ejecuciones{partial} ")
+            format!(" {name} · {total} ejecuciones{status}{partial} ")
         } else {
             format!(
-                " {name} · {shown}/{total}{partial} · filtro: {} ",
+                " {name} · {shown}/{total}{status}{partial} · filtro: {} ",
                 self.filter
             )
         }
@@ -518,6 +594,13 @@ impl View for SfnView {
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         let mut hints = vec![("y", "copiar ARN"), ("O", "consola")];
+        // En ejecuciones: filtrar por estado y traer más allá del top-50.
+        if matches!(self.level, Level::Executions { .. }) {
+            hints.push((":status", "filtrar (failed/all)"));
+            if self.executions_partial {
+                hints.push(("o", "más"));
+            }
+        }
         // `l` solo si el estado seleccionado del timeline invoca una Lambda (cross-link
         // a sus logs). Lectura → sin gate.
         if self
@@ -554,6 +637,8 @@ impl View for SfnView {
     fn on_activate(&mut self) -> Vec<Action> {
         self.level = Level::Machines;
         self.executions.clear();
+        self.exec_token = None;
+        self.exec_status = None;
         self.detail = None;
         self.history.clear();
         self.failed_state = None;
@@ -585,6 +670,7 @@ impl View for SfnView {
             KeyCode::Enter => self.drill(),
             KeyCode::Esc => self.back(),
             KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('o') => self.load_more_executions(),
             KeyCode::Char('R') => self.redrive_intent(),
             KeyCode::Char('l') => self.open_lambda_logs(),
             KeyCode::Char('y') => self
@@ -601,6 +687,14 @@ impl View for SfnView {
         }
     }
 
+    fn on_command(&mut self, cmd: &str) -> Vec<Action> {
+        // `:status <estado|all>` filtra las ejecuciones server-side por estado.
+        match cmd.strip_prefix("status ") {
+            Some(arg) => self.set_exec_status(arg.trim()),
+            None => vec![],
+        }
+    }
+
     fn on_message(&mut self, message: &Message) {
         match message {
             Message::StateMachinesLoaded { machines, more } => {
@@ -614,7 +708,8 @@ impl View for SfnView {
             Message::ExecutionsLoaded {
                 machine_arn,
                 executions,
-                more,
+                next_token,
+                append,
             } => {
                 if let Level::Executions {
                     machine_arn: current,
@@ -622,8 +717,13 @@ impl View for SfnView {
                 } = &self.level
                     && current == machine_arn
                 {
-                    self.executions = executions.clone();
-                    self.executions_partial = *more;
+                    if *append {
+                        self.executions.extend(executions.clone());
+                    } else {
+                        self.executions = executions.clone();
+                    }
+                    self.exec_token = next_token.clone();
+                    self.executions_partial = next_token.is_some();
                     self.loading = false;
                     self.clamp_selection();
                 }
@@ -892,7 +992,8 @@ mod tests {
         v.on_message(&Message::ExecutionsLoaded {
             machine_arn,
             executions: vec![exec("e1", status)],
-            more: false,
+            next_token: None,
+            append: false,
         });
         v.on_key(key(KeyCode::Enter)); // → Detail
         let execution_arn = exec("e1", status).arn;
@@ -984,7 +1085,8 @@ mod tests {
         v.on_message(&Message::ExecutionsLoaded {
             machine_arn,
             executions: vec![exec("e1", ExecStatus::Succeeded)],
-            more: true,
+            next_token: Some("more".into()),
+            append: false,
         });
         assert!(v.executions_title().contains("parcial"));
     }
@@ -1019,12 +1121,95 @@ mod tests {
         )]));
         let actions = v.on_key(key(KeyCode::Enter));
         match actions.as_slice() {
-            [Action::ClearFilter, Action::LoadExecutions { machine_arn }] => {
+            [
+                Action::ClearFilter,
+                Action::LoadExecutions {
+                    machine_arn,
+                    status: None,
+                    token: None,
+                },
+            ] => {
                 assert!(machine_arn.ends_with("order-saga"))
             }
             other => panic!("se esperaba ClearFilter+LoadExecutions, llegó {other:?}"),
         }
         assert!(matches!(v.level, Level::Executions { .. }));
+    }
+
+    #[test]
+    fn o_loads_more_executions_and_appends() {
+        let mut v = SfnView::new();
+        v.on_message(&machines_msg(vec![machine("m1", MachineType::Standard)]));
+        v.on_key(key(KeyCode::Enter)); // → Executions
+        let arn = "arn:aws:states:us-east-1:000:stateMachine:m1".to_string();
+        // Primera página con next_token → guarda el token y marca parcial.
+        v.on_message(&Message::ExecutionsLoaded {
+            machine_arn: arn.clone(),
+            executions: vec![exec("e1", ExecStatus::Succeeded)],
+            next_token: Some("tok".into()),
+            append: false,
+        });
+        assert_eq!(v.visible_len(), 1);
+        assert!(v.executions_partial);
+
+        // `o` → load-more con el token (append).
+        match v.on_key(key(KeyCode::Char('o'))).as_slice() {
+            [
+                Action::LoadExecutions {
+                    machine_arn,
+                    status: None,
+                    token: Some(t),
+                },
+            ] => {
+                assert!(machine_arn.ends_with("m1"));
+                assert_eq!(t, "tok");
+            }
+            other => panic!("se esperaba LoadExecutions con token, llegó {other:?}"),
+        }
+
+        // Llega la página 2 (append) → se extiende, no reemplaza.
+        v.on_message(&Message::ExecutionsLoaded {
+            machine_arn: arn,
+            executions: vec![exec("e2", ExecStatus::Failed)],
+            next_token: None,
+            append: true,
+        });
+        assert_eq!(v.visible_len(), 2, "append extiende la lista");
+        assert!(!v.executions_partial, "sin next_token ya no es parcial");
+    }
+
+    #[test]
+    fn status_command_filters_executions_server_side() {
+        let mut v = SfnView::new();
+        v.on_message(&machines_msg(vec![machine("m1", MachineType::Standard)]));
+        v.on_key(key(KeyCode::Enter)); // → Executions
+        v.on_message(&Message::ExecutionsLoaded {
+            machine_arn: "arn:aws:states:us-east-1:000:stateMachine:m1".into(),
+            executions: vec![exec("e1", ExecStatus::Succeeded)],
+            next_token: None,
+            append: false,
+        });
+
+        // `:status failed` → recarga server-side filtrando por FAILED.
+        match v.on_command("status failed").as_slice() {
+            [
+                Action::LoadExecutions {
+                    status: Some(ExecStatus::Failed),
+                    token: None,
+                    ..
+                },
+            ] => {}
+            other => panic!("se esperaba LoadExecutions FAILED, llegó {other:?}"),
+        }
+        assert_eq!(v.exec_status, Some(ExecStatus::Failed));
+        assert!(v.executions_title().contains("solo FAILED"));
+
+        // `:status all` limpia el filtro.
+        match v.on_command("status all").as_slice() {
+            [Action::LoadExecutions { status: None, .. }] => {}
+            other => panic!("se esperaba LoadExecutions sin filtro, llegó {other:?}"),
+        }
+        assert_eq!(v.exec_status, None);
     }
 
     #[test]
@@ -1057,7 +1242,8 @@ mod tests {
         v.on_message(&Message::ExecutionsLoaded {
             machine_arn: "arn:aws:states:us-east-1:000:stateMachine:m1".into(),
             executions: vec![exec("e1", ExecStatus::Succeeded)],
-            more: false,
+            next_token: None,
+            append: false,
         });
         let actions = v.on_key(key(KeyCode::Enter)); // → Detail
         match actions.as_slice() {
@@ -1115,7 +1301,8 @@ mod tests {
         v.on_message(&Message::ExecutionsLoaded {
             machine_arn: "arn:aws:states:us-east-1:000:stateMachine:OTRA".into(),
             executions: vec![exec("x", ExecStatus::Succeeded)],
-            more: false,
+            next_token: None,
+            append: false,
         });
         assert_eq!(
             v.visible_len(),
@@ -1132,7 +1319,8 @@ mod tests {
         v.on_message(&Message::ExecutionsLoaded {
             machine_arn: "arn:aws:states:us-east-1:000:stateMachine:m1".into(),
             executions: vec![exec("e1", ExecStatus::Succeeded)],
-            more: false,
+            next_token: None,
+            append: false,
         });
         v.on_key(key(KeyCode::Enter)); // → Detail de e1
         v.on_message(&Message::ExecutionDetailLoaded {

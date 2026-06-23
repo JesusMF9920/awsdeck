@@ -7,7 +7,7 @@
 //! servicio (junto con `message.rs`, `effects.rs`, `aws/` y `main.rs`).
 
 use crate::aws::context::Env;
-use crate::message::LogWindow;
+use crate::message::{ExecStatus, LogWindow};
 
 #[derive(Clone, Debug)]
 pub enum Action {
@@ -69,8 +69,14 @@ pub enum Action {
     LoadQueueDetail { queue_url: String },
     /// Pedir las state machines de Step Functions del ambiente activo.
     LoadStateMachines,
-    /// Hacer drill a una máquina: sus ejecuciones (más recientes primero).
-    LoadExecutions { machine_arn: String },
+    /// Hacer drill a una máquina: sus ejecuciones (más recientes primero). `status` =
+    /// filtro server-side por estado (`:status failed`; `None` = todas); `token=Some` =
+    /// continuar paginando (load-more con `o`, append).
+    LoadExecutions {
+        machine_arn: String,
+        status: Option<ExecStatus>,
+        token: Option<String>,
+    },
     /// Hacer drill a una ejecución: describe + history (timeline de estados).
     LoadExecutionDetail { execution_arn: String },
     /// Pedir los event buses de EventBridge del ambiente activo.

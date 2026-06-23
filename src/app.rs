@@ -163,6 +163,10 @@ impl App {
         // Arranca en el menú principal (Screen::Menu por defecto). El picker de
         // ambiente, si lo hay, se dibuja encima hasta que el usuario elija.
         let mut events = EventStream::new();
+        // Tick periódico para refrescos en vivo (p. ej. tail -f de logs). Marca la
+        // cadencia; cada vista decide en `on_tick` si refresca. Skip si nos atrasamos.
+        let mut tick = tokio::time::interval(Duration::from_secs(3));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         while !self.should_quit {
             terminal.draw(|frame| self.render(frame))?;
 
@@ -192,9 +196,28 @@ impl App {
                     self.search_deadline = None;
                     self.dispatch_active_search();
                 }
+                _ = tick.tick() => self.on_tick(),
             }
         }
         Ok(())
+    }
+
+    /// Tick periódico: si hay una vista activa en modo normal (sin overlays), le
+    /// pregunta si quiere refrescar (tail -f). Agnóstico: no sabe qué vista es.
+    fn on_tick(&mut self) {
+        if !matches!(self.screen, Screen::View)
+            || !matches!(self.mode, Mode::Normal)
+            || self.confirm.is_some()
+            || self.picker.is_some()
+            || self.show_help
+        {
+            return;
+        }
+        let actions = match self.registry.active_mut() {
+            Some(view) => view.on_tick(),
+            None => Vec::new(),
+        };
+        self.dispatch_all(actions);
     }
 
     // --- Routing --------------------------------------------------------------

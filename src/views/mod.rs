@@ -67,6 +67,13 @@ pub trait View {
         Vec::new()
     }
 
+    /// Tick periódico del `App` (cadencia fija). La vista decide si quiere refrescar
+    /// (p. ej. el tail en vivo de `logs` re-consulta); default no-op. El `App` solo
+    /// tickea cuando hay una vista activa en modo normal, sin overlays.
+    fn on_tick(&mut self) -> Vec<Action> {
+        Vec::new()
+    }
+
     /// Dibuja la vista dentro de `area`.
     fn render(&mut self, frame: &mut Frame, area: Rect);
 

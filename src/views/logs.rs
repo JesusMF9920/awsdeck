@@ -79,6 +79,9 @@ pub struct LogsView {
     /// Generación de la consulta de tail vigente: sube en cada consulta *fresca*
     /// (ventana/patrón/drill) y NO en load-more; descarta respuestas con generation viejo.
     tail_gen: u64,
+    /// Tail en vivo (`tail -f`): si `true` y estás en `Tail`, cada tick del `App`
+    /// re-consulta la ventana (salta al fondo, newest abajo). Toggle con `f`.
+    tail_live: bool,
     /// Línea expandida: índice ABSOLUTO en `events` del evento abierto en el panel de
     /// detalle (`enter` sobre una línea). `None` = mostrando la lista.
     detail: Option<usize>,
@@ -105,6 +108,7 @@ impl LogsView {
             tail_preset: DEFAULT_PRESET,
             tail_token: None,
             tail_gen: 0,
+            tail_live: false,
             detail: None,
             detail_scroll: 0,
             state: ListState::default().with_selected(Some(0)),
@@ -370,6 +374,7 @@ impl LogsView {
                 self.tail_window = window;
                 self.tail_preset = preset;
                 self.tail_token = None;
+                self.tail_live = false; // un tail recién abierto no sigue en vivo
                 self.last_query = None; // el tail arranca sin filtro server-side
                 self.state.select(Some(0));
                 let mut actions = vec![Action::ClearFilter];
@@ -396,6 +401,20 @@ impl LogsView {
         self.tail_token = None;
         self.state.select(Some(0));
         self.tail_query(None)
+    }
+
+    /// `f`: alterna el tail en vivo (solo en `Tail`). Al prender, dispara una consulta
+    /// fresca de inmediato; el `App` seguirá tickeando mientras siga prendido.
+    fn toggle_live(&mut self) -> Vec<Action> {
+        if !matches!(self.level, Level::Tail { .. }) {
+            return vec![];
+        }
+        self.tail_live = !self.tail_live;
+        if self.tail_live {
+            self.tail_query(None)
+        } else {
+            vec![]
+        }
     }
 
     /// `o`: carga la siguiente página del tail (append) si hay `next_token`.
@@ -426,6 +445,7 @@ impl LogsView {
             // sin filtro server-side), así que volver no recarga: solo cambia de nivel.
             Level::Streams { .. } | Level::Tail { .. } => {
                 self.level = Level::Groups;
+                self.tail_live = false; // salir del tail apaga el seguimiento
                 self.recompute_filtered();
                 self.state.select(Some(0));
                 self.clamp_selection();
@@ -576,8 +596,13 @@ impl View for LogsView {
             Level::Groups | Level::Streams { .. } => {
                 vec![("t", "logs por tiempo"), ("y", "copiar"), ("O", "consola")]
             }
-            // Dentro del tail: cómo cambiar la ventana / paginar / fijar rango.
-            Level::Tail { .. } => vec![("w", "ventana"), ("o", "más"), (":since", "rango")],
+            // Dentro del tail: ventana / paginar / seguir en vivo / fijar rango.
+            Level::Tail { .. } => vec![
+                ("w", "ventana"),
+                ("o", "más"),
+                ("f", if self.tail_live { "detener" } else { "tail -f" }),
+                (":since", "rango"),
+            ],
             Level::Events { .. } => vec![("y", "copiar línea"), ("O", "consola")],
         }
     }
@@ -587,7 +612,19 @@ impl View for LogsView {
             Level::Groups => "logs".to_string(),
             Level::Streams { group } => format!("logs / {group}"),
             Level::Events { group, stream } => format!("logs / {group} / {stream}"),
-            Level::Tail { group } => format!("logs / {group} (tail)"),
+            Level::Tail { group } => {
+                let live = if self.tail_live { " [LIVE]" } else { "" };
+                format!("logs / {group} (tail){live}")
+            }
+        }
+    }
+
+    fn on_tick(&mut self) -> Vec<Action> {
+        // Tail en vivo: re-consulta la ventana actual (consulta fresca → salta al fondo).
+        if self.tail_live && matches!(self.level, Level::Tail { .. }) {
+            self.tail_query(None)
+        } else {
+            vec![]
         }
     }
 
@@ -598,6 +635,7 @@ impl View for LogsView {
         self.loading = true;
         self.last_query = None;
         self.partial = false;
+        self.tail_live = false;
         self.tail_token = None;
         self.tail_preset = DEFAULT_PRESET;
         self.tail_window = LogWindow::Last(WINDOW_PRESETS[DEFAULT_PRESET].1);
@@ -649,10 +687,12 @@ impl View for LogsView {
                 .collect(),
             // Logs del group (todos sus streams) por rango de tiempo.
             KeyCode::Char('t') => self.tail(),
-            // En el tail: `w`/`W` ciclan la ventana, `o` carga más (paginación).
+            // En el tail: `w`/`W` ciclan la ventana, `o` carga más (paginación),
+            // `f` togglea el seguimiento en vivo (tail -f).
             KeyCode::Char('w') => self.cycle_window(true),
             KeyCode::Char('W') => self.cycle_window(false),
             KeyCode::Char('o') => self.load_more(),
+            KeyCode::Char('f') => self.toggle_live(),
             _ => vec![],
         }
     }
@@ -1443,6 +1483,51 @@ mod tests {
             [Action::CopyToClipboard { text }] => assert_eq!(text, "ERROR boom"),
             other => panic!("se esperaba copiar la línea, llegó {other:?}"),
         }
+    }
+
+    #[test]
+    fn f_toggles_live_tail_and_on_tick_refreshes() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Char('t'))); // tail, gen=1, live off
+        assert!(v.on_tick().is_empty(), "sin live, el tick no refresca");
+        // `f` prende el live y dispara una consulta fresca de inmediato.
+        let actions = v.on_key(key(KeyCode::Char('f')));
+        assert!(v.tail_live, "f prende el seguimiento en vivo");
+        assert!(
+            matches!(actions.as_slice(), [Action::LoadLogTail { token: None, .. }]),
+            "prender live dispara una consulta fresca: {actions:?}"
+        );
+        // Con live, cada tick re-consulta.
+        assert!(
+            matches!(v.on_tick().as_slice(), [Action::LoadLogTail { .. }]),
+            "con live, el tick refresca el tail"
+        );
+        // `f` de nuevo lo apaga; el tick vuelve a ser no-op.
+        v.on_key(key(KeyCode::Char('f')));
+        assert!(!v.tail_live);
+        assert!(v.on_tick().is_empty());
+    }
+
+    #[test]
+    fn live_badge_shows_in_title() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Char('t')));
+        assert!(!v.title().contains("[LIVE]"));
+        v.on_key(key(KeyCode::Char('f')));
+        assert!(v.title().contains("[LIVE]"), "el título marca el seguimiento");
+    }
+
+    #[test]
+    fn back_from_tail_stops_live() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Char('t')));
+        v.on_key(key(KeyCode::Char('f'))); // live on
+        assert!(v.tail_live);
+        v.on_key(key(KeyCode::Esc)); // tail → groups
+        assert!(!v.tail_live, "salir del tail apaga el live");
     }
 
     #[test]

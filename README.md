@@ -31,8 +31,12 @@ AWSDECK_MOCK=1 cargo run
 `esc` usa el default). Si fijaste `AWS_PROFILE=algún-profile`, arranca directo a esa cuenta sin
 preguntar. La región sale de `AWS_REGION` o del profile (default `us-east-1`).
 
-Cambia de ambiente en vivo con `ctrl-e`. Si un profile no tiene credenciales válidas, el error
-se muestra en la **status bar** (no crashea).
+Cambia de ambiente en vivo con `ctrl-e` (profiles) o `:region <código>` (solo la región, mismo
+profile). El header confirma la **cuenta real** vía STS (`profile · region · 123456789012`), no
+solo el nombre del profile. Si las credenciales caducaron o falta un permiso, el error es
+**accionable y pegajoso**: la status bar dice qué hacer (`sesión caducada — corre aws sso login…`)
+y enciende un `[re-auth]` en el header; no se borra al navegar (se descarta con `esc` o al llegar
+data fresca). Nunca crashea.
 
 ## Keybindings
 
@@ -58,6 +62,7 @@ se muestra en la **status bar** (no crashea).
 | `S` | enviar evento de prueba a un bus `events` (gated: modo escritura + confirm) |
 | `:write` | alternar modo escritura (habilita acciones mutantes) |
 | `ctrl-e` | cambiar de ambiente (picker de profiles) |
+| `:region` | cambiar **solo la región** del ambiente actual (mismo profile), p. ej. `:region eu-west-1` |
 | `?` | ayuda |
 | `q` | salir |
 
@@ -69,7 +74,7 @@ se muestra en la **status bar** (no crashea).
 
 ```bash
 AWSDECK_MOCK=1 cargo run    # ver el TUI con datos, sin tocar AWS
-cargo test                  # 189 tests, sin red
+cargo test                  # 201 tests, sin red
 cargo clippy --all-targets  # lint
 cargo fmt --check           # formato
 ```
@@ -151,6 +156,10 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
   (`~/.config/awsdeck/config.toml`), búsqueda de groups por subcadena sin prefijo y **tolerante a
   casing** (fan-out server-side + fuzzy local, sin cargar todo), un solo `enter` desde el filtro,
   **handoff entre vistas con contexto** (`ActivateViewWithContext`/`View::on_context`).
+- **Robustez AWS real (P0)** ✅ errores del SDK **tipados** (`ErrorKind`) con la causa real
+  (SSO/credenciales caducadas, AccessDenied, throttling) y **pista accionable pegajosa** + `[re-auth]`
+  en el header; **cuenta confirmada por STS** en el header (prod-safe); **`:region`** para cambiar de
+  región sin tocar `~/.aws/config`; **retry adaptativo + timeouts** en el `SdkConfig`.
 
 Backlog: `SendEvent` con payload editable,
 input/output por estado en el timeline de `sfn`, escribir config en disco, más vistas (Lambda,

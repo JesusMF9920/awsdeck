@@ -193,7 +193,8 @@ Entregado: 3 niveles (event buses → rules → detalle). L1 `list_event_buses` 
 | `r` | refresh |
 | `y` | copiar ARN/URL/línea al clipboard |
 | `O` | abrir el recurso en la consola AWS |
-| `ctrl-e` | cambiar de ambiente |
+| `ctrl-e` | cambiar de ambiente (profiles) |
+| `:region` | cambiar solo la región del ambiente actual (p. ej. `:region eu-west-1`) |
 | `?` | ayuda |
 | `q` | salir |
 
@@ -218,6 +219,10 @@ Entregado: 3 niveles (event buses → rules → detalle). L1 `list_event_buses` 
   **vínculo a CloudWatch Logs desde otras vistas** — `l` en el detalle de `sfn` abre los logs de la
   Lambda de un estado, vía el handoff agnóstico `ActivateViewWithContext`/`View::on_context` (el core
   no inspecciona el `ViewContext`).
+- **Hecho (robustez AWS real, P0):** errores del SDK **tipados** (`ErrorKind`) con la causa real
+  (SSO/credenciales caducadas, AccessDenied, throttling) + **hint accionable pegajoso** y `[re-auth]`
+  en el header; **cuenta confirmada por STS** en el header (prod-safe); **`:region`** (cambiar región
+  sin editar `~/.aws/config`); **retry adaptativo + timeouts** en el `SdkConfig`.
 - Escribir la config en disco (hoy solo se lee); profiles favoritos, modo escritura por ambiente.
 - Más vistas: Lambda (invoke + config), DynamoDB (scan/query), ECS (services/tasks), RDS (estado), S3.
 - Temas / paleta, y modo "denso" para pantallas chicas.
@@ -228,4 +233,5 @@ Entregado: 3 niveles (event buses → rules → detalle). L1 `list_event_buses` 
 
 - Nombre final (`awsdeck` vs `cloudeck` vs otro).
 - ¿Soporte de SSO/`aws sso login` en v0 o lo dejamos para v1?
-- ¿Multi-región simultánea (ver dos regiones a la vez) o una a la vez por ahora? (Propuesta: una a la vez en v0.)
+- ¿Multi-región simultánea (ver dos regiones a la vez) o una a la vez por ahora? (Resuelto: una a la
+  vez; `:region` cambia de región al instante sin reiniciar. Multi-región simultánea queda fuera.)

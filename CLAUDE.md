@@ -79,7 +79,8 @@ concretas se cablean en `main.rs`; `effects.rs` es la frontera deliberada con el
 por subcadena; con `↑/↓` navegas sin salir; `enter` entra directo, sin doble enter) · `enter` drill ·
 `esc` back de dos etapas (con filtro lo limpia;
 si no, un nivel; desde la raíz, al menú) · `r` refresh · `y` copiar ARN/URL/línea · `O` abrir en
-la consola AWS · `ctrl-e` cambiar ambiente · `?` ayuda · `q` salir. En `logs`: `t` tail del group,
+la consola AWS · `ctrl-e` cambiar ambiente (profiles) · `:region <código>` cambiar solo la región ·
+`?` ayuda · `q` salir. En `logs`: `t` tail del group,
 `w/W` ventana, `o` paginar, `f` tail en vivo. En `sfn` detalle: `l` abre los logs de la Lambda del
 estado seleccionado. Acciones mutantes gated por modo escritura (`:write`)
 + confirm: `p` purgar cola (`sqs`), `R` redrive ejecución (`sfn`), `S` enviar evento a un bus
@@ -243,8 +244,28 @@ list/describe).
   inspeccionar** el `ViewContext` (espeja `on_message`/`ConsoleTarget`: el core nunca nombra
   servicios). `logs::on_context` abre el tail directo (`open_group_tail`). Lectura → sin gate; el hint
   `l` solo aparece sobre un estado con Lambda.
+- **Robustez contra AWS real (P0)**: lo que hacía frustrante el uso diario contra una cuenta real.
+  - **Errores tipados y accionables**: `Message::Error { kind: ErrorKind, detail }` (antes `String`).
+    `ErrorKind` (`Auth`/`AccessDenied`/`Throttle`/`Network`/`Other`) **no nombra servicios** → el core
+    ramifica sin romper el agnosticismo. `effects::sdk_error` recorre `e.chain()` (el `SdkError`
+    esconde el code/message reales en `source()`, no en `{e}`), clasifica y arma un detalle con
+    **hint** (Auth → "corre `aws sso login`"). Reemplaza los 15 sitios `format!("op: {e}")`.
+  - **Status pegajoso + recuperación**: las teclas de navegación ya no borran un error (`on_key` solo
+    limpia el info); se descarta con `esc` (etapa 0, antes del esc de filtro/back), con data fresca
+    (`on_envelope`) o al cambiar de ambiente. El header enciende `[re-auth]` ante `ErrorKind::Auth`
+    (`App::error_kind`, derivado sin nombrar servicios).
+  - **Cuenta confirmada por STS**: `Action::VerifyIdentity` → `Message::IdentityLoaded { account_id }`
+    (`get_caller_identity`; mock canned). El header muestra `profile · region · <cuenta>` (prod-safe:
+    la cuenta real, no solo el nombre del profile). `App::identity_pending` lo dispara desde el **loop**
+    (no `switch_env`) para que los cambios de ambiente queden sincrónicos (sin `tokio::spawn`); el epoch
+    guard descarta stale; un fallo de STS clasifica `Auth` (= SSO caducado) y enciende `[re-auth]`.
+  - **`:region <código>`** (core agnóstico en `run_command`): cambia solo la región del ambiente actual
+    reusando `switch_env` (epoch + clients + recarga); cumple "región cambiable al instante".
+  - **Retry adaptativo + timeouts** en el `SdkConfig` (`aws/context.rs`): mitiga throttling del fan-out;
+    un endpoint colgado falla como `Network` (reintentable con `r`) en vez de congelar la TUI.
+  - **Nudge** al arrancar sin profiles en `~/.aws/config` (antes caía a default en silencio).
 
-189 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, búsqueda de
+201 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, búsqueda de
 groups server-side por subcadena + fuzzy local + fan-out de casing ("createOrder" → "CreateOrderV3") +
 "latest wins", menú, drill x3 en `sfn`/`events` y
 eventos/tail de `logs`, back→menú de dos etapas,
@@ -254,7 +275,11 @@ append—, cache de filtrado invariante, copiar (`y`) y abrir consola (`O`) por 
 tail en vivo (`f`/`on_tick`/`[LIVE]`), config (`Config::parse`), expandir línea (JSON pretty), parsers
 de fecha/duración, guard EXPRESS, `parse_history` —incluye resource_arn de Lambda—, cross-link
 `sfn`→logs (`on_context`/`ActivateViewWithContext`), `lambda_log_group_from_arn`, hints por vista +
-footer, render con `TestBackend`). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
+footer, render con `TestBackend`, **errores tipados** (`ErrorKind::classify`/`hint`), **status
+pegajoso** (sobrevive navegación, se limpia con data fresca, `esc` lo descarta), **`:region`**
+(cambia región conservando profile), **STS** (mock `VerifyIdentity`, `IdentityLoaded` puebla la
+cuenta, `switch_env` la resetea, header pinta cuenta + `[re-auth]`), `parse_datetime` rechaza días
+fuera del mes). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
 
 Pendiente: `SendEvent` con payload editable (form multi-campo; v3 envía un evento canned),
 input/output por estado en el timeline de `sfn`, escribir config en disco (hoy load-only). Backlog de

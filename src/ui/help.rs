@@ -17,7 +17,10 @@ const KEYS: &[(&str, &str)] = &[
         "enter",
         "drill (group → stream → eventos) · en una línea, expandir",
     ),
-    ("esc", "con filtro: lo limpia; si no, volver (raíz → menú)"),
+    (
+        "esc",
+        "descarta el error; con filtro lo limpia; si no, volver (raíz → menú)",
+    ),
     (":menu / bksp", "volver al menú principal"),
     ("r", "refresh"),
     ("y", "copiar ARN/URL/línea del item al portapapeles"),
@@ -41,7 +44,11 @@ const KEYS: &[(&str, &str)] = &[
     ("R", "redrive ejecución sfn — gated por modo escritura"),
     ("S", "enviar evento de prueba (events) — gated"),
     (":write", "alternar modo escritura (acciones mutantes)"),
-    ("ctrl-e", "cambiar de ambiente"),
+    ("ctrl-e", "cambiar de ambiente (picker de profiles)"),
+    (
+        ":region",
+        "cambiar SOLO la región del ambiente actual (p. ej. :region eu-west-1)",
+    ),
     ("?", "mostrar/ocultar esta ayuda"),
     ("q", "salir"),
 ];

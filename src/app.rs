@@ -594,6 +594,14 @@ impl App {
                     action,
                 }
             }
+            Action::RedriveDlq { queue_url } => {
+                let name = queue_url.rsplit('/').next().unwrap_or(queue_url);
+                Confirm {
+                    title: " redrive DLQ ".to_string(),
+                    body: format!("se reenviarán los mensajes del DLQ a sus colas origen:\n{name}"),
+                    action,
+                }
+            }
             Action::RedriveExecution { execution_arn } => {
                 let name = execution_arn.rsplit(':').next().unwrap_or(execution_arn);
                 Confirm {
@@ -643,6 +651,7 @@ impl App {
                 self.error_kind = Some(*kind);
             }
             Message::QueuePurged { .. } => self.set_info("cola purgada — refrescando…"),
+            Message::DlqRedriveStarted { .. } => self.set_info("redrive iniciado — refrescando…"),
             Message::ExecutionRedriven { .. } => self.set_info("redrive enviado — refrescando…"),
             Message::EventSent { event_bus_name } => {
                 self.set_info(format!("evento enviado a {event_bus_name}"))
@@ -657,6 +666,9 @@ impl App {
         // servidor no se actualiza al instante).
         match envelope.message {
             Message::QueuePurged { queue_url } => {
+                self.dispatch(Action::LoadQueueDetail { queue_url })
+            }
+            Message::DlqRedriveStarted { queue_url } => {
                 self.dispatch(Action::LoadQueueDetail { queue_url })
             }
             Message::ExecutionRedriven { execution_arn } => {
@@ -916,7 +928,10 @@ impl App {
 fn is_mutating(action: &Action) -> bool {
     matches!(
         action,
-        Action::PurgeQueue { .. } | Action::RedriveExecution { .. } | Action::SendEvent { .. }
+        Action::PurgeQueue { .. }
+            | Action::RedriveDlq { .. }
+            | Action::RedriveExecution { .. }
+            | Action::SendEvent { .. }
     )
 }
 
@@ -1555,6 +1570,25 @@ mod tests {
         app.write_mode = true;
         app.dispatch(purge("https://sqs/000/orders"));
         assert!(app.confirm.is_some(), "con modo escritura abre el confirm");
+    }
+
+    #[test]
+    fn redrive_dlq_is_gated_like_purge() {
+        let action = || Action::RedriveDlq {
+            queue_url: "https://sqs/000/orders-dlq".to_string(),
+        };
+        // Sin modo escritura: bloquea, no abre confirm.
+        let mut app = test_app();
+        app.dispatch(action());
+        assert!(app.confirm.is_none());
+        assert!(app.status.as_ref().is_some_and(|s| s.error));
+        // Con modo escritura: abre el confirm con el nombre del DLQ.
+        let mut app = test_app();
+        app.write_mode = true;
+        app.dispatch(action());
+        let c = app.confirm.as_ref().expect("confirm de redrive DLQ");
+        assert!(c.title.contains("redrive DLQ"));
+        assert!(c.body.contains("orders-dlq"));
     }
 
     #[test]

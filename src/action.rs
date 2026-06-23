@@ -97,6 +97,9 @@ pub enum Action {
     // --- Mutantes: gated por el `App` (modo escritura + confirm) antes de effects ---
     /// Purgar una cola: borra TODOS sus mensajes. Irreversible.
     PurgeQueue { queue_url: String },
+    /// Redrive de un DLQ (`StartMessageMoveTask`): reenvía sus mensajes a las colas
+    /// origen. `queue_url` = el DLQ; `effects` resuelve su ARN (`source_arn`).
+    RedriveDlq { queue_url: String },
     /// Redrive de una ejecución fallida: la relanza desde el último estado fallido.
     RedriveExecution { execution_arn: String },
     /// Publicar un evento de prueba (canned) contra un bus de EventBridge.

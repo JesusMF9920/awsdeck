@@ -65,11 +65,20 @@ pub struct QueueAttrsDto {
     /// ARN de la DLQ (de `RedrivePolicy`), si la cola tiene una configurada.
     pub dlq_target_arn: Option<String>,
     pub max_receive_count: Option<i64>,
+    /// URLs de las colas que usan ESTA cola como su DLQ (`ListDeadLetterSourceQueues`).
+    /// No vacío ⇒ la cola **es** un DLQ → se ofrece el redrive (`d`). Lo puebla `effects`.
+    pub dlq_sources: Vec<String>,
 }
 
 impl QueueAttrsDto {
+    /// La cola tiene configurada una DLQ (perspectiva de origen).
     pub fn has_dlq(&self) -> bool {
         self.dlq_target_arn.is_some()
+    }
+
+    /// La cola **es** un DLQ de otras (≥1 cola origen): habilita el redrive.
+    pub fn is_dlq(&self) -> bool {
+        !self.dlq_sources.is_empty()
     }
 }
 
@@ -367,6 +376,9 @@ pub enum Message {
     },
     /// Se purgó una cola (acción mutante confirmada).
     QueuePurged { queue_url: String },
+    /// Se inició el redrive de un DLQ (`StartMessageMoveTask`): los mensajes vuelven a
+    /// sus colas origen. `queue_url` = el DLQ (para refrescar su detalle).
+    DlqRedriveStarted { queue_url: String },
 
     // --- Step Functions (v2) ---
     /// Se cargaron las state machines del ambiente activo. `more` indica que se

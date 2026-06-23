@@ -104,6 +104,7 @@ impl Effects {
             Action::LoadQueues => self.load_queues(epoch),
             Action::LoadQueueDetail { queue_url } => self.load_queue_detail(queue_url, epoch),
             Action::PurgeQueue { queue_url } => self.purge_queue(queue_url, epoch),
+            Action::RedriveDlq { queue_url } => self.redrive_dlq(queue_url, epoch),
             Action::LoadStateMachines => self.load_state_machines(epoch),
             Action::LoadExecutions {
                 machine_arn,
@@ -358,6 +359,29 @@ impl Effects {
                     let msg = match purge_queue_real(&ctx, &queue_url).await {
                         Ok(()) => Message::QueuePurged { queue_url },
                         Err(e) => sdk_error("purge_queue", &e),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+        }
+    }
+
+    fn redrive_dlq(&self, queue_url: String, epoch: u64) {
+        let tx = self.tx.clone();
+        match &self.backend {
+            Backend::Mock(_) => {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let msg = Message::DlqRedriveStarted { queue_url };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match redrive_dlq_real(&ctx, &queue_url).await {
+                        Ok(()) => Message::DlqRedriveStarted { queue_url },
+                        Err(e) => sdk_error("start_message_move_task", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -1025,6 +1049,18 @@ async fn fetch_queue_detail(
 
     let (dlq_target_arn, max_receive_count) =
         parse_redrive(get(&QueueAttributeName::RedrivePolicy));
+
+    // ¿Esta cola ES un DLQ? `ListDeadLetterSourceQueues` lista las colas que la usan
+    // como su DLQ; ≥1 ⇒ el redrive (`d`) tiene sentido. Best-effort: un gap de permiso
+    // en esta llamada NO debe romper el detalle (se trata como "no es DLQ").
+    let dlq_sources = client
+        .list_dead_letter_source_queues()
+        .queue_url(queue_url)
+        .send()
+        .await
+        .map(|o| o.queue_urls().to_vec())
+        .unwrap_or_default();
+
     let attrs = QueueAttrsDto {
         visible: int(&QueueAttributeName::ApproximateNumberOfMessages),
         in_flight: int(&QueueAttributeName::ApproximateNumberOfMessagesNotVisible),
@@ -1032,6 +1068,7 @@ async fn fetch_queue_detail(
         arn: get(&QueueAttributeName::QueueArn).map(str::to_string),
         dlq_target_arn,
         max_receive_count,
+        dlq_sources,
     };
 
     // Peek: receive con visibility_timeout(0) (best-effort; incrementa receive_count).
@@ -1071,6 +1108,30 @@ async fn purge_queue_real(ctx: &AwsContext, queue_url: &str) -> color_eyre::Resu
         .await
         .purge_queue()
         .queue_url(queue_url)
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// Inicia el redrive de un DLQ: `StartMessageMoveTask` requiere el ARN de la cola
+/// (`source_arn`), no su URL; lo resolvemos con `GetQueueAttributes(QueueArn)`. Sin
+/// `destination_arn`, AWS devuelve los mensajes a sus colas origen.
+async fn redrive_dlq_real(ctx: &AwsContext, queue_url: &str) -> color_eyre::Result<()> {
+    use aws_sdk_sqs::types::QueueAttributeName;
+    let client = ctx.sqs().await;
+    let out = client
+        .get_queue_attributes()
+        .queue_url(queue_url)
+        .attribute_names(QueueAttributeName::QueueArn)
+        .send()
+        .await?;
+    let source_arn = out
+        .attributes()
+        .and_then(|m| m.get(&QueueAttributeName::QueueArn))
+        .ok_or_else(|| color_eyre::eyre::eyre!("no se pudo resolver el ARN de la cola"))?;
+    client
+        .start_message_move_task()
+        .source_arn(source_arn)
         .send()
         .await?;
     Ok(())
@@ -1698,6 +1759,15 @@ fn mock_queue_detail(url: &str) -> (QueueAttrsDto, Vec<QueueMessageDto>) {
         arn: Some(format!("arn:aws:sqs:us-east-1:000000000000:{name}")),
         dlq_target_arn: (!is_dlq).then(|| format!("arn:aws:sqs:us-east-1:000000000000:{name}-dlq")),
         max_receive_count: (!is_dlq).then_some(5),
+        // Una cola `*-dlq` ES un DLQ: tiene colas origen → redrive demoable offline.
+        dlq_sources: if is_dlq {
+            let src = name.strip_suffix("-dlq").unwrap_or(name);
+            vec![format!(
+                "https://sqs.us-east-1.amazonaws.com/000000000000/{src}"
+            )]
+        } else {
+            Vec::new()
+        },
     };
 
     let base_ts: i64 = 1_750_000_000_000;
@@ -2305,6 +2375,49 @@ mod tests {
         let envelope = rx.recv().await.expect("debe llegar un envelope");
         assert_eq!(envelope.epoch, 1);
         assert!(matches!(envelope.message, Message::QueuePurged { queue_url } if queue_url == url));
+    }
+
+    #[tokio::test]
+    async fn mock_queue_detail_dlq_queue_has_sources() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+        let url = "https://sqs.us-east-1.amazonaws.com/000000000000/orders-dlq".to_string();
+
+        fx.dispatch(
+            Action::LoadQueueDetail {
+                queue_url: url.clone(),
+            },
+            2,
+        );
+
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        match envelope.message {
+            Message::QueueDetailLoaded { attrs, .. } => {
+                assert!(attrs.is_dlq(), "un *-dlq ES un DLQ (tiene colas origen)");
+                assert!(!attrs.has_dlq(), "un DLQ no apunta a otro DLQ");
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_redrive_dlq_replies_started() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+        let url = "https://sqs.us-east-1.amazonaws.com/000000000000/orders-dlq".to_string();
+
+        fx.dispatch(
+            Action::RedriveDlq {
+                queue_url: url.clone(),
+            },
+            7,
+        );
+
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        assert_eq!(envelope.epoch, 7);
+        assert!(
+            matches!(envelope.message, Message::DlqRedriveStarted { queue_url } if queue_url == url)
+        );
     }
 
     #[test]

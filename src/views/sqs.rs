@@ -209,6 +209,19 @@ impl SqsView {
         }
     }
 
+    /// `d` en el detalle: emite la intención de redrive SOLO si la cola es un DLQ
+    /// (`is_dlq`). El App la gatea (modo escritura + confirm).
+    fn redrive_intent(&self) -> Vec<Action> {
+        match &self.level {
+            Level::Detail { queue_url } if self.attrs.as_ref().is_some_and(|a| a.is_dlq()) => {
+                vec![Action::RedriveDlq {
+                    queue_url: queue_url.clone(),
+                }]
+            }
+            _ => vec![],
+        }
+    }
+
     // --- Render ---------------------------------------------------------------
 
     fn queues_title(&self) -> String {
@@ -253,13 +266,20 @@ impl SqsView {
                 Span::raw(v),
             ])
         };
-        let lines = vec![
+        let mut lines = vec![
             row("visible", opt(a.visible)),
             row("in-flight", opt(a.in_flight)),
             row("delayed", opt(a.delayed)),
             row("DLQ", dlq),
             row("ARN", a.arn.clone().unwrap_or_else(|| "—".to_string())),
         ];
+        // Si la cola ES un DLQ (tiene colas origen), anunciarlo: habilita `d` redrive.
+        if a.is_dlq() {
+            lines.push(row(
+                "DLQ de",
+                format!("{} colas origen · [d] redrive", a.dlq_sources.len()),
+            ));
+        }
         Paragraph::new(lines).block(block)
     }
 }
@@ -285,13 +305,20 @@ impl View for SqsView {
             return p.hints();
         }
         match self.level {
-            // En el detalle de una cola, `p` purga (gated por modo escritura + confirm).
-            Level::Detail { .. } => vec![
-                ("enter", "ver cuerpo"),
-                ("y", "copiar ARN"),
-                ("O", "consola"),
-                ("p", "purgar"),
-            ],
+            // En el detalle de una cola, `p` purga y `d` redrivea el DLQ (ambas gated).
+            Level::Detail { .. } => {
+                let mut hints = vec![
+                    ("enter", "ver cuerpo"),
+                    ("y", "copiar ARN"),
+                    ("O", "consola"),
+                    ("p", "purgar"),
+                ];
+                // `d` solo si la cola ES un DLQ (tiene colas origen).
+                if self.attrs.as_ref().is_some_and(|a| a.is_dlq()) {
+                    hints.push(("d", "redrive DLQ"));
+                }
+                hints
+            }
             Level::Queues => vec![("y", "copiar URL"), ("O", "consola")],
         }
     }
@@ -360,6 +387,7 @@ impl View for SqsView {
             KeyCode::Esc => self.back(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('p') => self.purge_intent(),
+            KeyCode::Char('d') => self.redrive_intent(),
             KeyCode::Char('y') => self
                 .copy_text()
                 .map(|text| Action::CopyToClipboard { text })
@@ -410,6 +438,14 @@ impl View for SqsView {
                     self.loading = true;
                 }
             }
+            Message::DlqRedriveStarted { queue_url } => {
+                // El App re-dispara LoadQueueDetail; aquí marcamos recarga.
+                if let Level::Detail { queue_url: current } = &self.level
+                    && current == queue_url
+                {
+                    self.loading = true;
+                }
+            }
             Message::Error { .. } => self.loading = false,
             // Mensajes de otras vistas (p. ej. logs): se ignoran.
             _ => {}
@@ -448,9 +484,15 @@ impl View for SqsView {
             return;
         }
 
-        // Detalle: attributes arriba, peek de mensajes abajo.
+        // Detalle: attributes arriba, peek de mensajes abajo. Una fila más si la cola
+        // es un DLQ (muestra "DLQ de" + el hint de redrive).
+        let attrs_h = if self.attrs.as_ref().is_some_and(|a| a.is_dlq()) {
+            8
+        } else {
+            7
+        };
         let [attrs_area, msgs_area] =
-            Layout::vertical([Constraint::Length(7), Constraint::Min(0)]).areas(area);
+            Layout::vertical([Constraint::Length(attrs_h), Constraint::Min(0)]).areas(area);
         frame.render_widget(self.attrs_paragraph(), attrs_area);
 
         let block = Block::bordered().title(self.messages_title());
@@ -749,6 +791,51 @@ mod tests {
             [Action::PurgeQueue { queue_url }] => assert!(queue_url.ends_with("/orders")),
             other => panic!("se esperaba PurgeQueue, llegó {other:?}"),
         }
+    }
+
+    fn dlq_attrs() -> QueueAttrsDto {
+        QueueAttrsDto {
+            arn: Some("arn:aws:sqs:us-east-1:000:orders-dlq".into()),
+            dlq_sources: vec!["https://sqs.us-east-1.amazonaws.com/000/orders".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn redrive_offered_and_emitted_only_for_dlq() {
+        let mut v = SqsView::new();
+        v.on_message(&Message::QueuesLoaded(vec![queue("orders-dlq")]));
+        v.on_key(key(KeyCode::Enter)); // → Detail
+
+        // Cola sin colas origen: NO es un DLQ → no se ofrece `d` ni emite.
+        v.on_message(&Message::QueueDetailLoaded {
+            queue_url: queue("orders-dlq").url,
+            attrs: QueueAttrsDto::default(),
+            messages: vec![],
+        });
+        assert!(!v.hints().iter().any(|(k, _)| *k == "d"));
+        assert!(v.on_key(key(KeyCode::Char('d'))).is_empty());
+
+        // Ahora ES un DLQ (tiene colas origen) → se ofrece y emite RedriveDlq.
+        v.on_message(&Message::QueueDetailLoaded {
+            queue_url: queue("orders-dlq").url,
+            attrs: dlq_attrs(),
+            messages: vec![],
+        });
+        assert!(v.hints().iter().any(|(k, _)| *k == "d"));
+        match v.on_key(key(KeyCode::Char('d'))).as_slice() {
+            [Action::RedriveDlq { queue_url }] => assert!(queue_url.ends_with("/orders-dlq")),
+            other => panic!("se esperaba RedriveDlq, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redrive_not_offered_outside_detail() {
+        let mut v = SqsView::new();
+        v.on_message(&Message::QueuesLoaded(vec![queue("orders-dlq")]));
+        // En la lista (queues) no se ofrece la acción gated `d` ni se emite.
+        assert!(!v.hints().iter().any(|(k, _)| *k == "d"));
+        assert!(v.on_key(key(KeyCode::Char('d'))).is_empty());
     }
 
     #[test]

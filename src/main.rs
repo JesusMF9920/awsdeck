@@ -7,6 +7,7 @@
 mod action;
 mod app;
 mod aws;
+mod config;
 mod effects;
 mod message;
 mod tui;
@@ -19,6 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::app::App;
 use crate::aws::context::Env;
+use crate::config::Config;
 use crate::effects::Effects;
 use crate::tui::Tui;
 use crate::views::Registry;
@@ -29,7 +31,9 @@ use crate::views::sqs::SqsView;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let env = initial_env();
+    // Config opcional del disco (load-only); si no hay, defaults.
+    let config = Config::load();
+    let env = initial_env(&config);
 
     // Canal de resultados async: effects manda, App recibe en el select! loop.
     let (tx, rx) = mpsc::channel(64);
@@ -43,7 +47,11 @@ async fn main() -> Result<()> {
     // Registry de vistas. Aquí —y solo aquí, en el composition root— se nombran
     // las vistas concretas. Agregar un servicio = registrar una línea más.
     let mut registry = Registry::new();
-    registry.register(Box::new(LogsView::new()));
+    let logs = match config.default_tail_window.as_deref() {
+        Some(w) => LogsView::new().with_default_window(w),
+        None => LogsView::new(),
+    };
+    registry.register(Box::new(logs));
     registry.register(Box::new(SqsView::new()));
     registry.register(Box::new(SfnView::new()));
     registry.register(Box::new(EventsView::new()));
@@ -64,11 +72,16 @@ async fn main() -> Result<()> {
     result
 }
 
-/// Ambiente inicial tomado del entorno, con defaults sensatos.
-fn initial_env() -> Env {
-    let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
+/// Ambiente inicial: entorno > config en disco > defaults sensatos.
+fn initial_env(config: &Config) -> Env {
+    let profile = std::env::var("AWS_PROFILE")
+        .ok()
+        .or_else(|| config.default_profile.clone())
+        .unwrap_or_else(|| "default".to_string());
     let region = std::env::var("AWS_REGION")
-        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-        .unwrap_or_else(|_| "us-east-1".to_string());
+        .ok()
+        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+        .or_else(|| config.default_region.clone())
+        .unwrap_or_else(|| "us-east-1".to_string());
     Env::new(profile, region)
 }

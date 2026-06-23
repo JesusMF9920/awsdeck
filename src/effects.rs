@@ -1786,9 +1786,7 @@ mod tests {
             Message::LogGroupsLoaded { groups, more } => {
                 assert!(!more);
                 assert!(
-                    groups
-                        .iter()
-                        .any(|g| g.name.contains("CreateOrderV3")),
+                    groups.iter().any(|g| g.name.contains("CreateOrderV3")),
                     "el set completo incluye el group con prefijo largo"
                 );
             }

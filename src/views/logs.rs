@@ -82,6 +82,9 @@ pub struct LogsView {
     /// Tail en vivo (`tail -f`): si `true` y estás en `Tail`, cada tick del `App`
     /// re-consulta la ventana (salta al fondo, newest abajo). Toggle con `f`.
     tail_live: bool,
+    /// Preset de ventana por defecto al abrir el tail (configurable en disco vía
+    /// `with_default_window`). Por defecto `DEFAULT_PRESET` (1h).
+    default_preset: usize,
     /// Línea expandida: índice ABSOLUTO en `events` del evento abierto en el panel de
     /// detalle (`enter` sobre una línea). `None` = mostrando la lista.
     detail: Option<usize>,
@@ -109,10 +112,22 @@ impl LogsView {
             tail_token: None,
             tail_gen: 0,
             tail_live: false,
+            default_preset: DEFAULT_PRESET,
             detail: None,
             detail_scroll: 0,
             state: ListState::default().with_selected(Some(0)),
         }
+    }
+
+    /// Fija la ventana de tiempo por defecto del tail desde la config (etiqueta de
+    /// preset: `15m`/`1h`/`6h`/`24h`/`3d`/`7d`). Etiqueta desconocida → se ignora.
+    pub fn with_default_window(mut self, spec: &str) -> Self {
+        if let Some(i) = WINDOW_PRESETS.iter().position(|(label, _)| *label == spec) {
+            self.default_preset = i;
+            self.tail_preset = i;
+            self.tail_window = LogWindow::Last(WINDOW_PRESETS[i].1);
+        }
+        self
     }
 
     /// Abre el panel de detalle del evento seleccionado (índice absoluto en `events`).
@@ -271,9 +286,7 @@ impl LogsView {
     /// `set_filter` ya dejó la selección en el mejor match al teclear, de modo que
     /// esto conserva ese baseline cuando el usuario no navegó.
     fn restore_selection(&mut self, name: Option<&str>) {
-        let pos = name.and_then(|n| {
-            self.filtered.iter().position(|&i| self.groups[i].name == n)
-        });
+        let pos = name.and_then(|n| self.filtered.iter().position(|&i| self.groups[i].name == n));
         self.state.select(Some(pos.unwrap_or(0)));
         self.clamp_selection();
     }
@@ -359,8 +372,8 @@ impl LogsView {
     /// `esc` vuelve a groups. `w`/`o`/`:since`/`:from-to` ajustan rango/paginación.
     fn tail(&mut self) -> Vec<Action> {
         self.open_tail(
-            LogWindow::Last(WINDOW_PRESETS[DEFAULT_PRESET].1),
-            DEFAULT_PRESET,
+            LogWindow::Last(WINDOW_PRESETS[self.default_preset].1),
+            self.default_preset,
         )
     }
 
@@ -637,8 +650,8 @@ impl View for LogsView {
         self.partial = false;
         self.tail_live = false;
         self.tail_token = None;
-        self.tail_preset = DEFAULT_PRESET;
-        self.tail_window = LogWindow::Last(WINDOW_PRESETS[DEFAULT_PRESET].1);
+        self.tail_preset = self.default_preset;
+        self.tail_window = LogWindow::Last(WINDOW_PRESETS[self.default_preset].1);
         self.state.select(Some(0));
         vec![Action::LoadLogGroups]
     }
@@ -1046,7 +1059,10 @@ mod tests {
 
     /// Construye un `LogGroupsLoaded` para los tests.
     fn loaded(groups: Vec<LogGroupDto>) -> Message {
-        Message::LogGroupsLoaded { groups, more: false }
+        Message::LogGroupsLoaded {
+            groups,
+            more: false,
+        }
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1478,10 +1494,36 @@ mod tests {
     fn y_in_events_copies_the_line() {
         let mut v = LogsView::new();
         into_events(&mut v);
-        v.on_message(&events_loaded("/svc", "stream-a", vec![ev("ERROR boom", 1)]));
+        v.on_message(&events_loaded(
+            "/svc",
+            "stream-a",
+            vec![ev("ERROR boom", 1)],
+        ));
         match v.on_key(key(KeyCode::Char('y'))).as_slice() {
             [Action::CopyToClipboard { text }] => assert_eq!(text, "ERROR boom"),
             other => panic!("se esperaba copiar la línea, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_default_window_sets_tail_default() {
+        // `t` abre el tail con la ventana configurada (preset 6h), no el default 1h.
+        let mut v = LogsView::new().with_default_window("6h");
+        v.on_message(&loaded(vec![group("/svc")]));
+        match v.on_key(key(KeyCode::Char('t'))).as_slice() {
+            [_, Action::LoadLogTail { window, .. }] => {
+                assert_eq!(*window, LogWindow::Last(6 * 60 * 60_000), "abre con 6h");
+            }
+            other => panic!("se esperaba ClearFilter+LoadLogTail, llegó {other:?}"),
+        }
+        // Una etiqueta inválida se ignora (conserva el default 1h).
+        let mut v = LogsView::new().with_default_window("nope");
+        v.on_message(&loaded(vec![group("/svc")]));
+        match v.on_key(key(KeyCode::Char('t'))).as_slice() {
+            [_, Action::LoadLogTail { window, .. }] => {
+                assert_eq!(*window, LogWindow::Last(WINDOW_PRESETS[DEFAULT_PRESET].1));
+            }
+            other => panic!("llegó {other:?}"),
         }
     }
 
@@ -1495,7 +1537,10 @@ mod tests {
         let actions = v.on_key(key(KeyCode::Char('f')));
         assert!(v.tail_live, "f prende el seguimiento en vivo");
         assert!(
-            matches!(actions.as_slice(), [Action::LoadLogTail { token: None, .. }]),
+            matches!(
+                actions.as_slice(),
+                [Action::LoadLogTail { token: None, .. }]
+            ),
             "prender live dispara una consulta fresca: {actions:?}"
         );
         // Con live, cada tick re-consulta.
@@ -1516,7 +1561,10 @@ mod tests {
         v.on_key(key(KeyCode::Char('t')));
         assert!(!v.title().contains("[LIVE]"));
         v.on_key(key(KeyCode::Char('f')));
-        assert!(v.title().contains("[LIVE]"), "el título marca el seguimiento");
+        assert!(
+            v.title().contains("[LIVE]"),
+            "el título marca el seguimiento"
+        );
     }
 
     #[test]
@@ -1545,7 +1593,11 @@ mod tests {
         assert_eq!(v.filtered.len(), 3);
         v.set_filter("error");
         assert_eq!(v.filtered, v.filtered_event_indices());
-        assert_eq!(v.filtered.len(), 1, "filtro substring sobre el lowercase precomputado");
+        assert_eq!(
+            v.filtered.len(),
+            1,
+            "filtro substring sobre el lowercase precomputado"
+        );
         v.set_filter("");
         assert_eq!(v.filtered.len(), 3, "limpiar el filtro restituye el cache");
     }
@@ -1568,7 +1620,11 @@ mod tests {
             generation: 1,
         });
         assert_eq!(v.event_rows.len(), 2, "event_rows crece con el append");
-        assert_eq!(v.visible_len(), 1, "el append respeta el filtro vía el cache");
+        assert_eq!(
+            v.visible_len(),
+            1,
+            "el append respeta el filtro vía el cache"
+        );
     }
 
     #[test]
@@ -1855,7 +1911,10 @@ mod tests {
         assert!(v.hints().iter().any(|(k, _)| *k == "t"), "groups anuncia t");
         v.on_key(key(KeyCode::Enter));
         v.on_message(&stream("s1"));
-        assert!(v.hints().iter().any(|(k, _)| *k == "t"), "streams anuncia t");
+        assert!(
+            v.hints().iter().any(|(k, _)| *k == "t"),
+            "streams anuncia t"
+        );
         // Dentro del tail: anuncia ventana/paginación/rango y ya no `t`.
         v.on_key(key(KeyCode::Char('t')));
         let keys: Vec<&str> = v.hints().iter().map(|(k, _)| *k).collect();

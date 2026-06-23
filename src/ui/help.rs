@@ -17,7 +17,10 @@ const KEYS: &[(&str, &str)] = &[
     ("esc", "con filtro: lo limpia; si no, volver (raíz → menú)"),
     (":menu / bksp", "volver al menú principal"),
     ("r", "refresh"),
-    ("t", "logs: ver TODOS los streams del group juntos, por rango de tiempo"),
+    (
+        "t",
+        "logs: ver TODOS los streams del group juntos, por rango de tiempo",
+    ),
     ("w / W", "logs: ciclar la ventana de tiempo (15m…7d)"),
     ("o", "logs: cargar más líneas (paginación de la ventana)"),
     (

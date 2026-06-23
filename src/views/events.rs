@@ -389,7 +389,11 @@ impl View for EventsView {
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         match self.level {
             // `S` envía un evento de prueba al bus (gated por modo escritura + confirm).
-            Level::Buses => vec![("y", "copiar ARN"), ("O", "consola"), ("S", "enviar evento")],
+            Level::Buses => vec![
+                ("y", "copiar ARN"),
+                ("O", "consola"),
+                ("S", "enviar evento"),
+            ],
             Level::Rules { .. } => vec![("y", "copiar nombre"), ("O", "consola")],
             Level::Detail { .. } => vec![("y", "copiar ARN target"), ("O", "consola")],
         }

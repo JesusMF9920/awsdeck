@@ -82,8 +82,13 @@ pub struct LogsView {
     /// (ventana/patrón/drill) y NO en load-more; descarta respuestas con generation viejo.
     tail_gen: u64,
     /// Tail en vivo (`tail -f`): si `true` y estás en `Tail`, cada tick del `App`
-    /// re-consulta la ventana (salta al fondo, newest abajo). Toggle con `f`.
+    /// re-consulta la ventana. Toggle con `f`.
     tail_live: bool,
+    /// La consulta de tail en vuelo proviene de un tick del tail en vivo (no de una
+    /// acción manual). En la respuesta, un refresh en vivo **respeta** la posición del
+    /// usuario salvo que ya estuviera al fondo (si no, cada tick lo expulsaría y leer en
+    /// vivo sería imposible); una carga manual (t/ventana/drill) sí salta al fondo.
+    live_refresh: bool,
     /// Preset de ventana por defecto al abrir el tail (configurable en disco vía
     /// `with_default_window`). Por defecto `DEFAULT_PRESET` (1h).
     default_preset: usize,
@@ -112,6 +117,7 @@ impl LogsView {
             tail_token: None,
             tail_gen: 0,
             tail_live: false,
+            live_refresh: false,
             default_preset: DEFAULT_PRESET,
             detail: None,
             state: ListState::default().with_selected(Some(0)),
@@ -182,6 +188,7 @@ impl LogsView {
         if token.is_none() {
             self.tail_gen = self.tail_gen.wrapping_add(1);
         }
+        self.live_refresh = false; // por defecto manual; `on_tick` lo marca como live
         self.loading = true;
         vec![Action::LoadLogTail {
             group,
@@ -625,9 +632,13 @@ impl View for LogsView {
     }
 
     fn on_tick(&mut self) -> Vec<Action> {
-        // Tail en vivo: re-consulta la ventana actual (consulta fresca → salta al fondo).
+        // Tail en vivo: re-consulta la ventana actual. Marca la consulta como refresh en
+        // vivo para que la respuesta respete la posición del usuario (salvo que esté al
+        // fondo), en vez de arrastrarlo al final en cada tick.
         if self.tail_live && matches!(self.level, Level::Tail { .. }) {
-            self.tail_query(None)
+            let actions = self.tail_query(None);
+            self.live_refresh = true;
+            actions
         } else {
             vec![]
         }
@@ -780,6 +791,9 @@ impl View for LogsView {
                 if let Level::Tail { group: g } = &self.level
                     && g == group
                 {
+                    // ¿El usuario estaba al fondo ANTES de ingerir? (para el tail en vivo).
+                    let prev_sel = self.state.selected();
+                    let was_at_bottom = prev_sel.is_none_or(|s| s + 1 >= self.filtered.len());
                     if *append {
                         self.extend_events(events.clone());
                     } else {
@@ -788,11 +802,20 @@ impl View for LogsView {
                     self.tail_token = next_token.clone();
                     self.partial = next_token.is_some();
                     self.loading = false;
-                    // En carga fresca, salta al fondo (newest abajo); en append conserva
-                    // la posición del usuario.
                     if !*append {
-                        self.select_edge(true);
+                        if self.live_refresh && !was_at_bottom {
+                            // Refresh en vivo y el usuario estaba leyendo arriba: conserva
+                            // su posición (los eventos viejos mantienen su índice; los
+                            // nuevos entran al final) en vez de expulsarlo al fondo.
+                            let len = self.filtered.len();
+                            let keep = prev_sel.unwrap_or(0).min(len.saturating_sub(1));
+                            self.state.select((len > 0).then_some(keep));
+                        } else {
+                            // Carga manual (t/ventana/drill) o ya estabas al fondo: newest abajo.
+                            self.select_edge(true);
+                        }
                     }
+                    self.live_refresh = false; // consumido
                 }
             }
             // El App ya muestra el error en la status bar; aquí cortamos el loading.
@@ -1488,6 +1511,73 @@ mod tests {
             }
             other => panic!("se esperaba LoadLogTail con token, llegó {other:?}"),
         }
+    }
+
+    #[test]
+    fn live_tick_preserves_scroll_unless_at_bottom() {
+        let mut v = LogsView::new();
+        v.on_message(&loaded(vec![group("/svc")]));
+        v.on_key(key(KeyCode::Char('t'))); // → Tail, gen=1
+
+        let make = |events: Vec<LogEventDto>, generation: u64| Message::LogTailLoaded {
+            group: "/svc".into(),
+            events,
+            next_token: None,
+            append: false,
+            generation,
+        };
+
+        // Carga fresca inicial: selección al fondo (newest abajo).
+        v.on_message(&make(
+            vec![ev("a", 1), ev("b", 2), ev("c", 3), ev("d", 4)],
+            1,
+        ));
+        assert_eq!(v.state.selected(), Some(3));
+
+        // El usuario sube a leer una línea vieja.
+        v.on_key(key(KeyCode::Char('k')));
+        v.on_key(key(KeyCode::Char('k')));
+        assert_eq!(v.state.selected(), Some(1));
+
+        // Prende el tail en vivo y dispara un tick (re-consulta marcada como live).
+        v.on_key(key(KeyCode::Char('f'))); // toggle ON
+        let g1 = match v.on_tick().as_slice() {
+            [Action::LoadLogTail { generation, .. }] => *generation,
+            other => panic!("el tick debe re-consultar: {other:?}"),
+        };
+        // Llega el refresh en vivo con una línea nueva al final.
+        v.on_message(&make(
+            vec![ev("a", 1), ev("b", 2), ev("c", 3), ev("d", 4), ev("e", 5)],
+            g1,
+        ));
+        assert_eq!(
+            v.state.selected(),
+            Some(1),
+            "el tick en vivo respeta la posición del lector"
+        );
+
+        // Si bajas al fondo, el siguiente tick sigue al fondo.
+        v.on_key(key(KeyCode::Char('G')));
+        let gen2 = match v.on_tick().as_slice() {
+            [Action::LoadLogTail { generation, .. }] => *generation,
+            other => panic!("el tick debe re-consultar: {other:?}"),
+        };
+        v.on_message(&make(
+            vec![
+                ev("a", 1),
+                ev("b", 2),
+                ev("c", 3),
+                ev("d", 4),
+                ev("e", 5),
+                ev("f", 6),
+            ],
+            gen2,
+        ));
+        assert_eq!(
+            v.state.selected(),
+            Some(5),
+            "si estabas al fondo, el tick sigue al fondo"
+        );
     }
 
     #[test]

@@ -120,6 +120,14 @@ pub struct App {
     /// sesión SSO caducada) sin que el core nombre ningún servicio. `None` = no hay
     /// error vigente; se limpia al llegar data fresca o al cambiar de ambiente.
     error_kind: Option<ErrorKind>,
+    /// Id de cuenta AWS confirmado por STS (`GetCallerIdentity`) para el ambiente
+    /// activo. El header lo muestra junto a `profile · region` (prod-safe: ver la
+    /// cuenta REAL, no solo el nombre del profile). `None` = aún sin confirmar.
+    account_id: Option<String>,
+    /// `true` = hay que confirmar la cuenta (STS) en cuanto el loop pueda (arranque o
+    /// tras un cambio de ambiente). El loop lo dispara, no `switch_env`, para que los
+    /// cambios de ambiente queden sincrónicos (sin `tokio::spawn`).
+    identity_pending: bool,
     show_help: bool,
     picker: Option<Picker>,
     /// Modal de confirmación de una acción mutante (gate prod-safe).
@@ -154,6 +162,8 @@ impl App {
             filter: String::new(),
             status: None,
             error_kind: None,
+            account_id: None,
+            identity_pending: true,
             show_help: false,
             picker: None,
             confirm: None,
@@ -174,6 +184,9 @@ impl App {
         let mut tick = tokio::time::interval(Duration::from_secs(3));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         while !self.should_quit {
+            // Confirma la cuenta activa (STS) al arrancar y tras cada cambio de ambiente,
+            // en cuanto el picker de arranque (si lo hay) se resuelve. Idempotente.
+            self.verify_identity_if_pending();
             terminal.draw(|frame| self.render(frame))?;
 
             // Debounce del filtro: la búsqueda server-side dispara al vencer el
@@ -479,6 +492,8 @@ impl App {
         self.env = env.clone();
         self.effects.set_env(env);
         self.write_mode = false; // re-armar la seguridad al cambiar de cuenta
+        self.account_id = None; // la cuenta del ambiente anterior ya no aplica
+        self.identity_pending = true; // re-confirmar la cuenta (lo dispara el loop)
         self.clear_filter();
         // Solo recargar si estamos dentro de una vista; en el menú no hay qué cargar.
         if matches!(self.screen, Screen::View) {
@@ -486,6 +501,17 @@ impl App {
             self.dispatch_all(actions);
         }
         self.set_info(format!("ambiente: {}", self.env));
+    }
+
+    /// Confirma la identidad de la cuenta activa (STS) si está pendiente y no estamos
+    /// esperando la elección del picker de arranque. Lo llama el loop (contexto async),
+    /// no `switch_env`, para que los cambios de ambiente sean sincrónicos (sin spawn).
+    /// Read-only, sin gate; el epoch guard descarta la respuesta si el ambiente cambió.
+    fn verify_identity_if_pending(&mut self) {
+        if self.identity_pending && !self.awaiting_startup_env {
+            self.identity_pending = false;
+            self.effects.dispatch(Action::VerifyIdentity, self.epoch);
+        }
     }
 
     // --- Picker de ambientes (ctrl-e) -----------------------------------------
@@ -523,7 +549,8 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 // Cancelar: cerrar el picker. En el de arranque, quedarse en el
-                // ambiente por defecto (se aterriza en el menú principal).
+                // ambiente por defecto (se aterriza en el menú principal). La cuenta del
+                // default la confirma el loop (`identity_pending` sigue en true).
                 self.picker = None;
                 self.awaiting_startup_env = false;
             }
@@ -620,6 +647,7 @@ impl App {
             Message::EventSent { event_bus_name } => {
                 self.set_info(format!("evento enviado a {event_bus_name}"))
             }
+            Message::IdentityLoaded { account_id } => self.account_id = Some(account_id.clone()),
             _ => {}
         }
         if let Some(view) = self.registry.active_mut() {
@@ -797,6 +825,7 @@ impl App {
             &title,
             self.write_mode,
             auth_warning,
+            self.account_id.as_deref(),
         );
 
         match self.screen {
@@ -1463,6 +1492,36 @@ mod tests {
         app.on_envelope(Envelope::new(1, Message::err("error real")));
         let status = app.status.as_ref().expect("el envelope vigente sí pinta");
         assert!(status.error && status.text.contains("error real"));
+    }
+
+    #[test]
+    fn identity_loaded_sets_account_id() {
+        let mut app = test_app();
+        app.on_envelope(Envelope::new(
+            0,
+            Message::IdentityLoaded {
+                account_id: "123456789012".into(),
+            },
+        ));
+        assert_eq!(app.account_id.as_deref(), Some("123456789012"));
+    }
+
+    #[test]
+    fn switch_env_resets_account_and_flags_identity_pending() {
+        let mut app = test_app();
+        app.account_id = Some("111122223333".into());
+        app.identity_pending = false;
+
+        app.dispatch(Action::SwitchEnv(Env::new("prod", "eu-west-1")));
+
+        assert_eq!(
+            app.account_id, None,
+            "la cuenta del ambiente anterior no aplica"
+        );
+        assert!(
+            app.identity_pending,
+            "se re-confirma la cuenta del nuevo ambiente"
+        );
     }
 
     // --- Gate de mutaciones (modo escritura + confirm) ------------------------

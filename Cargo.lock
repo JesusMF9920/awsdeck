@@ -622,6 +622,7 @@ dependencies = [
  "aws-sdk-eventbridge",
  "aws-sdk-sfn",
  "aws-sdk-sqs",
+ "aws-sdk-sts",
  "color-eyre",
  "crossterm",
  "futures",

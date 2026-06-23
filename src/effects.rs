@@ -116,6 +116,7 @@ impl Effects {
             } => self.load_rule_detail(event_bus_name, rule_name, epoch),
             Action::SendEvent { event_bus_name } => self.send_event(event_bus_name, epoch),
             Action::OpenConsole { target } => self.open_console(target, epoch),
+            Action::VerifyIdentity => self.verify_identity(epoch),
             Action::Quit
             | Action::ActivateView(_)
             | Action::ActivateViewWithContext { .. }
@@ -580,6 +581,40 @@ impl Effects {
             }
         }
     }
+
+    fn verify_identity(&self, epoch: u64) {
+        let tx = self.tx.clone();
+        match &self.backend {
+            Backend::Mock(_) => {
+                tokio::spawn(async move {
+                    let msg = Message::IdentityLoaded {
+                        account_id: "123456789012".to_string(),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match get_caller_identity(&ctx).await {
+                        Ok(account_id) => Message::IdentityLoaded { account_id },
+                        // Un fallo aquí ES la señal de SSO/credenciales caducadas: se
+                        // clasifica como `Auth` y enciende el `[re-auth]` del header.
+                        Err(e) => sdk_error("get_caller_identity", &e),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+        }
+    }
+}
+
+/// STS `GetCallerIdentity`: devuelve el id de cuenta de 12 dígitos contra el que
+/// estamos trabajando. Confirma la cuenta real (un `~/.aws/config` mal puesto puede
+/// no corresponder al nombre del profile).
+async fn get_caller_identity(ctx: &AwsContext) -> color_eyre::Result<String> {
+    let out = ctx.sts().await.get_caller_identity().send().await?;
+    Ok(out.account().unwrap_or_default().to_string())
 }
 
 /// Traduce un error del SDK (ya aplanado a `Report` por el `?`) en un
@@ -1834,6 +1869,21 @@ mod tests {
                     "la data mock refleja el profile activo"
                 );
             }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_verify_identity_returns_canned_account() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let fx = Effects::new_mock(tx, Env::new("dev", "us-east-1"));
+
+        fx.dispatch(Action::VerifyIdentity, 3);
+
+        let envelope = rx.recv().await.expect("debe llegar un envelope");
+        assert_eq!(envelope.epoch, 3, "el epoch se propaga");
+        match envelope.message {
+            Message::IdentityLoaded { account_id } => assert_eq!(account_id, "123456789012"),
             other => panic!("mensaje inesperado: {other:?}"),
         }
     }

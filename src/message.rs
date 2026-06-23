@@ -406,6 +406,11 @@ pub enum Message {
     /// Se publicó un evento de prueba en un bus (acción mutante confirmada).
     EventSent { event_bus_name: String },
 
+    /// Identidad de la cuenta activa (STS `GetCallerIdentity`): confirma contra qué
+    /// cuenta trabajamos. El `App` la muestra en el header (prod-safe: ver la cuenta
+    /// real antes de una acción mutante).
+    IdentityLoaded { account_id: String },
+
     /// Algo falló: se muestra en la status bar, nunca hace panic. `kind` clasifica
     /// el fallo (para que el core ofrezca recuperación —p. ej. una pista de re-auth—
     /// sin nombrar servicios) y `detail` es el texto ya listo para pintar (incluye el

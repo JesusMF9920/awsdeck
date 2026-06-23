@@ -39,6 +39,10 @@ pub enum Action {
     /// `ConsoleTarget`; `effects` construye la URL con la región activa y abre el
     /// navegador (el `App` la reenvía sin inspeccionarla).
     OpenConsole { target: ConsoleTarget },
+    /// Confirmar contra qué cuenta AWS estamos (STS `GetCallerIdentity`). La emite el
+    /// `App` al arrancar y al cambiar de ambiente; `effects` responde con
+    /// `IdentityLoaded`. Read-only, sin gate. (Service-shaped: vive en `action.rs`.)
+    VerifyIdentity,
 
     // --- Efectos: `App` los reenvía a `effects::dispatch` (específicos de servicio) ---
     /// Pedir una página acotada (≤50) de log groups. `query=None` = primera página;

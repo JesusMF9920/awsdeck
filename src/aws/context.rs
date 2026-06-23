@@ -13,6 +13,7 @@ use aws_sdk_cloudwatchlogs::Client as LogsClient;
 use aws_sdk_eventbridge::Client as EventBridgeClient;
 use aws_sdk_sfn::Client as SfnClient;
 use aws_sdk_sqs::Client as SqsClient;
+use aws_sdk_sts::Client as StsClient;
 use tokio::sync::OnceCell;
 
 /// El ambiente activo: identidad de la cuenta/region contra la que trabajamos.
@@ -51,6 +52,7 @@ pub struct AwsContext {
     sqs: OnceCell<SqsClient>,
     sfn: OnceCell<SfnClient>,
     eventbridge: OnceCell<EventBridgeClient>,
+    sts: OnceCell<StsClient>,
 }
 
 impl AwsContext {
@@ -62,6 +64,7 @@ impl AwsContext {
             sqs: OnceCell::new(),
             sfn: OnceCell::new(),
             eventbridge: OnceCell::new(),
+            sts: OnceCell::new(),
         }
     }
 
@@ -123,6 +126,15 @@ impl AwsContext {
     pub async fn eventbridge(&self) -> &EventBridgeClient {
         self.eventbridge
             .get_or_init(|| async { EventBridgeClient::new(self.config().await) })
+            .await
+    }
+
+    /// Cliente de STS, cacheado de forma perezosa. Para `GetCallerIdentity`: confirma
+    /// contra qué cuenta AWS estamos trabajando (el header solo conocía el nombre del
+    /// profile, que un `~/.aws/config` mal configurado puede no corresponder a la cuenta).
+    pub async fn sts(&self) -> &StsClient {
+        self.sts
+            .get_or_init(|| async { StsClient::new(self.config().await) })
             .await
     }
 }

@@ -17,12 +17,15 @@ const KEYS: &[(&str, &str)] = &[
     ("esc", "con filtro: lo limpia; si no, volver (raíz → menú)"),
     (":menu / bksp", "volver al menú principal"),
     ("r", "refresh"),
+    ("y", "copiar ARN/URL/línea del item al portapapeles"),
+    ("O", "abrir el recurso en la consola web de AWS"),
     (
         "t",
         "logs: ver TODOS los streams del group juntos, por rango de tiempo",
     ),
     ("w / W", "logs: ciclar la ventana de tiempo (15m…7d)"),
     ("o", "logs: cargar más líneas (paginación de la ventana)"),
+    ("f", "logs: seguir el tail en vivo (tail -f)"),
     (
         ":since/:from",
         "logs: rango — :since 2d · :from 2026-06-19 [to …] (UTC)",

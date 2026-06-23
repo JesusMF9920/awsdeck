@@ -75,13 +75,14 @@ concretas se cablean en `main.rs`; `effects.rs` es la frontera deliberada con el
 
 ## Keybindings (iguales en todas las vistas)
 
-`:` command bar · `/` filtro (con `↑/↓` navegas los resultados sin salir) · `enter` drill ·
-`esc` back de dos etapas (con filtro lo limpia; si no, un nivel; desde la raíz, al menú) ·
-`r` refresh · `ctrl-e` cambiar ambiente · `?` ayuda · `q` salir. Acciones mutantes gated por
-modo escritura (`:write`) + confirm: `p` purgar cola (`sqs`), `R` redrive ejecución (`sfn`),
-`S` enviar evento de prueba a un bus (`events`). (`y` copiar ARN/URL — más adelante.) Las
-teclas propias de cada vista se **anuncian** en el footer según el contexto (`View::hints`):
-no hay que memorizar la tabla ni abrir `?`.
+`:` command bar · `/` filtro (fuzzy local; con `↑/↓` navegas los resultados sin salir; `enter`
+entra directo, sin doble enter) · `enter` drill · `esc` back de dos etapas (con filtro lo limpia;
+si no, un nivel; desde la raíz, al menú) · `r` refresh · `y` copiar ARN/URL/línea · `O` abrir en
+la consola AWS · `ctrl-e` cambiar ambiente · `?` ayuda · `q` salir. En `logs`: `t` tail del group,
+`w/W` ventana, `o` paginar, `f` tail en vivo. Acciones mutantes gated por modo escritura (`:write`)
++ confirm: `p` purgar cola (`sqs`), `R` redrive ejecución (`sfn`), `S` enviar evento a un bus
+(`events`). Las teclas propias de cada vista se **anuncian** en el footer según el contexto
+(`View::hints`): no hay que memorizar la tabla ni abrir `?`.
 
 `esc` es navegación uniforme de **dos etapas** (estilo k9s): el `App` lo intercepta en
 `on_normal_key` y, si hay filtro aplicado, lo limpia y se queda en la vista (1a etapa, la vista
@@ -92,8 +93,8 @@ vista nunca nombra al menú.
 ## Stack
 
 tokio · ratatui + crossterm (feature `event-stream`) · color-eyre · tui-input · serde_json ·
-aws-config + aws-sdk-cloudwatchlogs / aws-sdk-sqs / aws-sdk-sfn / aws-sdk-eventbridge. **Sin
-`async-trait`.**
+serde + toml (config) · arboard (clipboard) · open (abrir navegador) · aws-config +
+aws-sdk-cloudwatchlogs / aws-sdk-sqs / aws-sdk-sfn / aws-sdk-eventbridge. **Sin `async-trait`.**
 
 ## Estado
 
@@ -198,16 +199,41 @@ list/describe).
   en el tail y `esc` en el detalle de línea; `sqs`/`sfn`/`events` anuncian sus teclas gated
   (`p`/`R`/`S`, `R` solo si la ejecución es redrivable). Hace **descubrible** el tail por tiempo de
   `logs` (antes solo vivía en `?` con texto críptico, ya reescrito).
+- **Búsqueda de groups 100% local (sin prefijo)**: `logs` deja de buscar server-side; pagina
+  **todos** los groups a cache (tope `MAX_LOG_GROUP_PAGES`, como `sfn`/`events`) y filtra con
+  `fuzzy_score` (subsecuencia, case-insensitive). `Action::LoadLogGroups`/`Message::LogGroupsLoaded`
+  pierden `query`; `last_query` queda solo para el `filter_pattern` del tail. Teclear `CreateOrder`
+  encuentra `…-CreateOrderV3`.
+- **Performance del tail (rangos amplios)**: `logs` cachea los índices filtrados (`filtered`) y
+  precomputa por evento lowercase/preview/severidad (`event_rows`), en sync vía
+  `set_events`/`extend_events` (únicos puntos de mutación) + `recompute_filtered` (solo al cambiar
+  filtro/lista/nivel). Antes recomputaba O(n) con `to_lowercase` por tecla y reconstruía la lista por
+  frame sobre hasta 10k líneas; ahora navega fluido.
+- **Un solo `enter` desde el filtro** (`app.rs on_filter_key`): `Enter` commitea el filtro y reenvía
+  el Enter a la vista (drill) en una pulsación, espejando el reenvío de flechas; el drill emite
+  `ClearFilter` (no se arrastra al hijo). Agnóstico.
+- **Copiar (`y`) y abrir en consola (`O`)**: `Action::CopyToClipboard{text}` (agnóstica, la maneja el
+  `App` con `arboard`) y `Action::OpenConsole{target: ConsoleTarget}` (service-shaped en `action.rs`;
+  `effects` arma la URL con la región del `ctx` y abre el navegador con `open`). Cada vista decide qué
+  identificador copiar/abrir; hints anuncian `y`/`O`.
+- **Tail en vivo (`f`, `tail -f`)**: `View::on_tick` (default no-op) + un `interval` (~3s) en el loop
+  del `App` (solo tickea con vista activa en modo normal, sin overlays). `logs` togglea `tail_live`
+  con `f`; en cada tick re-consulta la ventana (salta al fondo). Título `[LIVE]`.
+- **Config en disco** (`config.rs`, load-only): `~/.config/awsdeck/config.toml` (respeta
+  `XDG_CONFIG_HOME`) con `default_profile`/`default_region` (fallbacks de `Env` tras el entorno) y
+  `default_tail_window` (preset del tail, vía `LogsView::with_default_window`). Si no existe/no parsea,
+  defaults. Escribir queda como follow-up.
 
-157 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, fuzzy, menú,
-búsqueda/staleness, drill x3 en `sfn`/`events` y eventos/tail de `logs`, back→menú de dos etapas,
-navegación en filtro, preservación de selección, `ClearFilter` al cambiar de nivel, señal `· parcial`,
-rango de tiempo del tail —`w`/`o`/`:since`/`:from-to`, staleness por gen, append—, expandir línea
-(JSON pretty), parsers de fecha/duración, guard EXPRESS, `parse_history`, hints contextuales por
-vista (`View::hints`) + render del footer con/sin contexto, render con `TestBackend`).
+178 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive y send—, fuzzy local sin
+prefijo, menú, drill x3 en `sfn`/`events` y eventos/tail de `logs`, back→menú de dos etapas,
+navegación en filtro + `enter` que drillea, preservación de selección, `ClearFilter` al cambiar de
+nivel, señal `· parcial`, rango de tiempo del tail —`w`/`o`/`:since`/`:from-to`, staleness por gen,
+append—, cache de filtrado invariante, copiar (`y`) y abrir consola (`O`) por vista + URLs de consola,
+tail en vivo (`f`/`on_tick`/`[LIVE]`), config (`Config::parse`), expandir línea (JSON pretty), parsers
+de fecha/duración, guard EXPRESS, `parse_history`, hints por vista + footer, render con `TestBackend`).
 `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
 
-Pendiente: `SendEvent` con payload editable (form multi-campo; v3 envía un evento canned), tail en
-vivo (`tail -f`) en `logs` (hoy es carga puntual + `r`/`o`), input/output por estado en el timeline de
-`sfn`, `y` (copiar ARN), abrir en consola (`o` ya se usa para paginar logs), config en disco. Backlog
-de vistas: Lambda, DynamoDB, ECS…
+Pendiente: cross-link `sfn` → logs de la Lambda de una ejecución (diseñado, diferido a un PR aparte),
+`SendEvent` con payload editable (form multi-campo; v3 envía un evento canned), input/output por estado
+en el timeline de `sfn`, escribir config en disco (hoy load-only). Backlog de vistas: Lambda,
+DynamoDB, ECS…

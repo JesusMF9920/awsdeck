@@ -39,15 +39,18 @@ se muestra en la **status bar** (no crashea).
 | Tecla | Acción |
 |-------|--------|
 | `:` | command bar (saltar de herramienta, p. ej. `:logs`, `:sqs`, `:sfn`, `:events`) |
-| `/` | buscar (fuzzy; en `logs` consulta al servidor; `↑`/`↓` navegan los resultados sin salir) |
+| `/` | buscar (fuzzy local; `↑`/`↓` navegan los resultados sin salir; `enter` entra directo) |
 | `enter` | drill al detalle (en `logs`: group → stream → **eventos**); sobre una **línea**, la **expande** completa |
 | `esc` | con filtro aplicado lo limpia (1er `esc`); si no, vuelve un nivel (drill back; en la raíz, al menú) |
 | `:menu` · `backspace` | volver al menú principal |
 | `j` / `k` · `↑` / `↓` · `g` / `G` | navegar (y scrollear el panel de detalle) |
 | `r` | refrescar |
-| `t` | **logs del group** (`logs`): todos sus streams **por rango de tiempo** (`/` filtra server-side) |
+| `y` | copiar el ARN/URL/línea del item seleccionado al portapapeles |
+| `O` | abrir el recurso seleccionado en la consola web de AWS |
+| `t` | **logs del group** (`logs`): todos sus streams **por rango de tiempo** |
 | `w` / `W` | `logs`: ciclar la **ventana de tiempo** (15m · 1h · 6h · 24h · 3d · 7d) |
 | `o` | `logs`: **cargar más** líneas (paginación de la ventana) |
+| `f` | `logs`: **tail en vivo** (`tail -f`) — auto-refresca el tail |
 | `:since` · `:from`/`to` | `logs`: rango — `:since 2d` · `:from 2026-06-19 [to 2026-06-20]` (UTC) |
 | `p` | purgar cola SQS (gated: modo escritura + confirm) |
 | `R` | redrive ejecución `sfn` fallida (gated: modo escritura + confirm) |
@@ -57,15 +60,15 @@ se muestra en la **status bar** (no crashea).
 | `?` | ayuda |
 | `q` | salir |
 
-> Las teclas específicas de cada vista (`t`/`w`/`o` en `logs`, `p`/`R`/`S` gated) se **anuncian
-> solas** en el footer según dónde estés, y `logs` además recuerda `t` en el título del group:
-> no hace falta memorizar esta tabla ni abrir `?`.
+> Las teclas específicas de cada vista (`t`/`w`/`o`/`f` en `logs`, `y`/`O`, `p`/`R`/`S` gated) se
+> **anuncian solas** en el footer según dónde estés, y `logs` además recuerda `t` en el título del
+> group: no hace falta memorizar esta tabla ni abrir `?`.
 
 ## Cómo probar los cambios
 
 ```bash
 AWSDECK_MOCK=1 cargo run    # ver el TUI con datos, sin tocar AWS
-cargo test                  # 157 tests, sin red
+cargo test                  # 178 tests, sin red
 cargo clippy --all-targets  # lint
 cargo fmt --check           # formato
 ```
@@ -97,11 +100,13 @@ Recorrido rápido (con `AWSDECK_MOCK=1 cargo run`):
 **Epoch guard:** al cambiar de ambiente con un request en vuelo, nunca se pintan datos de la
 cuenta anterior (probado en `app::tests::epoch_guard_discards_stale_and_accepts_fresh`).
 
-**Escala (logs):** con miles de log groups, `logs` no los carga todos — trae una página (≤50)
-y `/` consulta al servidor por substring (`logGroupNamePattern`, debounced ~280ms), rankeando
-los resultados con fuzzy local. El título indica `· parcial` cuando hay más en el servidor. Los
-**logs del group** se traen por **rango de tiempo** (`w`/`:since`/`:from-to`) y se paginan en
-demanda (`o`); el reloj de la ventana vive solo en `effects` (la vista nunca lo ve).
+**Escala (logs):** los log groups se **paginan completos** a un cache local (tope de páginas, como
+`sfn`/`events`) y `/` filtra **100% local con fuzzy** (subsecuencia, case-insensitive): teclear
+`CreateOrder` encuentra `…-CreateOrderV3` sin escribir el prefijo. El título marca `· parcial` si se
+topó el tope. Los **logs del group** se traen por **rango de tiempo** (`w`/`:since`/`:from-to`), se
+paginan en demanda (`o`) y siguen en vivo con `f` (`tail -f`); el reloj vive solo en `effects`. El
+tail no recomputa el filtro por tecla ni reconstruye la lista por frame (cache + display
+precomputado), así que un rango amplio (p. ej. 14 días) navega fluido.
 
 **Escala (sfn):** las state machines se **paginan** (se traen todas, alcanzables por el fuzzy);
 las ejecuciones muestran las 50 más recientes y marcan `· parcial (recientes)` si hay más. El
@@ -128,17 +133,21 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
 
 ## Roadmap
 
-- **v0** ✅ shell + `logs` (CloudWatch): groups → streams → **eventos** (`get_log_events`) +
-  **logs del group por rango de tiempo** (`filter_log_events`, `t`; `w`/`:since`/`:from-to`,
-  paginación `o`, filtro server-side) + **expandir una línea** (`enter`, JSON pretty).
+- **v0** ✅ shell + `logs` (CloudWatch): groups (fuzzy local) → streams → **eventos**
+  (`get_log_events`) + **logs del group por rango de tiempo** (`filter_log_events`, `t`;
+  `w`/`:since`/`:from-to`, paginación `o`, **tail en vivo** `f`) + **expandir una línea** (`enter`,
+  JSON pretty).
 - **v1** ✅ `sqs` — colas, attributes, *peek*, `PurgeQueue` (gated por modo escritura + confirm).
 - **v2** ✅ `sfn` — state machines, ejecuciones (status coloreado), timeline de estados con duración,
   `Redrive` (gated).
 - **v3** ✅ `events` — event buses, rules (estado coloreado), detalle con patrón + targets,
   `SendEvent` (gated).
+- **Transversal** ✅ copiar ARN/URL (`y`), abrir en consola AWS (`O`), config en disco
+  (`~/.config/awsdeck/config.toml`), búsqueda local sin prefijo, un solo `enter` desde el filtro.
 
-Backlog: `SendEvent` con payload editable, copiar ARN (`y`), abrir en consola (`o`), config en disco,
-más vistas (Lambda, DynamoDB, ECS…).
+Backlog: cross-link `sfn` → logs de la Lambda de una ejecución, `SendEvent` con payload editable,
+input/output por estado en el timeline de `sfn`, escribir config en disco, más vistas (Lambda,
+DynamoDB, ECS…).
 
 ## Stack
 

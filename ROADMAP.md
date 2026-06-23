@@ -58,8 +58,8 @@ ya vive ahí, y meter el siguiente cuesta un PR pequeño.
   (alias de comando, p. ej. `"logs"`), su título para el header, qué `Action`s emitir al
   activarse, cómo reacciona a teclas (devolviendo `Action`s), cómo ingiere un `Message` y
   cómo se dibuja. Nada de SDK, nada de async aquí. Hooks agnósticos para extenderse sin tocar
-  el core: `on_command` (comandos `:` propios) y `hints` (pistas de teclado contextuales que el
-  footer anuncia según el estado de la vista).
+  el core: `on_command` (comandos `:` propios), `hints` (pistas de teclado contextuales que el
+  footer anuncia según el estado) y `on_tick` (refresco periódico, p. ej. el `tail -f` de logs).
 - **`Action` (intenciones).** Lo que el usuario/vista quiere que pase, normalmente async:
   `Refresh`, `Drill(id)`, `SwitchEnv(env)`, y las mutantes `PurgeQueue`, `Redrive`, `SendEvent`.
 - **`Message` (resultados).** Lo que regresa del mundo async: `LogGroupsLoaded`, `QueuesLoaded`,
@@ -153,11 +153,13 @@ Entrega:
 severidad) y **logs del group por rango de tiempo** (`Tail`, tecla `t` → `filter_log_events` sobre
 todos sus streams). El **rango** se elige con presets (`w`/`W`: 15m…7d) o por command bar
 (`:since 2d`, `:from 2026-06-19 [to …]`, UTC) vía el hook `View::on_command`; la ventana se **pagina**
-(auto + `o` para cargar más) con staleness por `generation`. `/` filtra server-side (`filter_pattern`).
-**Expandir una línea**: `enter` sobre un evento abre el mensaje completo (wrap + scroll, JSON pretty;
-`esc` cierra). `LogWindow` plano (el reloj solo en `effects`); mock + real, sin gate (lectura).
-El tail y su selector de tiempo se **anuncian** en el footer y en el título del group (vía el hook
-agnóstico `View::hints`) para que no queden escondidos. Pendiente: tail en vivo (`tail -f`).
+(auto + `o` para cargar más) con staleness por `generation`, y **sigue en vivo** con `f` (`tail -f`,
+vía `View::on_tick`). `/` filtra server-side (`filter_pattern`). **Expandir una línea**: `enter` sobre
+un evento abre el mensaje completo (wrap + scroll, JSON pretty; `esc` cierra). `LogWindow` plano (el
+reloj solo en `effects`); mock + real, sin gate (lectura). El tail y su selector de tiempo se
+**anuncian** en el footer y en el título del group (`View::hints`). Los **log groups** se buscan
+**fuzzy local sin prefijo** (cache completo paginado, case-insensitive) y el tail con rango amplio
+navega fluido (cache de filtrado + display precomputado).
 
 ### v1 — Vista `sqs` — ✅ hecho
 Listar colas del ambiente; ver attributes (mensajes visibles, in-flight, DLQ); *peek* de mensajes (receive sin borrar). Acción mutante `PurgeQueue` detrás de confirm + modo escritura.
@@ -182,14 +184,18 @@ Entregado: 3 niveles (event buses → rules → detalle). L1 `list_event_buses` 
 | Tecla | Acción |
 |-------|--------|
 | `:` | command bar (saltar de servicio) |
-| `/` | filtrar la lista actual |
+| `/` | filtrar la lista actual (fuzzy local; `enter` entra directo) |
 | `enter` | drill (entrar al detalle) |
 | `esc` | volver |
 | `r` | refresh |
+| `y` | copiar ARN/URL/línea al clipboard |
+| `O` | abrir el recurso en la consola AWS |
 | `ctrl-e` | cambiar de ambiente |
-| `y` | copiar ARN/URL al clipboard |
 | `?` | ayuda |
 | `q` | salir |
+
+`logs` añade: `t` tail del group, `w`/`W` ventana, `o` paginar, `f` tail en vivo (`tail -f`),
+`:since`/`:from` rango. Mutantes gated: `p` (sqs), `R` (sfn), `S` (events).
 
 ### Reglas de código
 - El core nunca conoce servicios concretos: solo el registry los conecta.
@@ -201,12 +207,14 @@ Entregado: 3 niveles (event buses → rules → detalle). L1 `list_event_buses` 
 
 ## 8. Backlog / futuro
 
+- **Hecho (transversal):** copiar ARN/URL (`y`), abrir en consola AWS (`O`), búsqueda fuzzy local sin
+  prefijo, un solo `enter` desde el filtro, tail en vivo (`f`, `tail -f`), y config **load-only** en
+  `~/.config/awsdeck/config.toml` (`default_profile`/`default_region`/`default_tail_window`).
+- Vínculo a CloudWatch Logs desde otras vistas (del Lambda de un estado de SFN → sus logs): diseñado
+  (`ViewContext`/`View::on_context`, ARN del SDK ya verificado), diferido a un PR aparte.
+- Escribir la config en disco (hoy solo se lee); profiles favoritos, modo escritura por ambiente.
 - Más vistas: Lambda (invoke + config), DynamoDB (scan/query), ECS (services/tasks), RDS (estado), S3.
-- Archivo de config (`~/.config/awsdeck/config.toml`): región default, profiles favoritos, vistas a mostrar, modo escritura por ambiente.
-- Vínculo a CloudWatch Logs desde otras vistas (p. ej. del Lambda de un estado de SFN → sus logs).
-- Abrir el recurso en la consola de AWS (`o`).
 - Temas / paleta, y modo "denso" para pantallas chicas.
-- Navegación fuzzy entre recursos (estilo `:` con autocompletado).
 
 ---
 

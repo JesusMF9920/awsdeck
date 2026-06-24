@@ -105,7 +105,8 @@ vista nunca nombra al menú.
 ## Stack
 
 tokio · ratatui + crossterm (feature `event-stream`) · color-eyre · tui-input · serde_json ·
-serde + toml (config) · arboard (clipboard) · open (abrir navegador) · aws-config +
+serde + toml (config) + toml_edit (`:set` preservando comentarios) · arboard (clipboard) · open
+(abrir navegador) · aws-config +
 aws-sdk-cloudwatchlogs / aws-sdk-sqs / aws-sdk-sfn / aws-sdk-eventbridge. **Sin `async-trait`.**
 
 ## Estado
@@ -346,8 +347,27 @@ list/describe).
     si apuntaba a un favorito del ambiente anterior. La clave NO usa el `account_id` (async vía STS):
     profile+región es síncrono y siempre conocido. Core agnóstico: el `App` pasa `profile`/`región`
     (campos que ya posee), nunca inspecciona `view_id`/`key`; las vistas no cambian.
+- **Backlog de usabilidad (P4)**:
+  - **Persistencia instantánea**: `state.toml` ya no se escribe solo al salir; `App::persist_store`
+    (stampa el ambiente + `State::save`) corre tras cada cambio del store (`*`, `RecordRecent`, abrir un
+    favorito), así un crash no pierde lo de la sesión. En tests el write a disco se compila fuera
+    (`#[cfg(not(test))]`) para no tocar el `state.toml` real.
+  - **Favoritos en niveles profundos**: `events` marca una rule y `sfn` una ejecución (no solo el
+    recurso raíz). La `key` de `ViewContext::Favorite` sigue opaca: cada vista la codifica compuesta
+    `padre⟂hijo` (separador `\u{1f}`) en `selected_favorite` y la decodifica en `on_context` para abrir
+    directo el `Detail` (`LoadRuleDetail` / `LoadExecutionDetail`). Sin auto-recientes en profundo (son
+    explícitos con `*`); sin caveat EXPRESS (a las ejecuciones solo se llega en STANDARD). logs/sqs y el
+    core sin cambios.
+  - **Presets de evento**: `config.toml` gana `[[event_presets]]` (`Config.event_presets`, primer dato
+    no-escalar); `S` abre un chooser (`(en blanco)` + presets) que prellena el form
+    (`open_send_form_with`); el chooser reusa `wants_raw_input`. Sin presets → form canned directo.
+    `EventsView::with_presets` (cableado en `main`).
+  - **`:set <clave> <valor>`**: persiste un default en `config.toml` (`default_profile`/`default_region`/
+    `default_tail_window`) **preservando comentarios** (dep `toml_edit`; `Config::apply_setting` pura +
+    `write_setting` IO). Solo persiste (efectivo al reabrir); el ambiente vivo lo cambia `:region`. Core
+    agnóstico (toca claves de config, no servicios).
 
-260 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive, send y **redrive de DLQ**—, búsqueda de
+275 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive, send y **redrive de DLQ**—, búsqueda de
 groups server-side por subcadena + fuzzy local + fan-out de casing ("createOrder" → "CreateOrderV3") +
 "latest wins", menú, drill x3 en `sfn`/`events` y
 eventos/tail de `logs`, back→menú de dos etapas,
@@ -375,10 +395,12 @@ budget, mock `big` crece contiguo, selección preservada por nombre), **favorito
 activo, menú lista fav+recientes y `enter` abre por `ViewContext::Favorite`, getter + `on_context` por
 vista), **historial por ambiente** (aislamiento por `(profile, región)`, `prune` por bucket, lectura
 no crea bucket, migración del listado plano legacy al último ambiente / a defaults, el menú refleja
-solo el ambiente activo, `switch_env` re-ancla la selección)). `AWSDECK_MOCK=1 cargo run` lo abre sin
-credenciales.
+solo el ambiente activo, `switch_env` re-ancla la selección), **persistencia instantánea** (`*` stampa
+el ambiente en el store), **favoritos profundos** (events rule / sfn ejecución: la key compuesta abre el
+`Detail`), **presets de evento** (`S` abre el chooser, prellena el form; sin presets → canned), **`:set`**
+(`apply_setting` conserva comentarios y otras claves, agrega clave nueva, round-trip por `Config::parse`,
+rechaza clave/TOML inválido)). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
 
-Pendiente: presets de evento (`SendEvent`); persistir favoritos al instante (hoy al salir);
-favoritos en niveles profundos (hoy solo el recurso raíz de cada vista); abrir un favorito EXPRESS de
-`sfn` sin el error del SDK; escribir de vuelta `config.toml` (queda hand-editado). Backlog de vistas:
-Lambda, DynamoDB, ECS…
+Pendiente: presets built-in / "guardar evento actual como preset"; favoritos de streams de logs
+(efímeros); abrir un favorito EXPRESS de `sfn` sin el error del SDK; `:set` que también cambie el
+ambiente vivo. Backlog de vistas: Lambda, DynamoDB, ECS…

@@ -54,7 +54,7 @@ data fresca). Nunca crashea.
 | `t` | **logs del group** (`logs`): todos sus streams **por rango de tiempo** |
 | `w` / `W` | `logs`: ciclar la **ventana de tiempo** (15m · 1h · 6h · 24h · 3d · 7d) |
 | `o` | **cargar más** — tail: paginar la ventana · Events: líneas más viejas del stream · `sfn`: más ejecuciones, o más **history** en el detalle |
-| `*` | marcar/quitar **favorito** del recurso seleccionado (★ en el menú; los **recientes** se trackean solos al drillear; historial **por ambiente**) |
+| `*` | marcar/quitar **favorito** del recurso seleccionado (★ en el menú; recientes auto al drillear; historial **por ambiente**; también niveles profundos: una rule de `events` o una ejecución de `sfn`) |
 | `f` | `logs`: **tail en vivo** (`tail -f`) — auto-refresca **sin arrastrarte al fondo** si estás leyendo arriba |
 | `:since` · `:from`/`to` | `logs`: rango — `:since 2d` · `:from 2026-06-19 [to 2026-06-20]` (UTC) |
 | `P` | `events` (detalle): expandir el **event_pattern** completo (scroll + copia) |
@@ -63,10 +63,11 @@ data fresca). Nunca crashea.
 | `p` | purgar cola SQS (gated: modo escritura + confirm) |
 | `d` | `sqs` (detalle de un **DLQ**): redrive — reenvía los mensajes a sus colas origen (gated) |
 | `R` | redrive ejecución `sfn` fallida (gated: modo escritura + confirm) |
-| `S` | `events`: abre un **form editable** (source/detail-type/detail JSON + `time`/`resources` opcionales) y publica el evento (gated) |
+| `S` | `events`: si hay **presets** en `config.toml`, un chooser; luego un **form editable** (source/detail-type/detail JSON + `time`/`resources`) que publica el evento (gated) |
 | `:write` | alternar modo escritura (habilita acciones mutantes) |
 | `ctrl-e` | cambiar de ambiente (picker de profiles) |
 | `:region` | cambiar **solo la región** del ambiente actual (mismo profile), p. ej. `:region eu-west-1` |
+| `:set` | persistir un default en `config.toml` (`default_profile`/`default_region`/`default_tail_window`; conserva comentarios) |
 | `?` | ayuda |
 | `q` | salir |
 
@@ -185,9 +186,15 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
   `View::selected_favorite` + `ViewContext::Favorite`; persistidos en `state.toml` **por ambiente**:
   cada `(profile, región)` tiene su propio historial, así que cambiar de ambiente muestra el set
   correcto; un `state.toml` plano viejo migra solo).
+- **Más usabilidad diaria (P4)** ✅ **persistencia instantánea** (los favoritos/recientes se escriben
+  tras cada cambio, no solo al salir); **favoritos en niveles profundos** (`*` sobre una rule de
+  `events` o una ejecución de `sfn`, no solo el recurso raíz; key compuesta opaca que abre el detalle
+  directo); **presets de evento** (`[[event_presets]]` en `config.toml`: `S` ofrece un chooser que
+  prellena el form); **`:set <clave> <valor>`** (persiste un default en `config.toml` preservando
+  comentarios, vía `toml_edit`).
 
-Backlog: presets de evento; persistir favoritos al instante (hoy al salir); favoritos en niveles
-profundos; más vistas (Lambda, DynamoDB, ECS…).
+Backlog: presets built-in / guardar el evento actual como preset; favoritos de streams de logs
+(efímeros); más vistas (Lambda, DynamoDB, ECS…).
 
 ## Stack
 

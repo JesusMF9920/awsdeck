@@ -249,8 +249,16 @@ ejecuciones por estado) y `l` (logs de la Lambda del estado). Mutantes gated: `p
   favorites}>`; `toggle`/`record`/`prune`/`favorites_for` toman `(profile, región)`, `CAP=50` por
   bucket; el menú lee el bucket del ambiente activo y `switch_env` re-ancla la selección; shim
   `migrate_legacy` pliega el `state.toml` plano viejo al último ambiente usado).
-- Presets de evento; persistir favoritos al instante (hoy al salir); favoritos en niveles profundos;
-  escribir de vuelta el `config.toml` hand-editado.
+- **Hecho (más usabilidad diaria, P4):** **persistencia instantánea** (`App::persist_store` tras cada
+  cambio del store —`*`/`RecordRecent`/abrir favorito—, no solo al salir; en tests el write se compila
+  fuera); **favoritos en niveles profundos** (`events` rule + `sfn` ejecución: `key` compuesta opaca
+  `padre⟂hijo` que `selected_favorite` codifica y `on_context` decodifica para abrir el `Detail`
+  directo; logs/sqs y el core sin cambios); **presets de evento** (`[[event_presets]]` en `config.toml`
+  → `EventsView::with_presets`; `S` abre un chooser que prellena el form vía `open_send_form_with`);
+  **`:set <clave> <valor>`** (persiste un default en `config.toml` preservando comentarios, dep
+  `toml_edit`; `Config::apply_setting` pura + `write_setting` IO; core agnóstico).
+- Presets built-in / "guardar evento actual como preset"; favoritos de streams de logs (efímeros);
+  `:set` que también cambie el ambiente vivo; abrir un favorito EXPRESS de `sfn` sin error.
 - Más vistas: Lambda (invoke + config), DynamoDB (scan/query), ECS (services/tasks), RDS (estado), S3.
 - Temas / paleta, y modo "denso" para pantallas chicas.
 

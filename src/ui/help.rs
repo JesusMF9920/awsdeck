@@ -66,13 +66,17 @@ const KEYS: &[(&str, &str)] = &[
     ("R", "redrive ejecución sfn — gated por modo escritura"),
     (
         "S",
-        "enviar evento (events): form editable (source/detail-type/detail/time/resources) — gated",
+        "enviar evento (events): chooser de presets (config.toml) + form editable — gated",
     ),
     (":write", "alternar modo escritura (acciones mutantes)"),
     ("ctrl-e", "cambiar de ambiente (picker de profiles)"),
     (
         ":region",
         "cambiar SOLO la región del ambiente actual (p. ej. :region eu-west-1)",
+    ),
+    (
+        ":set",
+        "persistir un default en config.toml (default_profile/region/tail_window)",
     ),
     ("?", "mostrar/ocultar esta ayuda"),
     ("q", "salir"),

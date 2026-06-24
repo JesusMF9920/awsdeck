@@ -247,12 +247,22 @@ impl App {
             }
         }
         // Persistir el último ambiente + favoritos/recientes para recordarlos al reabrir.
-        // No-destructivo: escribe `state.toml` aparte, no toca el `config.toml`
-        // hand-editado. Best-effort.
+        self.persist_store();
+        Ok(())
+    }
+
+    /// Escribe el estado (último ambiente + favoritos/recientes por ambiente) a disco.
+    /// Se llama tras cada cambio del store —marcar `*`, auto-trackear un reciente, abrir
+    /// un favorito— para no perder lo de la sesión si el proceso muere sin salir limpio
+    /// (antes solo se escribía al salir). No-destructivo: escribe `state.toml` aparte, no
+    /// toca el `config.toml` hand-editado. Best-effort (I/O minúsculo, a ritmo humano).
+    fn persist_store(&mut self) {
         self.store.last_profile = Some(self.env.profile.clone());
         self.store.last_region = Some(self.env.region.clone());
+        // En tests no tocamos el disco real (`~/.config/awsdeck/state.toml`): el stamp de
+        // arriba es lo verificable; el write reusa el path probado de `State::save`.
+        #[cfg(not(test))]
         self.store.save();
-        Ok(())
     }
 
     /// Tick periódico: si hay una vista activa en modo normal (sin overlays), le
@@ -434,6 +444,7 @@ impl App {
                     &key,
                     &label,
                 );
+                self.persist_store();
                 self.dispatch(Action::ActivateViewWithContext {
                     id: view_id,
                     context: ViewContext::Favorite { key },
@@ -581,6 +592,7 @@ impl App {
                 if let Some(id) = self.registry.active().map(|v| v.id()) {
                     self.store
                         .record_recent(&self.env.profile, &self.env.region, id, &key, &label);
+                    self.persist_store();
                 }
             }
             // Gate prod-safe: las mutantes pasan por modo escritura + confirm.
@@ -968,6 +980,7 @@ impl App {
         let marked =
             self.store
                 .toggle_favorite(&self.env.profile, &self.env.region, view_id, &key, &label);
+        self.persist_store();
         if marked {
             self.set_info(format!("favorito: {label}"));
         } else {
@@ -2088,6 +2101,16 @@ mod tests {
         // `*` de nuevo lo desmarca (queda como reciente, sin estrella).
         app.on_key(ch('*'));
         assert!(!app.store.favorites_for(&app.env.profile, &app.env.region)[0].is_favorite);
+    }
+
+    #[test]
+    fn star_persists_store_stamping_current_env() {
+        let mut app = app_with_fav_view(); // env ("default","us-east-1")
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // menú → vista
+        assert!(app.store.last_profile.is_none(), "aún no se persistió nada");
+        app.on_key(ch('*')); // marca → persist_store stampa el ambiente (y guardaría)
+        assert_eq!(app.store.last_profile.as_deref(), Some("default"));
+        assert_eq!(app.store.last_region.as_deref(), Some("us-east-1"));
     }
 
     #[test]

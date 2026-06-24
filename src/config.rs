@@ -252,6 +252,9 @@ impl State {
 
     /// Escribe el estado al disco (best-effort: crea el directorio e ignora errores;
     /// no debe romper la salida de la app si el disco no está disponible).
+    // En el build de tests no se llama (el `App` compila fuera el write para no tocar el
+    // disco real); en producción la usa `App::persist_store`.
+    #[cfg_attr(test, allow(dead_code))]
     pub fn save(&self) {
         let Some(path) = config_file("state.toml") else {
             return;

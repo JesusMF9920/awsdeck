@@ -55,7 +55,9 @@ async fn main() -> Result<()> {
     registry.register(Box::new(logs));
     registry.register(Box::new(SqsView::new()));
     registry.register(Box::new(SfnView::new()));
-    registry.register(Box::new(EventsView::new()));
+    registry.register(Box::new(
+        EventsView::new().with_presets(config.event_presets),
+    ));
 
     let mut app = App::new(env, registry, effects, rx);
     // Inyecta los favoritos/recientes persistidos (`state.toml`); la app los muta en
@@ -114,6 +116,7 @@ mod tests {
             default_profile: Some("cfg-prof".into()),
             default_region: Some("cfg-region".into()),
             default_tail_window: None,
+            ..Config::default()
         };
         let state = State {
             last_profile: Some("state-prof".into()),

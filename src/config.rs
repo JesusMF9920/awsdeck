@@ -26,6 +26,23 @@ pub struct Config {
     pub default_region: Option<String>,
     /// Ventana de tiempo por defecto del tail de `logs` (etiqueta de preset).
     pub default_tail_window: Option<String>,
+    /// Templates de evento para `S` (vista `events`), hand-editados como
+    /// `[[event_presets]]`. Vacío = comportamiento actual (un solo default canned).
+    pub event_presets: Vec<EventPreset>,
+}
+
+/// Un template de evento para `S` en la vista `events`, hand-editado en `config.toml`
+/// como `[[event_presets]]`. La vista lo ofrece en un chooser y prellena el form con sus
+/// valores (la validación de `detail` JSON sigue en la vista, al enviar).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct EventPreset {
+    /// Nombre mostrado en el chooser.
+    pub name: String,
+    pub source: String,
+    pub detail_type: String,
+    /// Cuerpo `detail` (JSON como string).
+    pub detail: String,
 }
 
 impl Config {
@@ -303,6 +320,38 @@ mod tests {
         assert_eq!(cfg.default_profile.as_deref(), Some("prod"));
         assert_eq!(cfg.default_region.as_deref(), Some("eu-west-1"));
         assert_eq!(cfg.default_tail_window.as_deref(), Some("6h"));
+    }
+
+    #[test]
+    fn parses_event_presets() {
+        let cfg = Config::parse(
+            r#"
+            default_region = "eu-west-1"
+
+            [[event_presets]]
+            name = "orden creada"
+            source = "shop.orders"
+            detail_type = "OrderCreated"
+            detail = "{\"id\":1}"
+
+            [[event_presets]]
+            name = "pago ok"
+            source = "shop.payments"
+            detail_type = "PaymentOk"
+            detail = "{}"
+        "#,
+        )
+        .expect("parsea");
+        assert_eq!(cfg.event_presets.len(), 2);
+        assert_eq!(cfg.event_presets[0].name, "orden creada");
+        assert_eq!(cfg.event_presets[0].source, "shop.orders");
+        assert_eq!(cfg.event_presets[1].detail_type, "PaymentOk");
+    }
+
+    #[test]
+    fn config_without_presets_has_empty_vec() {
+        let cfg = Config::parse(r#"default_region = "us-east-1""#).expect("parsea");
+        assert!(cfg.event_presets.is_empty());
     }
 
     #[test]

@@ -13,10 +13,11 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 
 use super::View;
 use crate::action::{Action, ConsoleTarget, ViewContext};
+use crate::config::EventPreset;
 use crate::message::{EventBusDto, Message, RuleDetailDto, RuleDto, RuleState, TargetDto};
 use crate::ui::detail::DetailPanel;
 use crate::ui::form::{Form, FormOutcome};
@@ -60,6 +61,12 @@ pub struct EventsView {
     /// Se alcanzó el tope de paginación de rules.
     rules_partial: bool,
     state: ListState,
+    /// Presets de evento (de `config.toml`); el chooser de `S` los ofrece para prellenar
+    /// el form. Vacío = `S` abre el form canned directo (comportamiento previo).
+    presets: Vec<EventPreset>,
+    /// Chooser de presets abierto (`S` con presets): elige uno antes del form. `None` =
+    /// sin chooser. El índice 0 del chooser es "(en blanco)" = el default canned.
+    preset_chooser: Option<ListState>,
 }
 
 impl EventsView {
@@ -77,7 +84,16 @@ impl EventsView {
             buses_partial: false,
             rules_partial: false,
             state: ListState::default().with_selected(Some(0)),
+            presets: Vec::new(),
+            preset_chooser: None,
         }
+    }
+
+    /// Inyecta los presets de evento leídos de `config.toml` (lo llama el composition
+    /// root). Sin presets, `S` abre el form canned directo.
+    pub fn with_presets(mut self, presets: Vec<EventPreset>) -> Self {
+        self.presets = presets;
+        self
     }
 
     // --- Filtrado / selección -------------------------------------------------
@@ -327,18 +343,69 @@ impl EventsView {
         actions
     }
 
-    /// `S` en el nivel de buses: abre el form de envío con defaults editables y stashea
-    /// el bus elegido. El envío (con el payload tecleado) se gatea en el App al `Submit`.
-    fn open_send_form(&mut self) {
+    /// `S` en el nivel de buses: si hay presets configurados, abre el chooser para elegir
+    /// uno; si no, abre el form canned directo (comportamiento previo).
+    fn start_send(&mut self) {
+        if !matches!(self.level, Level::Buses) || self.selected_bus().is_none() {
+            return;
+        }
+        if self.presets.is_empty() {
+            self.open_send_form_with(
+                "awsdeck.manual",
+                "awsdeck test event",
+                r#"{"sentBy":"awsdeck"}"#,
+            );
+        } else {
+            self.preset_chooser = Some(ListState::default().with_selected(Some(0)));
+        }
+    }
+
+    /// El usuario eligió en el chooser (`enter`): índice 0 = "(en blanco)" canned; el resto
+    /// = ese preset. Cierra el chooser y abre el form prellenado.
+    fn choose_preset(&mut self) {
+        let sel = self
+            .preset_chooser
+            .as_ref()
+            .and_then(|s| s.selected())
+            .unwrap_or(0);
+        self.preset_chooser = None;
+        if sel == 0 {
+            self.open_send_form_with(
+                "awsdeck.manual",
+                "awsdeck test event",
+                r#"{"sentBy":"awsdeck"}"#,
+            );
+        } else if let Some(p) = self.presets.get(sel - 1) {
+            // Clonar para cortar el préstamo de `self.presets` antes de `&mut self`.
+            let (source, detail_type, detail) =
+                (p.source.clone(), p.detail_type.clone(), p.detail.clone());
+            self.open_send_form_with(&source, &detail_type, &detail);
+        }
+    }
+
+    /// Navega el chooser de presets (`j/k`); clamp a `[0, presets.len()]` (el 0 es canned).
+    fn chooser_move(&mut self, delta: i32) {
+        if let Some(state) = self.preset_chooser.as_mut() {
+            let len = self.presets.len() + 1; // +1 por "(en blanco)"
+            let cur = state.selected().unwrap_or(0) as i32;
+            let next = (cur + delta).clamp(0, len as i32 - 1) as usize;
+            state.select(Some(next));
+        }
+    }
+
+    /// Abre el form de envío prellenado con `source`/`detail-type`/`detail` y stashea el
+    /// bus elegido. `time`/`resources` arrancan vacíos (opcionales). El envío (con el
+    /// payload tecleado) se gatea en el App al `Submit`.
+    fn open_send_form_with(&mut self, source: &str, detail_type: &str, detail: &str) {
         if matches!(self.level, Level::Buses)
             && let Some(b) = self.selected_bus()
         {
             let form = Form::new(
                 format!("enviar evento → {}", b.name),
                 vec![
-                    ("source", "awsdeck.manual"),
-                    ("detail-type", "awsdeck test event"),
-                    ("detail", r#"{"sentBy":"awsdeck"}"#),
+                    ("source", source),
+                    ("detail-type", detail_type),
+                    ("detail", detail),
                     // Opcionales (vacío = omitir): timestamp UTC y ARNs de recursos.
                     // (El form es de una línea por campo — `enter` envía —, así que los
                     // resources van separados por coma.)
@@ -488,6 +555,31 @@ impl EventsView {
             .highlight_symbol("› ");
         frame.render_stateful_widget(list, area, &mut self.state);
     }
+
+    /// Renderiza el chooser de presets como popup centrado (sobre la lista de buses). El
+    /// índice 0 es "(en blanco)" = el default canned; el resto, los presets de config.
+    fn render_preset_chooser(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(state) = self.preset_chooser.as_mut() else {
+            return;
+        };
+        let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(Span::styled(
+            "(en blanco)",
+            Style::new().dark_gray(),
+        )))];
+        items.extend(
+            self.presets
+                .iter()
+                .map(|p| ListItem::new(Line::from(p.name.clone()))),
+        );
+        let height = (items.len() as u16 + 2).min(area.height.max(3));
+        let popup = crate::ui::popup_area(area, 50, height);
+        frame.render_widget(Clear, popup);
+        let list = List::new(items)
+            .block(Block::bordered().title(" preset · enter usa · esc cancela "))
+            .highlight_style(Style::new().reversed())
+            .highlight_symbol("› ");
+        frame.render_stateful_widget(list, popup, state);
+    }
 }
 
 impl Default for EventsView {
@@ -506,10 +598,14 @@ impl View for EventsView {
     }
 
     fn wants_raw_input(&self) -> bool {
-        self.event_form.is_some()
+        self.event_form.is_some() || self.preset_chooser.is_some()
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        // Chooser de presets abierto: navegar / elegir / cancelar.
+        if self.preset_chooser.is_some() {
+            return vec![("j/k", "preset"), ("enter", "usar"), ("esc", "cancelar")];
+        }
         // Form de envío abierto: sus teclas (campo/enviar/cancelar) mandan.
         if let Some((_, form)) = &self.event_form {
             return form.hints();
@@ -624,6 +720,19 @@ impl View for EventsView {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        // Chooser de presets abierto: `j/k` navega, `enter` elige (abre el form
+        // prellenado), `esc` cancela. (El App nos manda las teclas crudas vía
+        // `wants_raw_input`, así que `*`/`/`/`q` no las intercepta el core.)
+        if self.preset_chooser.is_some() {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.chooser_move(1),
+                KeyCode::Char('k') | KeyCode::Up => self.chooser_move(-1),
+                KeyCode::Enter => self.choose_preset(),
+                KeyCode::Esc => self.preset_chooser = None,
+                _ => {}
+            }
+            return vec![];
+        }
         // Form de envío abierto: rutea TODAS las teclas al form (el App nos las manda
         // crudas vía `wants_raw_input`). `enter` valida+envía, `esc` cancela.
         if self.event_form.is_some() {
@@ -688,7 +797,7 @@ impl View for EventsView {
             KeyCode::Esc => self.back(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('S') => {
-                self.open_send_form();
+                self.start_send();
                 vec![]
             }
             KeyCode::Char('y') => self
@@ -815,6 +924,8 @@ impl View for EventsView {
                 self.render_list(frame, targets, block, items);
             }
         }
+        // Chooser de presets: popup centrado (antes que el form; son excluyentes).
+        self.render_preset_chooser(frame, area);
         // Form de envío: popup centrado sobre el cuerpo (la lista de buses queda detrás).
         if let Some((_, form)) = &self.event_form {
             form.render(frame, area);
@@ -908,6 +1019,15 @@ mod tests {
 
     fn buses_msg(buses: Vec<EventBusDto>) -> Message {
         Message::EventBusesLoaded { buses, more: false }
+    }
+
+    fn preset(name: &str) -> EventPreset {
+        EventPreset {
+            name: name.to_string(),
+            source: format!("src.{name}"),
+            detail_type: format!("Type{name}"),
+            detail: r#"{"k":1}"#.to_string(),
+        }
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1368,6 +1488,60 @@ mod tests {
         // enter NO emite: el JSON es inválido → el form sigue abierto.
         assert!(v.on_key(key(KeyCode::Enter)).is_empty());
         assert!(v.event_form.is_some(), "JSON inválido deja el form abierto");
+    }
+
+    #[test]
+    fn s_with_presets_opens_chooser_not_form() {
+        let mut v = EventsView::new().with_presets(vec![preset("a"), preset("b")]);
+        v.on_message(&buses_msg(vec![bus("default")]));
+        v.on_key(key(KeyCode::Char('S')));
+        assert!(v.preset_chooser.is_some(), "abre el chooser");
+        assert!(v.event_form.is_none(), "todavía no hay form");
+        assert!(v.wants_raw_input(), "el chooser recibe teclas crudas");
+    }
+
+    #[test]
+    fn s_without_presets_opens_canned_form_directly() {
+        let mut v = EventsView::new(); // sin presets
+        v.on_message(&buses_msg(vec![bus("default")]));
+        v.on_key(key(KeyCode::Char('S')));
+        assert!(v.preset_chooser.is_none(), "sin chooser");
+        let (_, form) = v.event_form.as_ref().expect("form canned directo");
+        assert_eq!(form.values()[0], "awsdeck.manual");
+    }
+
+    #[test]
+    fn chooser_enter_on_preset_opens_prefilled_form() {
+        let mut v = EventsView::new().with_presets(vec![preset("a"), preset("b")]);
+        v.on_message(&buses_msg(vec![bus("default")]));
+        v.on_key(key(KeyCode::Char('S'))); // chooser: [0]=(en blanco), [1]=a, [2]=b
+        v.on_key(key(KeyCode::Char('j'))); // → preset "a" (índice 1)
+        v.on_key(key(KeyCode::Enter));
+        assert!(v.preset_chooser.is_none(), "el chooser se cerró");
+        let (_, form) = v.event_form.as_ref().expect("form abierto");
+        let vals = form.values();
+        assert_eq!(vals[0], "src.a");
+        assert_eq!(vals[1], "Typea");
+        assert_eq!(vals[2], r#"{"k":1}"#);
+    }
+
+    #[test]
+    fn chooser_index_zero_opens_canned_form() {
+        let mut v = EventsView::new().with_presets(vec![preset("a")]);
+        v.on_message(&buses_msg(vec![bus("default")]));
+        v.on_key(key(KeyCode::Char('S'))); // chooser arranca en índice 0 = (en blanco)
+        v.on_key(key(KeyCode::Enter));
+        let (_, form) = v.event_form.as_ref().expect("form canned");
+        assert_eq!(form.values()[0], "awsdeck.manual");
+    }
+
+    #[test]
+    fn chooser_esc_closes_without_form() {
+        let mut v = EventsView::new().with_presets(vec![preset("a")]);
+        v.on_message(&buses_msg(vec![bus("default")]));
+        v.on_key(key(KeyCode::Char('S')));
+        v.on_key(key(KeyCode::Esc));
+        assert!(v.preset_chooser.is_none() && v.event_form.is_none());
     }
 
     #[test]

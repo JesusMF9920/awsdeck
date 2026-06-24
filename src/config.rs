@@ -2,7 +2,9 @@
 //! - `~/.config/awsdeck/config.toml` — **load-only**, hand-editado por el usuario; si no
 //!   existe o no parsea, defaults sin romper el arranque.
 //! - `~/.config/awsdeck/state.toml` — **estado** que la app escribe sola (último ambiente
-//!   usado). Archivo aparte para NO clobberear los comentarios del `config.toml`.
+//!   usado + historial de favoritos/recientes POR AMBIENTE, como `[[environments]]`).
+//!   Archivo aparte para NO clobberear los comentarios del `config.toml`. Un `state.toml`
+//!   viejo con un listado plano `favorites` migra solo al esquema por-ambiente al salir.
 //!
 //! Ejemplo de `config.toml`:
 //! ```toml

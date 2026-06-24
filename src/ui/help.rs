@@ -39,7 +39,7 @@ const KEYS: &[(&str, &str)] = &[
     ),
     (
         "*",
-        "marcar/quitar favorito del recurso seleccionado (★ en el menú · recientes auto)",
+        "marcar/quitar favorito del recurso (★ en el menú · recientes auto · por ambiente)",
     ),
     (
         "f",

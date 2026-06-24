@@ -329,16 +329,25 @@ list/describe).
     (core): la vista la emite al drillear a un recurso raíz; el `App` la guarda con el id activo.
     Abrir un favorito reusa el handoff: nueva variante **`ViewContext::Favorite { key }`** →
     `ActivateViewWithContext` → `on_context` de la vista destino (drill directo). Persistido en
-    `state.toml` (`State.favorites: Vec<Favorite{view_id,key,label,is_favorite}>`, `#[serde(default)]`
-    = compat v1; `toggle_favorite`/`record_recent`/`prune` puros, `CAP=50` recientes). El `App` guarda
-    un `store: State` (inyectado con `load_state`, reescrito al salir). El **menú** lista, bajo las
-    herramientas, **★ favoritos** y **recientes** (`MenuRow::{Tool,Header,Favorite}`; la navegación
-    salta los headers); `enter` sobre uno lo sube al frente y lo abre por contexto. Hint `* favorito`
-    cuando la vista expone un recurso. Cada vista implementa el getter + `on_context(Favorite)` +
-    `RecordRecent` al drillear (`logs` group→tail, `sqs` cola→detalle, `sfn` máquina→ejecuciones —
-    EXPRESS abierto así muestra el error del SDK—, `events` bus→rules).
+    `state.toml` **por ambiente** (`State.environments: Vec<EnvHistory{profile,region,favorites}>`,
+    `[[environments]]`; `toggle_favorite`/`record_recent`/`favorites_for`/`prune` toman `(profile,
+    región)` y operan sobre el bucket del ambiente; `CAP=50` recientes por bucket; `#[serde(default)]`
+    + shim `migrate_legacy` = compat con el `state.toml` plano viejo, que migra solo al último ambiente
+    usado). El `App` guarda un `store: State` (inyectado con `load_state`, reescrito al salir). El
+    **menú** lista, bajo las herramientas, **★ favoritos** y **recientes** (`MenuRow::{Tool,Header,
+    Favorite}`; la navegación salta los headers); `enter` sobre uno lo sube al frente y lo abre por
+    contexto. Hint `* favorito` cuando la vista expone un recurso. Cada vista implementa el getter +
+    `on_context(Favorite)` + `RecordRecent` al drillear (`logs` group→tail, `sqs` cola→detalle, `sfn`
+    máquina→ejecuciones —EXPRESS abierto así muestra el error del SDK—, `events` bus→rules).
+  - **Historial por ambiente**: los favoritos/recientes son **por `(profile, región)`** — cada
+    ambiente ve recursos distintos, así que tiene su propio historial aislado. `menu_rows` lee el
+    bucket del ambiente activo (`favorites_for`), así que `ctrl-e`/`:region` muestran el set correcto
+    en el siguiente render; `switch_env` re-ancla la selección del menú (`reanchor_menu_selection`) por
+    si apuntaba a un favorito del ambiente anterior. La clave NO usa el `account_id` (async vía STS):
+    profile+región es síncrono y siempre conocido. Core agnóstico: el `App` pasa `profile`/`región`
+    (campos que ya posee), nunca inspecciona `view_id`/`key`; las vistas no cambian.
 
-251 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive, send y **redrive de DLQ**—, búsqueda de
+260 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive, send y **redrive de DLQ**—, búsqueda de
 groups server-side por subcadena + fuzzy local + fan-out de casing ("createOrder" → "CreateOrderV3") +
 "latest wins", menú, drill x3 en `sfn`/`events` y
 eventos/tail de `logs`, back→menú de dos etapas,
@@ -364,7 +373,10 @@ parsea/valida time + resources, confirm los muestra), **load-more del history `s
 budget, mock `big` crece contiguo, selección preservada por nombre), **favoritos/recientes**
 (`toggle`/`record_recent`/`prune` LRU + round-trip + compat v1, `*` marca/quita, `RecordRecent` con id
 activo, menú lista fav+recientes y `enter` abre por `ViewContext::Favorite`, getter + `on_context` por
-vista)). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
+vista), **historial por ambiente** (aislamiento por `(profile, región)`, `prune` por bucket, lectura
+no crea bucket, migración del listado plano legacy al último ambiente / a defaults, el menú refleja
+solo el ambiente activo, `switch_env` re-ancla la selección)). `AWSDECK_MOCK=1 cargo run` lo abre sin
+credenciales.
 
 Pendiente: presets de evento (`SendEvent`); persistir favoritos al instante (hoy al salir);
 favoritos en niveles profundos (hoy solo el recurso raíz de cada vista); abrir un favorito EXPRESS de

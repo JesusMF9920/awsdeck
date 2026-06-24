@@ -245,7 +245,10 @@ ejecuciones por estado) y `l` (logs de la Lambda del estado). Mutantes gated: `p
   cronológico contiguo—, conservando la selección por nombre); **favoritos + recientes** desde el menú
   principal — `*` marca un recurso, los recientes se trackean solos al drillear; agnóstico vía el hook
   `View::selected_favorite` + `Action::RecordRecent` + `ViewContext::Favorite` (abre por `on_context`),
-  persistidos en `state.toml` (`Favorite`, LRU por orden, `CAP=50`).
+  persistidos en `state.toml` **por ambiente** (`State.environments: Vec<EnvHistory{profile,region,
+  favorites}>`; `toggle`/`record`/`prune`/`favorites_for` toman `(profile, región)`, `CAP=50` por
+  bucket; el menú lee el bucket del ambiente activo y `switch_env` re-ancla la selección; shim
+  `migrate_legacy` pliega el `state.toml` plano viejo al último ambiente usado).
 - Presets de evento; persistir favoritos al instante (hoy al salir); favoritos en niveles profundos;
   escribir de vuelta el `config.toml` hand-editado.
 - Más vistas: Lambda (invoke + config), DynamoDB (scan/query), ECS (services/tasks), RDS (estado), S3.

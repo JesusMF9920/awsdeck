@@ -54,7 +54,7 @@ data fresca). Nunca crashea.
 | `t` | **logs del group** (`logs`): todos sus streams **por rango de tiempo** |
 | `w` / `W` | `logs`: ciclar la **ventana de tiempo** (15m · 1h · 6h · 24h · 3d · 7d) |
 | `o` | **cargar más** — tail: paginar la ventana · Events: líneas más viejas del stream · `sfn`: más ejecuciones, o más **history** en el detalle |
-| `*` | marcar/quitar **favorito** del recurso seleccionado (★ en el menú; los **recientes** se trackean solos al drillear) |
+| `*` | marcar/quitar **favorito** del recurso seleccionado (★ en el menú; los **recientes** se trackean solos al drillear; historial **por ambiente**) |
 | `f` | `logs`: **tail en vivo** (`tail -f`) — auto-refresca **sin arrastrarte al fondo** si estás leyendo arriba |
 | `:since` · `:from`/`to` | `logs`: rango — `:since 2d` · `:from 2026-06-19 [to 2026-06-20]` (UTC) |
 | `P` | `events` (detalle): expandir el **event_pattern** completo (scroll + copia) |
@@ -182,7 +182,9 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
   fechas UTC sin `chrono`); **load-more del history de `sfn`** (`o` en el detalle: re-fetch + re-parse
   con presupuesto creciente, conservando la selección); **favoritos + recientes** desde el menú
   principal (`*` marca un recurso, los recientes se trackean solos al drillear; agnóstico vía
-  `View::selected_favorite` + `ViewContext::Favorite`; persistidos en `state.toml`).
+  `View::selected_favorite` + `ViewContext::Favorite`; persistidos en `state.toml` **por ambiente**:
+  cada `(profile, región)` tiene su propio historial, así que cambiar de ambiente muestra el set
+  correcto; un `state.toml` plano viejo migra solo).
 
 Backlog: presets de evento; persistir favoritos al instante (hoy al salir); favoritos en niveles
 profundos; más vistas (Lambda, DynamoDB, ECS…).

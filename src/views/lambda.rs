@@ -237,11 +237,17 @@ impl LambdaView {
         } else {
             ""
         };
+        // Mientras llegan más páginas (streaming) con la lista ya visible, avisamos.
+        let loading = if self.loading && total > 0 {
+            " · cargando…"
+        } else {
+            ""
+        };
         if self.filter.is_empty() {
-            format!(" {total} funciones{partial} ")
+            format!(" {total} funciones{partial}{loading} ")
         } else {
             format!(
-                " {shown}/{total} funciones{partial} · filtro: {} ",
+                " {shown}/{total} funciones{partial}{loading} · filtro: {} ",
                 self.filter
             )
         }
@@ -444,11 +450,22 @@ impl View for LambdaView {
 
     fn on_message(&mut self, message: &Message) {
         match message {
-            Message::FunctionsLoaded { functions, more } => {
-                self.functions = functions.clone();
-                self.functions_partial = *more;
+            Message::FunctionsLoaded {
+                functions,
+                append,
+                more,
+                partial,
+            } => {
+                // Streaming: la 1ª página reemplaza, las siguientes se anexan.
+                if *append {
+                    self.functions.extend(functions.iter().cloned());
+                } else {
+                    self.functions = functions.clone();
+                }
+                self.functions_partial = *partial;
                 if matches!(self.level, Level::Functions) {
-                    self.loading = false;
+                    // Sigue cargando mientras lleguen más páginas (la lista ya se navega).
+                    self.loading = *more;
                     self.clamp_selection();
                 }
             }
@@ -649,7 +666,9 @@ mod tests {
         let mut v = LambdaView::new();
         v.on_message(&Message::FunctionsLoaded {
             functions: vec![function("create-order"), function("process-payment")],
+            append: false,
             more: false,
+            partial: false,
         });
         assert_eq!(v.visible_len(), 2);
     }
@@ -659,15 +678,44 @@ mod tests {
         let mut v = LambdaView::new();
         v.on_message(&Message::FunctionsLoaded {
             functions: vec![function("create-order")],
+            append: false,
             more: false,
+            partial: false,
         });
         assert!(!v.functions_title().contains("parcial"));
-        // Se alcanzó el tope de páginas con más pendientes → la vista lo señala.
+        // Última página que cortó por el tope (`partial`) → la vista lo señala.
         v.on_message(&Message::FunctionsLoaded {
             functions: vec![function("create-order")],
-            more: true,
+            append: false,
+            more: false,
+            partial: true,
         });
         assert!(v.functions_title().contains("parcial"));
+    }
+
+    #[test]
+    fn streaming_pages_append_and_finish() {
+        let mut v = LambdaView::new();
+        v.loading = true; // como tras on_activate
+        // 1ª página (more=true): ya se muestra y sigue "cargando".
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("a"), function("b")],
+            append: false,
+            more: true,
+            partial: false,
+        });
+        assert_eq!(v.visible_len(), 2);
+        assert!(v.loading, "sigue cargando mientras vienen más páginas");
+        assert!(v.functions_title().contains("cargando"));
+        // 2ª página (more=false): se anexa y termina de cargar.
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("c")],
+            append: true,
+            more: false,
+            partial: false,
+        });
+        assert_eq!(v.visible_len(), 3, "la 2ª página se anexa");
+        assert!(!v.loading, "terminó de cargar");
     }
 
     #[test]
@@ -679,7 +727,9 @@ mod tests {
                 function("create-invoice"),
                 function("process-payment"),
             ],
+            append: false,
             more: false,
+            partial: false,
         });
         v.set_filter("CREATE"); // case-insensitive
         assert_eq!(v.visible_len(), 2);
@@ -690,7 +740,9 @@ mod tests {
         let mut v = LambdaView::new();
         v.on_message(&Message::FunctionsLoaded {
             functions: vec![function("create-order"), function("process-payment")],
+            append: false,
             more: false,
+            partial: false,
         });
         v.on_key(key(KeyCode::Down)); // selecciona process-payment
         let actions = v.on_key(key(KeyCode::Enter));
@@ -729,7 +781,9 @@ mod tests {
         let mut v = LambdaView::new();
         v.on_message(&Message::FunctionsLoaded {
             functions: vec![function("create-order")],
+            append: false,
             more: false,
+            partial: false,
         });
         // En el nivel de funciones el favorito es la función seleccionada (arn + nombre).
         let fav = v.selected_favorite().expect("hay una función seleccionada");
@@ -753,7 +807,9 @@ mod tests {
         let mut v = LambdaView::new();
         v.on_message(&Message::FunctionsLoaded {
             functions: vec![function("create-order")],
+            append: false,
             more: false,
+            partial: false,
         });
         v.on_key(key(KeyCode::Enter)); // → Detail
         let long = format!("flags {}", "x".repeat(200));
@@ -790,7 +846,9 @@ mod tests {
         let mut v = LambdaView::new();
         v.on_message(&Message::FunctionsLoaded {
             functions: vec![function("create-order")],
+            append: false,
             more: false,
+            partial: false,
         });
         v.on_key(key(KeyCode::Enter)); // drill create-order
         v.on_message(&Message::FunctionDetailLoaded {
@@ -805,7 +863,9 @@ mod tests {
         let mut v = LambdaView::new();
         v.on_message(&Message::FunctionsLoaded {
             functions: vec![function("create-order")],
+            append: false,
             more: false,
+            partial: false,
         });
         let actions = v.on_key(key(KeyCode::Esc));
         assert!(matches!(actions.as_slice(), [Action::Back]));
@@ -817,7 +877,9 @@ mod tests {
         let mut v = LambdaView::new();
         v.on_message(&Message::FunctionsLoaded {
             functions: vec![function("create-order")],
+            append: false,
             more: false,
+            partial: false,
         });
         v.on_key(key(KeyCode::Enter)); // drill al detalle
         assert!(matches!(v.level, Level::Detail { .. }));
@@ -831,7 +893,9 @@ mod tests {
         let mut v = LambdaView::new();
         v.on_message(&Message::FunctionsLoaded {
             functions: vec![function("create-order")],
+            append: false,
             more: false,
+            partial: false,
         });
         match v.on_key(key(KeyCode::Char('y'))).as_slice() {
             [Action::CopyToClipboard { text }] => {
@@ -846,7 +910,9 @@ mod tests {
         let mut v = LambdaView::new();
         v.on_message(&Message::FunctionsLoaded {
             functions: vec![function("create-order")],
+            append: false,
             more: false,
+            partial: false,
         });
         match v.on_key(key(KeyCode::Char('O'))).as_slice() {
             [
@@ -863,7 +929,9 @@ mod tests {
         let mut v = LambdaView::new();
         v.on_message(&Message::FunctionsLoaded {
             functions: vec![function("create-order")],
+            append: false,
             more: false,
+            partial: false,
         });
         // En la lista: `l` abre los logs de la función seleccionada.
         match v.on_key(key(KeyCode::Char('l'))).as_slice() {
@@ -890,7 +958,9 @@ mod tests {
         let mut v = LambdaView::new();
         v.on_message(&Message::FunctionsLoaded {
             functions: vec![function("create-order")],
+            append: false,
             more: false,
+            partial: false,
         });
         assert!(v.hints().iter().any(|(k, _)| *k == "l"));
     }
@@ -903,7 +973,9 @@ mod tests {
         let mut v = LambdaView::new();
         v.on_message(&Message::FunctionsLoaded {
             functions: vec![function("create-order")],
+            append: false,
             more: false,
+            partial: false,
         });
         v.on_key(key(KeyCode::Enter));
         v.on_message(&Message::FunctionDetailLoaded {

@@ -412,11 +412,15 @@ pub enum Message {
     DlqRedriveStarted { queue_url: String },
 
     // --- Lambda ---
-    /// Se cargaron las funciones Lambda del ambiente activo. `more` indica que se alcanzó
-    /// el tope de paginación con más funciones pendientes (la vista muestra `· parcial`).
+    /// Una página de funciones Lambda (se cargan en streaming: la primera llega tras un
+    /// solo round-trip y la vista ya es usable; el resto se anexa de fondo). `append` =
+    /// anexar (vs reemplazar, primera página); `more` = aún vienen más páginas (la vista
+    /// mantiene "cargando…"); `partial` = se cortó por el tope de páginas (`· parcial`).
     FunctionsLoaded {
         functions: Vec<FunctionDto>,
+        append: bool,
         more: bool,
+        partial: bool,
     },
     /// Detalle de una función (`get_function`). `function_arn` permite a la vista
     /// confirmar que corresponde al drill actual.

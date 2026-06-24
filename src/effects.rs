@@ -377,19 +377,19 @@ impl Effects {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     let msg = Message::FunctionsLoaded {
                         functions: mock_functions(&env),
+                        append: false,
                         more: false,
+                        partial: false,
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
             }
             Backend::Real(ctx) => {
                 let ctx = ctx.clone();
+                // Streaming: cada página se manda apenas llega (la 1ª tras un round-trip
+                // → la vista es usable de inmediato; el resto se anexa de fondo).
                 tokio::spawn(async move {
-                    let msg = match fetch_functions(&ctx).await {
-                        Ok((functions, more)) => Message::FunctionsLoaded { functions, more },
-                        Err(e) => sdk_error("list_functions", &e),
-                    };
-                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                    stream_functions(&ctx, &tx, epoch).await;
                 });
             }
         }
@@ -1182,42 +1182,66 @@ async fn fetch_queues(ctx: &AwsContext) -> color_eyre::Result<Vec<QueueDto>> {
     Ok(queues)
 }
 
-/// Tope de páginas al listar funciones: `list_functions` no admite filtro server-side por
-/// nombre (lo que quede fuera sería inalcanzable), así que las traemos paginando, pero con
-/// un tope para no colgarse en cuentas con miles de funciones (cada página son ≤50 items y
-/// una llamada de red). Si se alcanza con más pendientes, `more = true` → la vista muestra
-/// `· parcial`. (Antes drenaba TODO el paginador → lento en cuentas grandes.)
-const MAX_FUNCTION_PAGES: usize = 20;
+/// Tope de páginas al listar funciones: `list_functions` devuelve ≤50 por página y no
+/// admite filtro server-side por nombre, así que para que la búsqueda fuzzy local encuentre
+/// todo hay que traerlas. El streaming hace la vista usable desde la 1ª página, así que el
+/// tope solo evita un fondo eterno en cuentas patológicas (40·50 = 2000 funciones). Si se
+/// alcanza con más pendientes, la última página marca `partial = true` → `· parcial`.
+const MAX_FUNCTION_PAGES: usize = 40;
 
-async fn fetch_functions(ctx: &AwsContext) -> color_eyre::Result<(Vec<FunctionDto>, bool)> {
+/// Lista funciones **en streaming**: manda una `Message::FunctionsLoaded` por página apenas
+/// la recibe (la 1ª tras un único round-trip → la vista renderiza ya; el resto se anexa).
+/// Un fallo en cualquier página corta el stream con un `Message::Error`.
+async fn stream_functions(ctx: &AwsContext, tx: &mpsc::Sender<Envelope>, epoch: u64) {
     let client = ctx.lambda().await;
-    let mut functions: Vec<FunctionDto> = Vec::new();
     let mut marker: Option<String> = None;
-    let mut more = false;
+    let mut first = true;
     for page in 0..MAX_FUNCTION_PAGES {
-        let out = client
+        let out = match client
             .list_functions()
             .max_items(50)
-            .set_marker(marker)
+            .set_marker(marker.take())
             .send()
-            .await?;
-        functions.extend(out.functions().iter().map(|f| FunctionDto {
-            name: f.function_name().unwrap_or_default().to_string(),
-            arn: f.function_arn().unwrap_or_default().to_string(),
-            runtime: f.runtime().map(|r| r.as_str().to_string()),
-            last_modified: f.last_modified().map(str::to_string),
-            memory: f.memory_size(),
-        }));
-        marker = out.next_marker().map(str::to_string);
-        if marker.is_none() {
+            .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                let report: color_eyre::eyre::Report = e.into();
+                let _ = tx
+                    .send(Envelope::new(epoch, sdk_error("list_functions", &report)))
+                    .await;
+                return;
+            }
+        };
+        let functions: Vec<FunctionDto> = out
+            .functions()
+            .iter()
+            .map(|f| FunctionDto {
+                name: f.function_name().unwrap_or_default().to_string(),
+                arn: f.function_arn().unwrap_or_default().to_string(),
+                runtime: f.runtime().map(|r| r.as_str().to_string()),
+                last_modified: f.last_modified().map(str::to_string),
+                memory: f.memory_size(),
+            })
+            .collect();
+        let next = out.next_marker().map(str::to_string);
+        // ¿Cortamos por el tope con más páginas pendientes?
+        let capped = next.is_some() && page == MAX_FUNCTION_PAGES - 1;
+        // ¿Vendrá otra página que SÍ vamos a traer?
+        let more = next.is_some() && !capped;
+        let msg = Message::FunctionsLoaded {
+            functions,
+            append: !first,
+            more,
+            partial: capped,
+        };
+        let _ = tx.send(Envelope::new(epoch, msg)).await;
+        first = false;
+        if next.is_none() || capped {
             break;
         }
-        // Última iteración con marker aún presente: hay más de las que trajimos.
-        if page == MAX_FUNCTION_PAGES - 1 {
-            more = true;
-        }
+        marker = next;
     }
-    Ok((functions, more))
 }
 
 async fn fetch_function_detail(

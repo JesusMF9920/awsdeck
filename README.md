@@ -1,13 +1,14 @@
 # awsdeck
 
 **k9s, pero para mi AWS.** Un TUI en Rust: un solo binario que abre una consola de terminal
-para saltar entre los servicios de AWS que uso a diario —CloudWatch Logs hoy; SQS, Step
-Functions y EventBridge en camino— con la misma navegación, los mismos keybindings y el
-ambiente (cuenta + región) siempre visible y cambiable al instante.
+para saltar entre los servicios de AWS que uso a diario —CloudWatch Logs, SQS, Step Functions,
+EventBridge y Lambda— con la misma navegación, los mismos keybindings y el ambiente
+(cuenta + región) siempre visible y cambiable al instante.
 
 > Estado: **v0 + v1 + v2 + v3** — el shell extensible + las vistas `logs` (CloudWatch), `sqs` (colas,
-> peek, purge gated), `sfn` (Step Functions: ejecuciones, timeline, redrive gated) y `events`
-> (EventBridge: buses, rules, patrón + targets, send gated).
+> peek, purge gated), `sfn` (Step Functions: ejecuciones, timeline, redrive gated), `events`
+> (EventBridge: buses, rules, patrón + targets, send gated) y `lambda` (funciones: config + env vars,
+> logs).
 > Diseño completo en [`ROADMAP.md`](ROADMAP.md); notas de arquitectura en [`CLAUDE.md`](CLAUDE.md).
 
 ## Requisitos
@@ -59,7 +60,7 @@ data fresca). Nunca crashea.
 | `:since` · `:from`/`to` | `logs`: rango — `:since 2d` · `:from 2026-06-19 [to 2026-06-20]` (UTC) |
 | `P` | `events` (detalle): expandir el **event_pattern** completo (scroll + copia) |
 | `:status` | `sfn`: filtrar ejecuciones por estado server-side (`:status failed` · `:status all`) |
-| `l` | `sfn` (detalle): abrir los **logs de la Lambda** del estado seleccionado (cross-link a `logs`) |
+| `l` | abrir los **logs de la Lambda** (cross-link a `logs`): en `sfn` del estado seleccionado, en `lambda` de la función |
 | `p` | purgar cola SQS (gated: modo escritura + confirm) |
 | `d` | `sqs` (detalle de un **DLQ**): redrive — reenvía los mensajes a sus colas origen (gated) |
 | `R` | redrive ejecución `sfn` fallida (gated: modo escritura + confirm) |
@@ -192,9 +193,13 @@ Más detalle en [`CLAUDE.md`](CLAUDE.md).
   directo); **presets de evento** (`[[event_presets]]` en `config.toml`: `S` ofrece un chooser que
   prellena el form); **`:set <clave> <valor>`** (persiste un default en `config.toml` preservando
   comentarios, vía `toml_edit`).
+- **Vista `lambda`** ✅ funciones (`list_functions`) → configuración (`get_function`: runtime, handler,
+  memoria, timeout, code size, role, tracing, DLQ, layers) + variables de entorno navegables (`enter`
+  expande el valor completo). **`l`** abre los logs `/aws/lambda/<fn>` (reusa el cross-link de `sfn`).
+  Solo lectura.
 
-Backlog: presets built-in / guardar el evento actual como preset; favoritos de streams de logs
-(efímeros); más vistas (Lambda, DynamoDB, ECS…).
+Backlog: **Lambda Invoke** (gated); presets built-in / guardar el evento actual como preset; favoritos
+de streams de logs (efímeros); más vistas (DynamoDB, ECS, RDS, S3…).
 
 ## Stack
 

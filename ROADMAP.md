@@ -257,9 +257,14 @@ ejecuciones por estado) y `l` (logs de la Lambda del estado). Mutantes gated: `p
   → `EventsView::with_presets`; `S` abre un chooser que prellena el form vía `open_send_form_with`);
   **`:set <clave> <valor>`** (persiste un default en `config.toml` preservando comentarios, dep
   `toml_edit`; `Config::apply_setting` pura + `write_setting` IO; core agnóstico).
-- Presets built-in / "guardar evento actual como preset"; favoritos de streams de logs (efímeros);
-  `:set` que también cambie el ambiente vivo; abrir un favorito EXPRESS de `sfn` sin error.
-- Más vistas: Lambda (invoke + config), DynamoDB (scan/query), ECS (services/tasks), RDS (estado), S3.
+- **Hecho (vista `lambda`):** funciones (`list_functions`) → config (`get_function`) + env vars
+  (keys/values; `enter` expande el valor), `l` cross-link a los logs `/aws/lambda/<fn>` (reusa
+  `lambda_log_group_from_arn` + `ViewContext::LogGroupTail`), favorito por ARN, copiar/consola. Solo
+  lectura; cableado en las fronteras (`aws/context.lambda()` + `action`/`message`/`effects` + mock).
+- **Lambda Invoke gated** (`i` + form de payload JSON + mostrar respuesta) — fast-follow; presets
+  built-in / "guardar evento actual como preset"; favoritos de streams de logs (efímeros); `:set` que
+  también cambie el ambiente vivo; abrir un favorito EXPRESS de `sfn` sin error.
+- Más vistas: DynamoDB (scan/query), ECS (services/tasks), RDS (estado), S3.
 - Temas / paleta, y modo "denso" para pantallas chicas.
 
 ---

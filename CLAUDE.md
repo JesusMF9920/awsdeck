@@ -64,6 +64,7 @@ src/
     sqs.rs         colas -> attributes + peek (drill, purge gated)
     sfn.rs         state machines -> ejecuciones -> detalle/timeline (drill x3, redrive gated)
     events.rs      event buses -> rules -> detalle (patrón + targets) (drill x3, send gated)
+    lambda.rs      funciones -> config + env vars (drill; `l` cross-link a logs; solo lectura)
   ui/
     header.rs      indicador de ambiente (profile · region) + breadcrumbs
     command_bar.rs `:` comandos y `/` filtro (tui-input)
@@ -107,14 +108,16 @@ vista nunca nombra al menú.
 tokio · ratatui + crossterm (feature `event-stream`) · color-eyre · tui-input · serde_json ·
 serde + toml (config) + toml_edit (`:set` preservando comentarios) · arboard (clipboard) · open
 (abrir navegador) · aws-config +
-aws-sdk-cloudwatchlogs / aws-sdk-sqs / aws-sdk-sfn / aws-sdk-eventbridge. **Sin `async-trait`.**
+aws-sdk-cloudwatchlogs / aws-sdk-sqs / aws-sdk-sfn / aws-sdk-eventbridge / aws-sdk-lambda.
+**Sin `async-trait`.**
 
 ## Estado
 
 **v0 + v1 + v2 + v3 completos.** Shell + vistas `logs` (`aws-sdk-cloudwatchlogs`), `sqs`
-(`aws-sdk-sqs`), `sfn` (`aws-sdk-sfn`) y `events` (`aws-sdk-eventbridge`) contra el SDK real, con
-`Backend::Mock` (`AWSDECK_MOCK=1`) para tests/demo offline. Header con `profile · region`, command
-bar (`:logs`/`:sqs`/`:sfn`/`:events`), filtro (`/`), drill/back, picker de profiles (`ctrl-e`) con
+(`aws-sdk-sqs`), `sfn` (`aws-sdk-sfn`), `events` (`aws-sdk-eventbridge`) y `lambda` (`aws-sdk-lambda`)
+contra el SDK real, con `Backend::Mock` (`AWSDECK_MOCK=1`) para tests/demo offline. Header con
+`profile · region`, command bar (`:logs`/`:sqs`/`:sfn`/`:events`/`:lambda`), filtro (`/`), drill/back,
+picker de profiles (`ctrl-e`) con
 epoch guard, selección de ambiente al iniciar si no hay `AWS_PROFILE` (`start_with_env_picker`),
 ayuda (`?`), status bar de errores.
 
@@ -366,8 +369,15 @@ list/describe).
     `default_tail_window`) **preservando comentarios** (dep `toml_edit`; `Config::apply_setting` pura +
     `write_setting` IO). Solo persiste (efectivo al reabrir); el ambiente vivo lo cambia `:region`. Core
     agnóstico (toca claves de config, no servicios).
+- **Vista `lambda`** (`aws-sdk-lambda`): primera vista nueva del backlog. Drill de 2 niveles que
+  espeja a `sqs`: funciones (`list_functions`) → config (`get_function`: runtime/handler/memoria/
+  timeout/code size/role/tracing/DLQ/layers) + lista navegable de **env vars** (keys + values; `enter`
+  expande el valor completo en el `DetailPanel`). **`l`** salta a los logs `/aws/lambda/<fn>` reusando
+  el cross-link de `sfn` (`lambda_log_group_from_arn` + `ViewContext::LogGroupTail`). Solo lectura, sin
+  gate. Cableado en las fronteras (`aws/context.lambda()`, `action`/`message`/`effects` + mock,
+  `main`); DTOs planos (runtime aplanado a String). **Invoke gated queda como fast-follow.**
 
-275 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive, send y **redrive de DLQ**—, búsqueda de
+289 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive, send y **redrive de DLQ**—, búsqueda de
 groups server-side por subcadena + fuzzy local + fan-out de casing ("createOrder" → "CreateOrderV3") +
 "latest wins", menú, drill x3 en `sfn`/`events` y
 eventos/tail de `logs`, back→menú de dos etapas,
@@ -399,8 +409,10 @@ solo el ambiente activo, `switch_env` re-ancla la selección), **persistencia in
 el ambiente en el store), **favoritos profundos** (events rule / sfn ejecución: la key compuesta abre el
 `Detail`), **presets de evento** (`S` abre el chooser, prellena el form; sin presets → canned), **`:set`**
 (`apply_setting` conserva comentarios y otras claves, agrega clave nueva, round-trip por `Config::parse`,
-rechaza clave/TOML inválido)). `AWSDECK_MOCK=1 cargo run` lo abre sin credenciales.
+rechaza clave/TOML inválido), **vista `lambda`** (drill funciones→config + env vars, `enter` expande el
+valor, `l` cross-link a logs, favorito por ARN, copiar/consola, render)). `AWSDECK_MOCK=1 cargo run` lo
+abre sin credenciales.
 
-Pendiente: presets built-in / "guardar evento actual como preset"; favoritos de streams de logs
-(efímeros); abrir un favorito EXPRESS de `sfn` sin el error del SDK; `:set` que también cambie el
-ambiente vivo. Backlog de vistas: Lambda, DynamoDB, ECS…
+Pendiente: **Lambda Invoke gated** (`i` + form de payload + respuesta); presets built-in / "guardar
+evento actual como preset"; favoritos de streams de logs (efímeros); abrir un favorito EXPRESS de `sfn`
+sin el error del SDK; `:set` que también cambie el ambiente vivo. Backlog de vistas: DynamoDB, ECS, RDS, S3…

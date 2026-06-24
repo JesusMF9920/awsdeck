@@ -8,7 +8,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 const KEYS: &[(&str, &str)] = &[
-    (":", "command bar (p. ej. :logs, :sqs, :sfn, :events)"),
+    (
+        ":",
+        "command bar (p. ej. :logs, :sqs, :sfn, :events, :lambda)",
+    ),
     (
         "/",
         "buscar (fuzzy; en logs tolera mayús/minús; ↑/↓ navega sin salir)",
@@ -59,7 +62,7 @@ const KEYS: &[(&str, &str)] = &[
     ),
     (
         "l",
-        "sfn: abrir los logs de la Lambda del estado seleccionado",
+        "abrir los logs de la Lambda (sfn: del estado · lambda: de la función)",
     ),
     ("p", "purgar cola SQS — gated por modo escritura"),
     ("d", "redrive DLQ (sqs, sobre un dead-letter) — gated"),

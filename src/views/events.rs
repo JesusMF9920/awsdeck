@@ -22,6 +22,12 @@ use crate::ui::detail::DetailPanel;
 use crate::ui::form::{Form, FormOutcome};
 use crate::util::{fuzzy_score, ranked};
 
+/// Separador de la `key` compuesta de un favorito profundo (`bus⟂rule`): el unit
+/// separator ASCII (`\u{1f}`), que nunca aparece en nombres de bus/rule de AWS, así que
+/// distingue un favorito de rule (con separador) de uno de bus (sin él). Opaco para el
+/// core (viaja dentro de `ViewContext::Favorite { key }`).
+const KEY_SEP: char = '\u{1f}';
+
 /// Nivel de drill actual. Cada nivel carga los identificadores que `back()`
 /// necesita para reconstruir el padre y que `on_message` usa como guard.
 enum Level {
@@ -554,10 +560,30 @@ impl View for EventsView {
         vec![Action::LoadEventBuses]
     }
 
-    /// Abrir un favorito/reciente: la `key` es el nombre del bus → drillea a sus rules.
+    /// Abrir un favorito/reciente. `key` simple (nombre de bus) → drillea a sus rules;
+    /// `key` compuesta (`bus⟂rule`, favorito profundo) → abre el detalle de la rule.
     /// Otros contextos (LogGroupTail) no le conciernen → activación normal.
     fn on_context(&mut self, context: &ViewContext) -> Vec<Action> {
         match context {
+            // Favorito profundo: una rule concreta → directo a su detalle.
+            ViewContext::Favorite { key } if key.contains(KEY_SEP) => {
+                let (bus, rule) = key.split_once(KEY_SEP).unwrap();
+                let (event_bus_name, rule_name) = (bus.to_string(), rule.to_string());
+                self.level = Level::Detail {
+                    event_bus_name: event_bus_name.clone(),
+                    rule_name: rule_name.clone(),
+                };
+                self.detail = None;
+                self.targets.clear();
+                self.detail_panel = None;
+                self.event_form = None;
+                self.loading = true;
+                self.state.select(Some(0));
+                vec![Action::LoadRuleDetail {
+                    event_bus_name,
+                    rule_name,
+                }]
+            }
             ViewContext::Favorite { key } => {
                 self.level = Level::Rules {
                     event_bus_name: key.clone(),
@@ -576,11 +602,24 @@ impl View for EventsView {
         }
     }
 
-    /// Favorito = el event bus seleccionado (solo en el nivel de buses).
+    /// Favorito según el nivel: el bus seleccionado (raíz), o —favorito profundo— una rule
+    /// concreta con `key` compuesta `bus⟂rule` (en el nivel de rules o en su detalle).
     fn selected_favorite(&self) -> Option<(String, String)> {
-        match self.level {
+        match &self.level {
             Level::Buses => self.selected_bus().map(|b| (b.name.clone(), b.name)),
-            _ => None,
+            Level::Rules { event_bus_name } => self.selected_rule().map(|r| {
+                (
+                    format!("{event_bus_name}{KEY_SEP}{}", r.name),
+                    format!("{event_bus_name} · {}", r.name),
+                )
+            }),
+            Level::Detail {
+                event_bus_name,
+                rule_name,
+            } => Some((
+                format!("{event_bus_name}{KEY_SEP}{rule_name}"),
+                format!("{event_bus_name} · {rule_name}"),
+            )),
         }
     }
 
@@ -1045,6 +1084,47 @@ mod tests {
             other => panic!("se esperaba LoadRules, llegó {other:?}"),
         }
         assert!(matches!(v.level, Level::Rules { .. }));
+    }
+
+    #[test]
+    fn deep_favorite_targets_a_rule_and_opens_its_detail() {
+        let sep = '\u{1f}';
+        let mut v = EventsView::new();
+        v.on_message(&buses_msg(vec![bus("default")]));
+        v.on_key(key(KeyCode::Enter)); // → Rules
+        v.on_message(&Message::RulesLoaded {
+            event_bus_name: "default".into(),
+            rules: vec![rule("orders-created", RuleState::Enabled)],
+            more: false,
+        });
+        // En el nivel de rules el favorito es la rule seleccionada (key compuesta bus⟂rule).
+        assert_eq!(
+            v.selected_favorite(),
+            Some((
+                format!("default{sep}orders-created"),
+                "default · orders-created".to_string()
+            ))
+        );
+        // Abrir ese favorito profundo → directo al detalle de la rule.
+        let mut v2 = EventsView::new();
+        match v2
+            .on_context(&ViewContext::Favorite {
+                key: format!("default{sep}orders-created"),
+            })
+            .as_slice()
+        {
+            [
+                Action::LoadRuleDetail {
+                    event_bus_name,
+                    rule_name,
+                },
+            ] => {
+                assert_eq!(event_bus_name, "default");
+                assert_eq!(rule_name, "orders-created");
+            }
+            other => panic!("se esperaba LoadRuleDetail, llegó {other:?}"),
+        }
+        assert!(matches!(v2.level, Level::Detail { .. }));
     }
 
     #[test]

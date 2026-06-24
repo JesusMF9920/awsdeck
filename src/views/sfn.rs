@@ -26,6 +26,11 @@ use crate::util::{fmt_epoch_millis, fuzzy_score, lambda_log_group_from_arn, rank
 /// Coincide con `effects::MAX_HISTORY_PAGES` (la carga inicial usa ese tope).
 const HISTORY_PAGE_STEP: usize = 10;
 
+/// Separador de la `key` compuesta de un favorito profundo (`machine_arn⟂exec_arn`): el
+/// unit separator ASCII (`\u{1f}`), que nunca aparece en un ARN, así que distingue un
+/// favorito de ejecución (con separador) de uno de máquina (sin él). Opaco para el core.
+const KEY_SEP: char = '\u{1f}';
+
 /// Nivel de drill actual. Cada nivel carga los identificadores que `back()`
 /// necesita para reconstruir el padre y que `on_message` usa como guard.
 enum Level {
@@ -732,11 +737,38 @@ impl View for SfnView {
         vec![Action::LoadStateMachines]
     }
 
-    /// Abrir un favorito/reciente: la `key` es el ARN de la máquina → drillea a sus
-    /// ejecuciones. No conocemos el tipo desde el ARN: asumimos STANDARD; si fuera
-    /// EXPRESS el SDK responde con error (status bar). Otros contextos → activación normal.
+    /// Abrir un favorito/reciente. `key` simple (ARN de máquina) → drillea a sus
+    /// ejecuciones (asumimos STANDARD; si fuera EXPRESS el SDK responde con error). `key`
+    /// compuesta (`machine_arn⟂exec_arn`, favorito profundo) → abre el detalle de la
+    /// ejecución directo. Otros contextos → activación normal.
     fn on_context(&mut self, context: &ViewContext) -> Vec<Action> {
         match context {
+            // Favorito profundo: una ejecución concreta → directo a su timeline. El tipo
+            // no importa (a la lista de ejecuciones solo se llega en máquinas STANDARD).
+            ViewContext::Favorite { key } if key.contains(KEY_SEP) => {
+                let (machine_arn, execution_arn) = key.split_once(KEY_SEP).unwrap();
+                let (machine_arn, execution_arn) =
+                    (machine_arn.to_string(), execution_arn.to_string());
+                let machine_name = machine_arn
+                    .rsplit(':')
+                    .next()
+                    .unwrap_or(&machine_arn)
+                    .to_string();
+                self.level = Level::Detail {
+                    machine_arn,
+                    machine_name,
+                    machine_type: MachineType::Standard,
+                    execution_arn: execution_arn.clone(),
+                };
+                self.detail = None;
+                self.history.clear();
+                self.failed_state = None;
+                self.history_partial = false;
+                self.history_pages = HISTORY_PAGE_STEP;
+                self.loading = true;
+                self.state.select(Some(0));
+                vec![Action::LoadExecutionDetail { execution_arn }]
+            }
             ViewContext::Favorite { key } => {
                 let machine_name = key.rsplit(':').next().unwrap_or(key).to_string();
                 self.level = Level::Executions {
@@ -760,11 +792,34 @@ impl View for SfnView {
         }
     }
 
-    /// Favorito = la state machine seleccionada (solo en el nivel de máquinas).
+    /// Favorito según el nivel: la máquina seleccionada (raíz), o —favorito profundo— una
+    /// ejecución concreta con `key` compuesta `machine_arn⟂exec_arn` (en el nivel de
+    /// ejecuciones o en su detalle).
     fn selected_favorite(&self) -> Option<(String, String)> {
-        match self.level {
+        match &self.level {
             Level::Machines => self.selected_machine().map(|m| (m.arn, m.name)),
-            _ => None,
+            Level::Executions {
+                machine_arn,
+                machine_name,
+                ..
+            } => self.selected_execution().map(|e| {
+                (
+                    format!("{machine_arn}{KEY_SEP}{}", e.arn),
+                    format!("{machine_name} · {}", e.name),
+                )
+            }),
+            Level::Detail {
+                machine_arn,
+                machine_name,
+                execution_arn,
+                ..
+            } => {
+                let exec_name = execution_arn.rsplit(':').next().unwrap_or(execution_arn);
+                Some((
+                    format!("{machine_arn}{KEY_SEP}{execution_arn}"),
+                    format!("{machine_name} · {exec_name}"),
+                ))
+            }
         }
     }
 
@@ -1340,6 +1395,44 @@ mod tests {
             other => panic!("se esperaba LoadExecutions, llegó {other:?}"),
         }
         assert!(matches!(v.level, Level::Executions { .. }));
+    }
+
+    #[test]
+    fn deep_favorite_targets_an_execution_and_opens_its_detail() {
+        let sep = '\u{1f}';
+        let mut v = SfnView::new();
+        v.on_message(&machines_msg(vec![machine("m1", MachineType::Standard)]));
+        v.on_key(key(KeyCode::Enter)); // → Executions
+        let machine_arn = "arn:aws:states:us-east-1:000:stateMachine:m1".to_string();
+        v.on_message(&Message::ExecutionsLoaded {
+            machine_arn: machine_arn.clone(),
+            executions: vec![exec("e1", ExecStatus::Succeeded)],
+            next_token: None,
+            append: false,
+        });
+        let exec_arn = "arn:aws:states:us-east-1:000:execution:m1:e1".to_string();
+        // En el nivel de ejecuciones el favorito es la ejecución seleccionada (compuesta).
+        assert_eq!(
+            v.selected_favorite(),
+            Some((
+                format!("{machine_arn}{sep}{exec_arn}"),
+                "m1 · e1".to_string()
+            ))
+        );
+        // Abrir ese favorito profundo → directo al detalle (timeline) de la ejecución.
+        let mut v2 = SfnView::new();
+        match v2
+            .on_context(&ViewContext::Favorite {
+                key: format!("{machine_arn}{sep}{exec_arn}"),
+            })
+            .as_slice()
+        {
+            [Action::LoadExecutionDetail { execution_arn }] => {
+                assert_eq!(*execution_arn, exec_arn)
+            }
+            other => panic!("se esperaba LoadExecutionDetail, llegó {other:?}"),
+        }
+        assert!(matches!(v2.level, Level::Detail { .. }));
     }
 
     #[test]

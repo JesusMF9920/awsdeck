@@ -885,6 +885,28 @@ impl App {
                     self.dispatch(Action::SwitchEnv(Env::new(self.env.profile.clone(), code)));
                 }
             }
+            // `:set <clave> <valor>` — persiste un default en `config.toml` (preservando
+            // comentarios, vía `toml_edit`). Core agnóstico: toca claves de config, no
+            // servicios. Solo persiste el default (efectivo al reabrir); para cambiar el
+            // ambiente vivo está `:region`/`ctrl-e`.
+            cmd if cmd == "set" || cmd.starts_with("set ") => {
+                let rest = cmd.strip_prefix("set").unwrap_or("").trim();
+                let mut parts = rest.splitn(2, char::is_whitespace);
+                match (parts.next(), parts.next()) {
+                    (Some(key), Some(value)) if !key.is_empty() && !value.trim().is_empty() => {
+                        let value = value.trim();
+                        match crate::config::Config::write_setting(key, value) {
+                            Ok(()) => {
+                                self.set_info(format!("config: {key} = {value} · efectivo al reabrir"))
+                            }
+                            Err(e) => self.set_error(e),
+                        }
+                    }
+                    _ => self.set_error(
+                        "uso: :set <clave> <valor>  (default_profile · default_region · default_tail_window)",
+                    ),
+                }
+            }
             // No es core: ofrécelo a la vista activa (p. ej. `logs` con `:since 2d`).
             // Si la vista no lo reclama (Vec vacío), trátalo como id de vista.
             other => {
@@ -1772,6 +1794,17 @@ mod tests {
         let mut app = test_app();
         type_command(&mut app, "region");
         assert_eq!(app.epoch, 0, "no cambia de ambiente");
+        assert!(app.status.as_ref().is_some_and(|s| s.error), "muestra uso");
+    }
+
+    #[test]
+    fn set_command_without_value_is_a_usage_error() {
+        // El path feliz escribe `config.toml` real, así que solo probamos la rama de uso
+        // (no llama a `write_setting`); la lógica de escritura vive en `Config::apply_setting`.
+        let mut app = test_app();
+        type_command(&mut app, "set"); // sin clave ni valor
+        assert!(app.status.as_ref().is_some_and(|s| s.error), "muestra uso");
+        type_command(&mut app, "set default_region"); // clave sin valor
         assert!(app.status.as_ref().is_some_and(|s| s.error), "muestra uso");
     }
 

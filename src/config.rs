@@ -63,7 +63,42 @@ impl Config {
     fn path() -> Option<PathBuf> {
         config_file("config.toml")
     }
+
+    /// Aplica `key = value` sobre el contenido TOML `current` y devuelve el TOML nuevo
+    /// **preservando comentarios y formato** (vía `toml_edit`). Pura/testeable (no toca
+    /// disco). `Err` si la clave no es escribible o el TOML actual no parsea. Nota: el
+    /// comentario inline de la clave editada puede perderse (se reemplaza el valor); los
+    /// comentarios de cabecera y de las demás claves se conservan.
+    pub fn apply_setting(current: &str, key: &str, value: &str) -> Result<String, String> {
+        if !SETTABLE_KEYS.contains(&key) {
+            return Err(format!(
+                "clave desconocida: {key} (válidas: {})",
+                SETTABLE_KEYS.join(", ")
+            ));
+        }
+        let mut doc = current
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| format!("config.toml no parsea: {e}"))?;
+        doc[key] = toml_edit::value(value);
+        Ok(doc.to_string())
+    }
+
+    /// Escribe `key = value` en `config.toml` preservando comentarios: lee el archivo
+    /// actual (o vacío si no existe), aplica el cambio y reescribe (crea el directorio).
+    /// `Err` con mensaje para la status bar.
+    pub fn write_setting(key: &str, value: &str) -> Result<(), String> {
+        let path = Self::path().ok_or_else(|| "no se pudo ubicar config.toml".to_string())?;
+        let current = std::fs::read_to_string(&path).unwrap_or_default();
+        let updated = Self::apply_setting(&current, key, value)?;
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::write(&path, updated).map_err(|e| format!("no se pudo escribir config.toml: {e}"))
+    }
 }
+
+/// Claves de `config.toml` que `:set` puede escribir (las del `Config` hand-editado).
+const SETTABLE_KEYS: [&str; 3] = ["default_profile", "default_region", "default_tail_window"];
 
 /// Un recurso recordado: favorito (marcado con `*`) o reciente (auto-trackeado al
 /// drillear). Agnóstico: `view_id`/`key`/`label` son strings opacos para el core (la
@@ -367,6 +402,52 @@ mod tests {
     #[test]
     fn invalid_toml_returns_none() {
         assert!(Config::parse("default_region = =bad").is_none());
+    }
+
+    #[test]
+    fn apply_setting_preserves_comments_and_other_keys() {
+        let current = "\
+# config de awsdeck (hand-editado)
+default_profile = \"prod\"  # mi cuenta
+default_region = \"us-east-1\"
+";
+        let out = Config::apply_setting(current, "default_region", "eu-west-1").expect("ok");
+        assert!(out.contains("eu-west-1"));
+        assert!(!out.contains("us-east-1"), "reemplazó el valor viejo");
+        assert!(
+            out.contains("# config de awsdeck (hand-editado)"),
+            "cabecera intacta"
+        );
+        assert!(
+            out.contains("# mi cuenta"),
+            "comentario de otra clave intacto"
+        );
+        assert!(
+            out.contains("default_profile = \"prod\""),
+            "otra clave intacta"
+        );
+    }
+
+    #[test]
+    fn apply_setting_adds_new_key_keeping_comments() {
+        let current = "# hand-editado\ndefault_profile = \"prod\"\n";
+        let out = Config::apply_setting(current, "default_region", "sa-east-1").expect("ok");
+        assert!(out.contains("# hand-editado"));
+        assert!(out.contains("default_profile"));
+        assert!(out.contains("default_region") && out.contains("sa-east-1"));
+    }
+
+    #[test]
+    fn apply_setting_into_empty_round_trips_through_config() {
+        let out = Config::apply_setting("", "default_region", "us-west-2").expect("ok");
+        let cfg = Config::parse(&out).expect("re-parsea como Config");
+        assert_eq!(cfg.default_region.as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn apply_setting_rejects_unknown_key_and_invalid_toml() {
+        assert!(Config::apply_setting("", "bogus", "x").is_err());
+        assert!(Config::apply_setting("not = = bad", "default_region", "x").is_err());
     }
 
     #[test]

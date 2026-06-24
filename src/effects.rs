@@ -375,7 +375,10 @@ impl Effects {
                 let env = env.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    let msg = Message::FunctionsLoaded(mock_functions(&env));
+                    let msg = Message::FunctionsLoaded {
+                        functions: mock_functions(&env),
+                        more: false,
+                    };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
             }
@@ -383,7 +386,7 @@ impl Effects {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
                     let msg = match fetch_functions(&ctx).await {
-                        Ok(functions) => Message::FunctionsLoaded(functions),
+                        Ok((functions, more)) => Message::FunctionsLoaded { functions, more },
                         Err(e) => sdk_error("list_functions", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
@@ -1179,22 +1182,42 @@ async fn fetch_queues(ctx: &AwsContext) -> color_eyre::Result<Vec<QueueDto>> {
     Ok(queues)
 }
 
-async fn fetch_functions(ctx: &AwsContext) -> color_eyre::Result<Vec<FunctionDto>> {
-    let client = ctx.lambda().await;
-    let mut pages = client.list_functions().into_paginator().items().send();
+/// Tope de páginas al listar funciones: `list_functions` no admite filtro server-side por
+/// nombre (lo que quede fuera sería inalcanzable), así que las traemos paginando, pero con
+/// un tope para no colgarse en cuentas con miles de funciones (cada página son ≤50 items y
+/// una llamada de red). Si se alcanza con más pendientes, `more = true` → la vista muestra
+/// `· parcial`. (Antes drenaba TODO el paginador → lento en cuentas grandes.)
+const MAX_FUNCTION_PAGES: usize = 20;
 
-    let mut functions = Vec::new();
-    while let Some(item) = pages.next().await {
-        let f = item?;
-        functions.push(FunctionDto {
+async fn fetch_functions(ctx: &AwsContext) -> color_eyre::Result<(Vec<FunctionDto>, bool)> {
+    let client = ctx.lambda().await;
+    let mut functions: Vec<FunctionDto> = Vec::new();
+    let mut marker: Option<String> = None;
+    let mut more = false;
+    for page in 0..MAX_FUNCTION_PAGES {
+        let out = client
+            .list_functions()
+            .max_items(50)
+            .set_marker(marker)
+            .send()
+            .await?;
+        functions.extend(out.functions().iter().map(|f| FunctionDto {
             name: f.function_name().unwrap_or_default().to_string(),
             arn: f.function_arn().unwrap_or_default().to_string(),
             runtime: f.runtime().map(|r| r.as_str().to_string()),
             last_modified: f.last_modified().map(str::to_string),
             memory: f.memory_size(),
-        });
+        }));
+        marker = out.next_marker().map(str::to_string);
+        if marker.is_none() {
+            break;
+        }
+        // Última iteración con marker aún presente: hay más de las que trajimos.
+        if page == MAX_FUNCTION_PAGES - 1 {
+            more = true;
+        }
     }
-    Ok(functions)
+    Ok((functions, more))
 }
 
 async fn fetch_function_detail(

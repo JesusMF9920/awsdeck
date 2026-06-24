@@ -376,8 +376,12 @@ list/describe).
   el cross-link de `sfn` (`lambda_log_group_from_arn` + `ViewContext::LogGroupTail`). Solo lectura, sin
   gate. Cableado en las fronteras (`aws/context.lambda()`, `action`/`message`/`effects` + mock,
   `main`); DTOs planos (runtime aplanado a String). **Invoke gated queda como fast-follow.**
+  Paginación **acotada** (`fetch_functions` sigue el `marker` hasta `MAX_FUNCTION_PAGES=20`, no drena
+  todo el paginador → no se cuelga en cuentas con miles de funciones; `Message::FunctionsLoaded.more`
+  → `· parcial`). `list_functions` no admite filtro server-side por nombre, así que la búsqueda es
+  fuzzy local sobre lo cargado.
 
-289 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive, send y **redrive de DLQ**—, búsqueda de
+290 tests sin red (routing, epoch guard, gate de mutaciones —purge, redrive, send y **redrive de DLQ**—, búsqueda de
 groups server-side por subcadena + fuzzy local + fan-out de casing ("createOrder" → "CreateOrderV3") +
 "latest wins", menú, drill x3 en `sfn`/`events` y
 eventos/tail de `logs`, back→menú de dos etapas,
@@ -410,7 +414,8 @@ el ambiente en el store), **favoritos profundos** (events rule / sfn ejecución:
 `Detail`), **presets de evento** (`S` abre el chooser, prellena el form; sin presets → canned), **`:set`**
 (`apply_setting` conserva comentarios y otras claves, agrega clave nueva, round-trip por `Config::parse`,
 rechaza clave/TOML inválido), **vista `lambda`** (drill funciones→config + env vars, `enter` expande el
-valor, `l` cross-link a logs, favorito por ARN, copiar/consola, render)). `AWSDECK_MOCK=1 cargo run` lo
+valor, `l` cross-link a logs, favorito por ARN, copiar/consola, render, paginación acotada
+`· parcial`)). `AWSDECK_MOCK=1 cargo run` lo
 abre sin credenciales.
 
 Pendiente: **Lambda Invoke gated** (`i` + form de payload + respuesta); presets built-in / "guardar

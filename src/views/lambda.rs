@@ -30,6 +30,8 @@ enum Level {
 pub struct LambdaView {
     level: Level,
     functions: Vec<FunctionDto>,
+    /// Se alcanzó el tope de paginación de funciones (hay más sin traer).
+    functions_partial: bool,
     detail: Option<FunctionDetailDto>,
     /// Panel con el valor completo de una env var (`enter` en el detalle): la fila lo
     /// colapsa a 60 chars; el panel lo muestra entero, scrolleable/copiable. `None` = normal.
@@ -44,6 +46,7 @@ impl LambdaView {
         Self {
             level: Level::Functions,
             functions: Vec::new(),
+            functions_partial: false,
             detail: None,
             detail_panel: None,
             filter: String::new(),
@@ -229,10 +232,18 @@ impl LambdaView {
     fn functions_title(&self) -> String {
         let total = self.functions.len();
         let shown = self.filtered_function_indices().len();
-        if self.filter.is_empty() {
-            format!(" {total} funciones ")
+        let partial = if self.functions_partial {
+            " · parcial"
         } else {
-            format!(" {shown}/{total} funciones · filtro: {} ", self.filter)
+            ""
+        };
+        if self.filter.is_empty() {
+            format!(" {total} funciones{partial} ")
+        } else {
+            format!(
+                " {shown}/{total} funciones{partial} · filtro: {} ",
+                self.filter
+            )
         }
     }
 
@@ -433,8 +444,9 @@ impl View for LambdaView {
 
     fn on_message(&mut self, message: &Message) {
         match message {
-            Message::FunctionsLoaded(functions) => {
+            Message::FunctionsLoaded { functions, more } => {
                 self.functions = functions.clone();
+                self.functions_partial = *more;
                 if matches!(self.level, Level::Functions) {
                     self.loading = false;
                     self.clamp_selection();
@@ -635,21 +647,40 @@ mod tests {
     #[test]
     fn ingests_functions_via_message() {
         let mut v = LambdaView::new();
-        v.on_message(&Message::FunctionsLoaded(vec![
-            function("create-order"),
-            function("process-payment"),
-        ]));
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("create-order"), function("process-payment")],
+            more: false,
+        });
         assert_eq!(v.visible_len(), 2);
+    }
+
+    #[test]
+    fn partial_pagination_signals_in_title() {
+        let mut v = LambdaView::new();
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("create-order")],
+            more: false,
+        });
+        assert!(!v.functions_title().contains("parcial"));
+        // Se alcanzó el tope de páginas con más pendientes → la vista lo señala.
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("create-order")],
+            more: true,
+        });
+        assert!(v.functions_title().contains("parcial"));
     }
 
     #[test]
     fn filter_narrows_function_list() {
         let mut v = LambdaView::new();
-        v.on_message(&Message::FunctionsLoaded(vec![
-            function("create-order"),
-            function("create-invoice"),
-            function("process-payment"),
-        ]));
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![
+                function("create-order"),
+                function("create-invoice"),
+                function("process-payment"),
+            ],
+            more: false,
+        });
         v.set_filter("CREATE"); // case-insensitive
         assert_eq!(v.visible_len(), 2);
     }
@@ -657,10 +688,10 @@ mod tests {
     #[test]
     fn enter_drills_into_function_detail() {
         let mut v = LambdaView::new();
-        v.on_message(&Message::FunctionsLoaded(vec![
-            function("create-order"),
-            function("process-payment"),
-        ]));
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("create-order"), function("process-payment")],
+            more: false,
+        });
         v.on_key(key(KeyCode::Down)); // selecciona process-payment
         let actions = v.on_key(key(KeyCode::Enter));
         match actions.as_slice() {
@@ -696,7 +727,10 @@ mod tests {
     #[test]
     fn favorite_getter_and_open_via_context() {
         let mut v = LambdaView::new();
-        v.on_message(&Message::FunctionsLoaded(vec![function("create-order")]));
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("create-order")],
+            more: false,
+        });
         // En el nivel de funciones el favorito es la función seleccionada (arn + nombre).
         let fav = v.selected_favorite().expect("hay una función seleccionada");
         assert!(fav.0.ends_with(":function:create-order"), "key = arn");
@@ -717,7 +751,10 @@ mod tests {
     #[test]
     fn enter_in_detail_expands_env_value_and_esc_closes() {
         let mut v = LambdaView::new();
-        v.on_message(&Message::FunctionsLoaded(vec![function("create-order")]));
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("create-order")],
+            more: false,
+        });
         v.on_key(key(KeyCode::Enter)); // → Detail
         let long = format!("flags {}", "x".repeat(200));
         v.on_message(&Message::FunctionDetailLoaded {
@@ -751,7 +788,10 @@ mod tests {
     #[test]
     fn detail_from_wrong_function_is_ignored() {
         let mut v = LambdaView::new();
-        v.on_message(&Message::FunctionsLoaded(vec![function("create-order")]));
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("create-order")],
+            more: false,
+        });
         v.on_key(key(KeyCode::Enter)); // drill create-order
         v.on_message(&Message::FunctionDetailLoaded {
             function_arn: function("otra").arn, // función equivocada
@@ -763,7 +803,10 @@ mod tests {
     #[test]
     fn esc_at_root_emits_back() {
         let mut v = LambdaView::new();
-        v.on_message(&Message::FunctionsLoaded(vec![function("create-order")]));
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("create-order")],
+            more: false,
+        });
         let actions = v.on_key(key(KeyCode::Esc));
         assert!(matches!(actions.as_slice(), [Action::Back]));
         assert!(matches!(v.level, Level::Functions));
@@ -772,7 +815,10 @@ mod tests {
     #[test]
     fn esc_in_detail_pops_to_functions() {
         let mut v = LambdaView::new();
-        v.on_message(&Message::FunctionsLoaded(vec![function("create-order")]));
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("create-order")],
+            more: false,
+        });
         v.on_key(key(KeyCode::Enter)); // drill al detalle
         assert!(matches!(v.level, Level::Detail { .. }));
         let actions = v.on_key(key(KeyCode::Esc));
@@ -783,7 +829,10 @@ mod tests {
     #[test]
     fn y_copies_function_arn() {
         let mut v = LambdaView::new();
-        v.on_message(&Message::FunctionsLoaded(vec![function("create-order")]));
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("create-order")],
+            more: false,
+        });
         match v.on_key(key(KeyCode::Char('y'))).as_slice() {
             [Action::CopyToClipboard { text }] => {
                 assert!(text.ends_with(":function:create-order"))
@@ -795,7 +844,10 @@ mod tests {
     #[test]
     fn o_opens_function_in_console() {
         let mut v = LambdaView::new();
-        v.on_message(&Message::FunctionsLoaded(vec![function("create-order")]));
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("create-order")],
+            more: false,
+        });
         match v.on_key(key(KeyCode::Char('O'))).as_slice() {
             [
                 Action::OpenConsole {
@@ -809,7 +861,10 @@ mod tests {
     #[test]
     fn l_opens_lambda_logs_crosslink() {
         let mut v = LambdaView::new();
-        v.on_message(&Message::FunctionsLoaded(vec![function("create-order")]));
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("create-order")],
+            more: false,
+        });
         // En la lista: `l` abre los logs de la función seleccionada.
         match v.on_key(key(KeyCode::Char('l'))).as_slice() {
             [Action::ActivateViewWithContext { id, context }] => {
@@ -833,7 +888,10 @@ mod tests {
     #[test]
     fn hints_offer_logs_link() {
         let mut v = LambdaView::new();
-        v.on_message(&Message::FunctionsLoaded(vec![function("create-order")]));
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("create-order")],
+            more: false,
+        });
         assert!(v.hints().iter().any(|(k, _)| *k == "l"));
     }
 
@@ -843,7 +901,10 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut v = LambdaView::new();
-        v.on_message(&Message::FunctionsLoaded(vec![function("create-order")]));
+        v.on_message(&Message::FunctionsLoaded {
+            functions: vec![function("create-order")],
+            more: false,
+        });
         v.on_key(key(KeyCode::Enter));
         v.on_message(&Message::FunctionDetailLoaded {
             function_arn: function("create-order").arn,

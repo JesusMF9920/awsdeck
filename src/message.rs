@@ -412,8 +412,12 @@ pub enum Message {
     DlqRedriveStarted { queue_url: String },
 
     // --- Lambda ---
-    /// Se cargaron las funciones Lambda del ambiente activo.
-    FunctionsLoaded(Vec<FunctionDto>),
+    /// Se cargaron las funciones Lambda del ambiente activo. `more` indica que se alcanzó
+    /// el tope de paginación con más funciones pendientes (la vista muestra `· parcial`).
+    FunctionsLoaded {
+        functions: Vec<FunctionDto>,
+        more: bool,
+    },
     /// Detalle de una función (`get_function`). `function_arn` permite a la vista
     /// confirmar que corresponde al drill actual.
     FunctionDetailLoaded {

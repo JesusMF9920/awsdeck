@@ -341,24 +341,17 @@ impl App {
             label: f.label.clone(),
             is_fav: f.is_favorite,
         };
-        let favs: Vec<MenuRow> = self
+        // Solo el historial del ambiente activo (favoritos/recientes por `(profile,
+        // región)`); cambiar de ambiente muestra el set correcto en el siguiente render.
+        let history = self
             .store
-            .favorites
-            .iter()
-            .filter(|f| f.is_favorite)
-            .map(row)
-            .collect();
+            .favorites_for(&self.env.profile, &self.env.region);
+        let favs: Vec<MenuRow> = history.iter().filter(|f| f.is_favorite).map(row).collect();
         if !favs.is_empty() {
             rows.push(MenuRow::Header("★ favoritos"));
             rows.extend(favs);
         }
-        let recents: Vec<MenuRow> = self
-            .store
-            .favorites
-            .iter()
-            .filter(|f| !f.is_favorite)
-            .map(row)
-            .collect();
+        let recents: Vec<MenuRow> = history.iter().filter(|f| !f.is_favorite).map(row).collect();
         if !recents.is_empty() {
             rows.push(MenuRow::Header("recientes"));
             rows.extend(recents);
@@ -412,7 +405,13 @@ impl App {
                 ..
             }) => {
                 let (view_id, key, label) = (view_id.clone(), key.clone(), label.clone());
-                self.store.record_recent(&view_id, &key, &label);
+                self.store.record_recent(
+                    &self.env.profile,
+                    &self.env.region,
+                    &view_id,
+                    &key,
+                    &label,
+                );
                 self.dispatch(Action::ActivateViewWithContext {
                     id: view_id,
                     context: ViewContext::Favorite { key },
@@ -558,7 +557,8 @@ impl App {
             // view_id de la vista activa y lo guarda (no es efecto del SDK).
             Action::RecordRecent { key, label } => {
                 if let Some(id) = self.registry.active().map(|v| v.id()) {
-                    self.store.record_recent(id, &key, &label);
+                    self.store
+                        .record_recent(&self.env.profile, &self.env.region, id, &key, &label);
                 }
             }
             // Gate prod-safe: las mutantes pasan por modo escritura + confirm.
@@ -940,7 +940,9 @@ impl App {
             self.set_info("nada que marcar como favorito aquí");
             return;
         };
-        let marked = self.store.toggle_favorite(view_id, &key, &label);
+        let marked =
+            self.store
+                .toggle_favorite(&self.env.profile, &self.env.region, view_id, &key, &label);
         if marked {
             self.set_info(format!("favorito: {label}"));
         } else {
@@ -2051,15 +2053,16 @@ mod tests {
         let mut app = app_with_fav_view();
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // menú → vista
         assert!(matches!(app.screen, Screen::View));
-        // `*` marca el recurso seleccionado como favorito.
+        // `*` marca el recurso seleccionado como favorito (en el ambiente activo).
         app.on_key(ch('*'));
-        assert_eq!(app.store.favorites.len(), 1);
-        assert!(app.store.favorites[0].is_favorite);
-        assert_eq!(app.store.favorites[0].view_id, "logs");
-        assert_eq!(app.store.favorites[0].key, "/aws/lambda/api");
+        let favs = app.store.favorites_for(&app.env.profile, &app.env.region);
+        assert_eq!(favs.len(), 1);
+        assert!(favs[0].is_favorite);
+        assert_eq!(favs[0].view_id, "logs");
+        assert_eq!(favs[0].key, "/aws/lambda/api");
         // `*` de nuevo lo desmarca (queda como reciente, sin estrella).
         app.on_key(ch('*'));
-        assert!(!app.store.favorites[0].is_favorite);
+        assert!(!app.store.favorites_for(&app.env.profile, &app.env.region)[0].is_favorite);
     }
 
     #[test]
@@ -2067,7 +2070,7 @@ mod tests {
         let (mut app, _a, _k) = app_with_counting_view(); // CountingView → selected_favorite None
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         app.on_key(ch('*'));
-        assert!(app.store.favorites.is_empty(), "no hay nada que marcar");
+        assert!(app.store.environments.is_empty(), "no hay nada que marcar");
         assert!(app.status.as_ref().is_some_and(|s| !s.error));
     }
 
@@ -2079,8 +2082,9 @@ mod tests {
             key: "q1".to_string(),
             label: "queue1".to_string(),
         });
-        assert_eq!(app.store.favorites.len(), 1);
-        let f = &app.store.favorites[0];
+        let favs = app.store.favorites_for(&app.env.profile, &app.env.region);
+        assert_eq!(favs.len(), 1);
+        let f = &favs[0];
         assert_eq!(f.view_id, "logs");
         assert_eq!(f.key, "q1");
         assert!(!f.is_favorite, "un reciente no es favorito");
@@ -2099,7 +2103,13 @@ mod tests {
             contexts: contexts.clone(),
         }));
         let mut app = App::new(env, registry, effects, rx);
-        app.store.toggle_favorite("logs", "/aws/lambda/api", "api");
+        app.store.toggle_favorite(
+            &app.env.profile,
+            &app.env.region,
+            "logs",
+            "/aws/lambda/api",
+            "api",
+        );
 
         // Menú: [Tool logs, Header ★ favoritos, Fav api]; seleccionables = índices 0 y 2.
         let rows = app.menu_rows();
@@ -2113,6 +2123,52 @@ mod tests {
         assert!(matches!(app.screen, Screen::View));
         assert_eq!(contexts.get(), 1, "se abrió vía on_context");
         assert_eq!(activated.get(), 0, "no se llamó on_activate");
+    }
+
+    // Rótulos de las filas de favorito/reciente del menú (en el orden en que aparecen).
+    fn menu_favorite_labels(app: &App) -> Vec<String> {
+        app.menu_rows()
+            .iter()
+            .filter_map(|r| match r {
+                MenuRow::Favorite { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn menu_shows_only_current_env_favorites() {
+        let mut app = app_with_fav_view();
+        // Sembrar un favorito en cada ambiente directamente en el store.
+        app.store
+            .toggle_favorite("default", "us-east-1", "logs", "ka", "label-a");
+        app.store
+            .toggle_favorite("prod", "eu-west-1", "logs", "kb", "label-b");
+        // Ambiente activo = ("default","us-east-1"): el menú muestra A, no B.
+        let labels = menu_favorite_labels(&app);
+        assert!(labels.contains(&"label-a".to_string()));
+        assert!(!labels.contains(&"label-b".to_string()));
+        // Cambiar a ("prod","eu-west-1"): ahora muestra B, no A.
+        app.dispatch(Action::SwitchEnv(Env::new("prod", "eu-west-1")));
+        let labels = menu_favorite_labels(&app);
+        assert!(labels.contains(&"label-b".to_string()));
+        assert!(!labels.contains(&"label-a".to_string()));
+    }
+
+    #[test]
+    fn toggle_favorite_records_under_current_env() {
+        let mut app = app_with_fav_view();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // menú → vista
+        app.on_key(ch('*')); // marca en el ambiente A (default/us-east-1)
+        assert_eq!(app.store.favorites_for("default", "us-east-1").len(), 1);
+        // Cambiar de ambiente: B no hereda el favorito de A.
+        app.dispatch(Action::SwitchEnv(Env::new("prod", "eu-west-1")));
+        assert!(app.store.favorites_for("prod", "eu-west-1").is_empty());
+        assert_eq!(
+            app.store.favorites_for("default", "us-east-1").len(),
+            1,
+            "el favorito de A sigue en su bucket"
+        );
     }
 
     #[tokio::test]

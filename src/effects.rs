@@ -15,9 +15,10 @@ use tokio::sync::mpsc;
 use crate::action::{Action, ConsoleTarget};
 use crate::aws::context::{AwsContext, Env};
 use crate::message::{
-    Envelope, ErrorKind, EventBusDto, ExecStatus, ExecutionDetailDto, ExecutionDto, LogEventDto,
-    LogGroupDto, LogStreamDto, LogWindow, MachineType, Message, QueueAttrsDto, QueueDto,
-    QueueMessageDto, RuleDetailDto, RuleDto, RuleState, StateMachineDto, StateSpanDto, TargetDto,
+    Envelope, ErrorKind, EventBusDto, ExecStatus, ExecutionDetailDto, ExecutionDto,
+    FunctionDetailDto, FunctionDto, LogEventDto, LogGroupDto, LogStreamDto, LogWindow, MachineType,
+    Message, QueueAttrsDto, QueueDto, QueueMessageDto, RuleDetailDto, RuleDto, RuleState,
+    StateMachineDto, StateSpanDto, TargetDto,
 };
 use crate::util::case_variants;
 
@@ -105,6 +106,10 @@ impl Effects {
             Action::LoadQueueDetail { queue_url } => self.load_queue_detail(queue_url, epoch),
             Action::PurgeQueue { queue_url } => self.purge_queue(queue_url, epoch),
             Action::RedriveDlq { queue_url } => self.redrive_dlq(queue_url, epoch),
+            Action::LoadFunctions => self.load_functions(epoch),
+            Action::LoadFunctionDetail { function_arn } => {
+                self.load_function_detail(function_arn, epoch)
+            }
             Action::LoadStateMachines => self.load_state_machines(epoch),
             Action::LoadExecutions {
                 machine_arn,
@@ -356,6 +361,60 @@ impl Effects {
                             messages,
                         },
                         Err(e) => sdk_error("queue detail", &e),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+        }
+    }
+
+    fn load_functions(&self, epoch: u64) {
+        let tx = self.tx.clone();
+        match &self.backend {
+            Backend::Mock(env) => {
+                let env = env.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let msg = Message::FunctionsLoaded(mock_functions(&env));
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match fetch_functions(&ctx).await {
+                        Ok(functions) => Message::FunctionsLoaded(functions),
+                        Err(e) => sdk_error("list_functions", &e),
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+        }
+    }
+
+    fn load_function_detail(&self, function_arn: String, epoch: u64) {
+        let tx = self.tx.clone();
+        match &self.backend {
+            Backend::Mock(_) => {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(450)).await;
+                    let detail = mock_function_detail(&function_arn);
+                    let msg = Message::FunctionDetailLoaded {
+                        function_arn,
+                        detail,
+                    };
+                    let _ = tx.send(Envelope::new(epoch, msg)).await;
+                });
+            }
+            Backend::Real(ctx) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let msg = match fetch_function_detail(&ctx, &function_arn).await {
+                        Ok(detail) => Message::FunctionDetailLoaded {
+                            function_arn,
+                            detail,
+                        },
+                        Err(e) => sdk_error("get_function", &e),
                     };
                     let _ = tx.send(Envelope::new(epoch, msg)).await;
                 });
@@ -815,6 +874,10 @@ fn console_url(region: &str, target: &ConsoleTarget) -> String {
             pct_encode(event_bus),
             pct_encode(name)
         ),
+        ConsoleTarget::LambdaFunction { name } => format!(
+            "{base}/lambda/home?region={region}#/functions/{}",
+            pct_encode(name)
+        ),
     }
 }
 
@@ -1114,6 +1177,82 @@ async fn fetch_queues(ctx: &AwsContext) -> color_eyre::Result<Vec<QueueDto>> {
         queues.push(QueueDto { name, url, is_fifo });
     }
     Ok(queues)
+}
+
+async fn fetch_functions(ctx: &AwsContext) -> color_eyre::Result<Vec<FunctionDto>> {
+    let client = ctx.lambda().await;
+    let mut pages = client.list_functions().into_paginator().items().send();
+
+    let mut functions = Vec::new();
+    while let Some(item) = pages.next().await {
+        let f = item?;
+        functions.push(FunctionDto {
+            name: f.function_name().unwrap_or_default().to_string(),
+            arn: f.function_arn().unwrap_or_default().to_string(),
+            runtime: f.runtime().map(|r| r.as_str().to_string()),
+            last_modified: f.last_modified().map(str::to_string),
+            memory: f.memory_size(),
+        });
+    }
+    Ok(functions)
+}
+
+async fn fetch_function_detail(
+    ctx: &AwsContext,
+    function_arn: &str,
+) -> color_eyre::Result<FunctionDetailDto> {
+    let out = ctx
+        .lambda()
+        .await
+        .get_function()
+        .function_name(function_arn)
+        .send()
+        .await?;
+    let cfg = out.configuration();
+
+    // Env vars (clave, valor) ordenadas por clave para un render estable.
+    let mut env: Vec<(String, String)> = cfg
+        .and_then(|c| c.environment())
+        .and_then(|e| e.variables())
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    env.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let layers = cfg
+        .map(|c| {
+            c.layers()
+                .iter()
+                .filter_map(|l| l.arn().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(FunctionDetailDto {
+        runtime: cfg
+            .and_then(|c| c.runtime())
+            .map(|r| r.as_str().to_string()),
+        handler: cfg.and_then(|c| c.handler()).map(str::to_string),
+        memory: cfg.and_then(|c| c.memory_size()),
+        timeout: cfg.and_then(|c| c.timeout()),
+        code_size: cfg.map(|c| c.code_size()),
+        last_modified: cfg.and_then(|c| c.last_modified()).map(str::to_string),
+        role: cfg.and_then(|c| c.role()).map(str::to_string),
+        description: cfg.and_then(|c| c.description()).map(str::to_string),
+        layers,
+        tracing: cfg
+            .and_then(|c| c.tracing_config())
+            .and_then(|t| t.mode())
+            .map(|m| m.as_str().to_string()),
+        dlq_target: cfg
+            .and_then(|c| c.dead_letter_config())
+            .and_then(|d| d.target_arn())
+            .map(str::to_string),
+        env,
+    })
 }
 
 async fn fetch_queue_detail(
@@ -1893,6 +2032,60 @@ fn mock_queue_detail(url: &str) -> (QueueAttrsDto, Vec<QueueMessageDto>) {
         .collect();
 
     (attrs, messages)
+}
+
+/// Funciones Lambda falsas del ambiente. Runtimes/memorias variados; un par llevan el
+/// `profile` activo para que un cambio de ambiente sea visible.
+fn mock_functions(env: &Env) -> Vec<FunctionDto> {
+    let specs: [(&str, &str, i32); 5] = [
+        ("create-order", "python3.12", 256),
+        ("process-payment", "nodejs20.x", 512),
+        ("send-notification", "python3.11", 128),
+        ("image-resize", "provided.al2023", 1024),
+        ("nightly-report", "java21", 2048),
+    ];
+    specs
+        .into_iter()
+        .map(|(name, runtime, memory)| {
+            let full = format!("{}-{name}", env.profile);
+            FunctionDto {
+                arn: format!("arn:aws:lambda:{}:000000000000:function:{full}", env.region),
+                name: full,
+                runtime: Some(runtime.to_string()),
+                last_modified: Some("2026-05-01T12:00:00.000+0000".to_string()),
+                memory: Some(memory),
+            }
+        })
+        .collect()
+}
+
+/// Detalle falso de una función, determinista por el ARN. Incluye un par de env vars,
+/// una con valor largo para probar el panel de detalle (`enter`).
+fn mock_function_detail(arn: &str) -> FunctionDetailDto {
+    let name = arn.rsplit(':').next().unwrap_or(arn);
+    FunctionDetailDto {
+        runtime: Some("python3.12".to_string()),
+        handler: Some("app.handler".to_string()),
+        memory: Some(256),
+        timeout: Some(30),
+        code_size: Some(4_823_551),
+        last_modified: Some("2026-05-01T12:00:00.000+0000".to_string()),
+        role: Some("arn:aws:iam::000000000000:role/service-role/exec".to_string()),
+        description: Some(format!("función {name} (mock)")),
+        layers: vec![
+            "arn:aws:lambda:us-east-1:000000000000:layer:deps:7".to_string(),
+        ],
+        tracing: Some("Active".to_string()),
+        dlq_target: Some("arn:aws:sqs:us-east-1:000000000000:dead-letter".to_string()),
+        env: vec![
+            ("LOG_LEVEL".to_string(), "info".to_string()),
+            ("STAGE".to_string(), "prod".to_string()),
+            (
+                "FEATURE_FLAGS".to_string(),
+                "{\"newCheckout\":true,\"betaSearch\":false,\"retryPolicy\":\"exponential\",\"maxRetries\":5}".to_string(),
+            ),
+        ],
+    }
 }
 
 /// State machines falsas del ambiente. Incluye al menos una STANDARD y una EXPRESS;

@@ -76,6 +76,10 @@ pub enum Action {
     LoadQueues,
     /// Hacer drill a una cola: attributes + peek de mensajes.
     LoadQueueDetail { queue_url: String },
+    /// Pedir la lista de funciones Lambda del ambiente activo.
+    LoadFunctions,
+    /// Hacer drill a una función: su configuración (`get_function`).
+    LoadFunctionDetail { function_arn: String },
     /// Pedir las state machines de Step Functions del ambiente activo.
     LoadStateMachines,
     /// Hacer drill a una máquina: sus ejecuciones (más recientes primero). `status` =
@@ -139,6 +143,7 @@ pub enum ConsoleTarget {
     Execution { arn: String },
     EventBus { name: String },
     Rule { event_bus: String, name: String },
+    LambdaFunction { name: String },
 }
 
 /// Contexto de arranque que una vista pasa a otra al activarla (handoff). Service-shaped

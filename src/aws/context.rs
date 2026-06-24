@@ -11,6 +11,7 @@ use aws_config::timeout::TimeoutConfig;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_cloudwatchlogs::Client as LogsClient;
 use aws_sdk_eventbridge::Client as EventBridgeClient;
+use aws_sdk_lambda::Client as LambdaClient;
 use aws_sdk_sfn::Client as SfnClient;
 use aws_sdk_sqs::Client as SqsClient;
 use aws_sdk_sts::Client as StsClient;
@@ -50,6 +51,7 @@ pub struct AwsContext {
     config: OnceCell<SdkConfig>,
     logs: OnceCell<LogsClient>,
     sqs: OnceCell<SqsClient>,
+    lambda: OnceCell<LambdaClient>,
     sfn: OnceCell<SfnClient>,
     eventbridge: OnceCell<EventBridgeClient>,
     sts: OnceCell<StsClient>,
@@ -62,6 +64,7 @@ impl AwsContext {
             config: OnceCell::new(),
             logs: OnceCell::new(),
             sqs: OnceCell::new(),
+            lambda: OnceCell::new(),
             sfn: OnceCell::new(),
             eventbridge: OnceCell::new(),
             sts: OnceCell::new(),
@@ -112,6 +115,13 @@ impl AwsContext {
     pub async fn sqs(&self) -> &SqsClient {
         self.sqs
             .get_or_init(|| async { SqsClient::new(self.config().await) })
+            .await
+    }
+
+    /// Cliente de Lambda, cacheado de forma perezosa.
+    pub async fn lambda(&self) -> &LambdaClient {
+        self.lambda
+            .get_or_init(|| async { LambdaClient::new(self.config().await) })
             .await
     }
 

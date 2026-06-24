@@ -91,6 +91,37 @@ pub struct QueueMessageDto {
     pub receive_count: Option<i64>,
 }
 
+// --- Lambda -------------------------------------------------------------------
+
+/// Una función Lambda (datos para la lista).
+#[derive(Clone, Debug)]
+pub struct FunctionDto {
+    pub name: String,
+    pub arn: String,
+    /// Runtime aplanado a String (p. ej. `"python3.12"`); `None` en funciones de imagen.
+    pub runtime: Option<String>,
+    pub last_modified: Option<String>,
+    pub memory: Option<i32>,
+}
+
+/// Configuración de una función; se carga al hacer drill (`get_function`).
+#[derive(Clone, Debug, Default)]
+pub struct FunctionDetailDto {
+    pub runtime: Option<String>,
+    pub handler: Option<String>,
+    pub memory: Option<i32>,
+    pub timeout: Option<i32>,
+    pub code_size: Option<i64>,
+    pub last_modified: Option<String>,
+    pub role: Option<String>,
+    pub description: Option<String>,
+    pub layers: Vec<String>,
+    pub tracing: Option<String>,
+    pub dlq_target: Option<String>,
+    /// Variables de entorno `(clave, valor)`, ordenadas por clave.
+    pub env: Vec<(String, String)>,
+}
+
 // --- Step Functions (v2) ------------------------------------------------------
 
 /// Tipo de state machine. Enum propio plano (no el del SDK, que es
@@ -379,6 +410,16 @@ pub enum Message {
     /// Se inició el redrive de un DLQ (`StartMessageMoveTask`): los mensajes vuelven a
     /// sus colas origen. `queue_url` = el DLQ (para refrescar su detalle).
     DlqRedriveStarted { queue_url: String },
+
+    // --- Lambda ---
+    /// Se cargaron las funciones Lambda del ambiente activo.
+    FunctionsLoaded(Vec<FunctionDto>),
+    /// Detalle de una función (`get_function`). `function_arn` permite a la vista
+    /// confirmar que corresponde al drill actual.
+    FunctionDetailLoaded {
+        function_arn: String,
+        detail: FunctionDetailDto,
+    },
 
     // --- Step Functions (v2) ---
     /// Se cargaron las state machines del ambiente activo. `more` indica que se

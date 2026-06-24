@@ -25,6 +25,7 @@ use crate::effects::Effects;
 use crate::tui::Tui;
 use crate::views::Registry;
 use crate::views::events::EventsView;
+use crate::views::lambda::LambdaView;
 use crate::views::logs::LogsView;
 use crate::views::sfn::SfnView;
 use crate::views::sqs::SqsView;
@@ -58,6 +59,7 @@ async fn main() -> Result<()> {
     registry.register(Box::new(
         EventsView::new().with_presets(config.event_presets),
     ));
+    registry.register(Box::new(LambdaView::new()));
 
     let mut app = App::new(env, registry, effects, rx);
     // Inyecta los favoritos/recientes persistidos (`state.toml`); la app los muta en

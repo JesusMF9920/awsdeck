@@ -10,6 +10,7 @@ use crate::action::{Action, ViewContext};
 use crate::message::Message;
 
 pub mod events;
+pub mod lambda;
 pub mod logs;
 pub mod sfn;
 pub mod sqs;

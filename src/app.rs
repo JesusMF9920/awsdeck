@@ -392,6 +392,28 @@ impl App {
         }
     }
 
+    /// Re-ancla la selección del menú a una fila seleccionable válida tras un cambio que
+    /// altera el conjunto de filas (p. ej. cambiar de ambiente, que cambia los favoritos/
+    /// recientes mostrados). Si el índice actual sigue siendo seleccionable lo respeta; si
+    /// no (quedó fuera de rango o sobre un `Header`), cae a la primera fila seleccionable
+    /// (las herramientas van primero y son estables entre ambientes).
+    fn reanchor_menu_selection(&mut self) {
+        let rows = self.menu_rows();
+        let selectable = Self::menu_selectable(&rows);
+        match selectable.first() {
+            None => self.menu.select(None),
+            Some(&first) => {
+                let valid = self
+                    .menu
+                    .selected()
+                    .is_some_and(|c| selectable.contains(&c));
+                if !valid {
+                    self.menu.select(Some(first));
+                }
+            }
+        }
+    }
+
     fn menu_activate(&mut self) {
         let rows = self.menu_rows();
         match self.menu.selected().and_then(|sel| rows.get(sel)) {
@@ -623,6 +645,9 @@ impl App {
             let actions = self.on_activate_active();
             self.dispatch_all(actions);
         }
+        // El historial mostrado en el menú es por ambiente: re-anclar la selección por si
+        // apuntaba a un favorito/reciente del ambiente anterior (ahora ausente).
+        self.reanchor_menu_selection();
         self.set_info(format!("ambiente: {}", self.env));
     }
 
@@ -2168,6 +2193,54 @@ mod tests {
             app.store.favorites_for("default", "us-east-1").len(),
             1,
             "el favorito de A sigue en su bucket"
+        );
+    }
+
+    #[test]
+    fn switch_env_reanchors_stale_menu_selection() {
+        let mut app = app_with_fav_view();
+        // Varios favoritos en A → hay filas de favorito seleccionables más allá de la tool.
+        app.store
+            .toggle_favorite("default", "us-east-1", "logs", "k1", "f1");
+        app.store
+            .toggle_favorite("default", "us-east-1", "logs", "k2", "f2");
+        // Seleccionar la última fila (un favorito de A).
+        let rows = app.menu_rows();
+        let last = *App::menu_selectable(&rows).last().unwrap();
+        app.menu.select(Some(last));
+        assert!(last > 0, "la selección apunta a un favorito, no a la tool");
+        // Cambiar a B (sin favoritos): ese índice ya no existe en el menú nuevo.
+        app.dispatch(Action::SwitchEnv(Env::new("prod", "eu-west-1")));
+        let rows = app.menu_rows();
+        let selectable = App::menu_selectable(&rows);
+        let sel = app.menu.selected().expect("hay selección");
+        assert!(
+            selectable.contains(&sel),
+            "la selección se re-ancla a una fila válida"
+        );
+        assert_eq!(sel, selectable[0], "cae a la primera fila (la herramienta)");
+    }
+
+    #[test]
+    fn switch_env_to_env_with_favorites_keeps_valid_selection() {
+        let mut app = app_with_fav_view();
+        app.store
+            .toggle_favorite("default", "us-east-1", "logs", "ka", "fa");
+        app.store
+            .toggle_favorite("prod", "eu-west-1", "logs", "kb1", "fb1");
+        app.store
+            .toggle_favorite("prod", "eu-west-1", "logs", "kb2", "fb2");
+        // Seleccionar un favorito en A: índice 2 = [Tool(0), Header(1), Fav(2)]. En B
+        // (con ≥2 favoritos) el índice 2 sigue siendo una fila seleccionable.
+        app.menu.select(Some(2));
+        // Cambiar a B (que también tiene favoritos): la selección sigue siendo válida.
+        app.dispatch(Action::SwitchEnv(Env::new("prod", "eu-west-1")));
+        let rows = app.menu_rows();
+        let selectable = App::menu_selectable(&rows);
+        let sel = app.menu.selected().expect("hay selección");
+        assert!(
+            selectable.contains(&sel),
+            "la selección queda dentro de las filas seleccionables del ambiente nuevo"
         );
     }
 
